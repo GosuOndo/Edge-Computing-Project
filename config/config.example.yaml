@@ -1,0 +1,160 @@
+# Smart Medication System Configuration
+# Copy this file to config.yaml and fill in your actual values
+
+# System Settings
+system:
+  name: "Smart Medication Verification System"
+  version: "1.0.0"
+  location: "Singapore, SG"
+  timezone: "Asia/Singapore"
+
+# Hardware Configuration
+hardware:
+  camera:
+    device_id: 0  # /dev/video0
+    resolution: [640, 480]
+    fps: 30
+    
+  display:
+    width: 1024
+    height: 600
+    fullscreen: true
+    
+  audio:
+    enabled: true
+    volume: 0.8  # 0.0 to 1.0
+
+# MQTT Configuration
+mqtt:
+  broker_host: "localhost"
+  broker_port: 1883
+  client_id: "medication_system_pi"
+  topics:
+    weight_data: "medication/weight/+"  # + is wildcard for station_id
+    commands: "medication/commands"
+    status: "medication/status"
+  qos: 1
+  keepalive: 60
+
+# Weight Sensor Configuration
+weight_sensors:
+  station_1:
+    id: "station_1"
+    medicine_name: ""  # Set during setup
+    pill_weight_mg: 500  # Average pill weight in milligrams
+    threshold_stable_g: 0.05  # Stability threshold
+    threshold_delta_g: 0.2  # Minimum change to trigger event
+    
+  station_2:
+    id: "station_2"
+    medicine_name: ""
+    pill_weight_mg: 500
+    threshold_stable_g: 0.05
+    threshold_delta_g: 0.2
+
+# OCR Configuration
+ocr:
+  language: "eng"
+  config: "--psm 6"  # Tesseract config: Assume a single uniform block of text
+  min_confidence: 0.75
+  preprocessing:
+    grayscale: true
+    denoise: true
+    threshold: true
+
+# Patient Monitoring Configuration
+patient_monitoring:
+  enabled: true
+  duration_seconds: 30  # Monitor for 30 seconds after pill removal
+  fps: 20
+  detection:
+    swallow:
+      enabled: true
+      sensitivity: 0.85
+    cough:
+      enabled: true
+      sensitivity: 0.80
+    hand_motion:
+      enabled: true
+
+# Telegram Bot Configuration
+telegram:
+  enabled: true
+  bot_token: "YOUR_BOT_TOKEN_HERE"  # Get from @BotFather
+  patient_chat_id: "YOUR_PATIENT_CHAT_ID"  # Get using /start command
+  caregiver_chat_id: "YOUR_CAREGIVER_CHAT_ID"
+  retry_attempts: 3
+  retry_delay_seconds: 5
+
+# Medication Schedule
+# Format: time in 24-hour format, medicines as list
+schedule:
+  medications:
+    - name: "Aspirin 100mg"
+      station_id: "station_1"
+      dosage_pills: 2
+      times: ["08:00", "20:00"]
+      
+    - name: "Paracetamol 500mg"
+      station_id: "station_2"
+      dosage_pills: 1
+      times: ["12:00"]
+  
+  reminder:
+    advance_minutes: 5  # Remind 5 minutes before
+    timeout_minutes: 30  # Consider missed after 30 minutes
+
+# Decision Engine Rules
+decision_engine:
+  tolerance:
+    pill_count: 1  # Allow plus minus 1 pill difference
+  
+  verification:
+    require_ocr: false  # Set to true to require OCR match
+    require_weight: true
+    require_monitoring: true
+  
+  alerts:
+    missed_dose: true
+    incorrect_dosage: true
+    behavioral_issue: true
+
+# Database Configuration
+database:
+  path: "data/medication_events.db"
+  backup_enabled: true
+  backup_interval_hours: 24
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  console_output: true
+  file_output: true
+  max_file_size_mb: 10
+  backup_count: 5
+
+# Performance Configuration
+performance:
+  max_cpu_percent: 80
+  max_memory_mb: 3072  # Leave 1GB for OS on 4GB Pi
+  enable_throttling: true  # Reduce resolution/fps if overloaded
+
+# Network Configuration
+network:
+  offline_mode_enabled: true  # Continue operation without internet
+  queue_alerts: true  # Queue Telegram alerts when offline
+  check_interval_seconds: 60
+
+# Privacy Configuration
+privacy:
+  store_images: false  # Never store patient images
+  store_video: false
+  anonymize_logs: true
+  data_retention_days: 30
+
+# Measurement & Profiling (for validation)
+profiling:
+  enabled: false  # Enable during measurement phase
+  latency_logging: true
+  resource_logging: true
+  log_interval_seconds: 1

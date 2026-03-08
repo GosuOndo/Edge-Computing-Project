@@ -11,7 +11,7 @@ data/raw/
 data/private/
 
 # Secrets
-config/config.yml
+config/config.yaml
 *.env
 
 # OS
