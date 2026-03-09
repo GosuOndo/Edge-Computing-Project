@@ -2,17 +2,21 @@
 __pycache__/
 *.pyc
 .venv/
-env/
 venv/
+env/
+
 
 # Logs & runtime data
 logs/
 data/raw/
 data/private/
+data/audio_cache/
+data/telegram_queue.json
 
 # Secrets
 config/config.yaml
 *.env
+.env
 
 # OS
 .DS_Store
