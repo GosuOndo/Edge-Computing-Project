@@ -8,6 +8,7 @@ env/
 
 # Logs & runtime data
 logs/
+data/
 data/raw/
 data/private/
 data/audio_cache/
