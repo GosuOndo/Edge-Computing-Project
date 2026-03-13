@@ -359,11 +359,11 @@ class TelegramBot:
         
         # Add details
         if details.get('cough_count'):
-            message += f"• Coughs detected: {details['cough_count']}\n"
+            message += f"â€¢ Coughs detected: {details['cough_count']}\n"
         if details.get('swallow_count') is not None:
-            message += f"• Swallows detected: {details['swallow_count']}\n"
+            message += f"â€¢ Swallows detected: {details['swallow_count']}\n"
         if details.get('compliance_status'):
-            message += f"• Status: {details['compliance_status']}\n"
+            message += f"â€¢ Status: {details['compliance_status']}\n"
         
         return self.send_message(self.caregiver_chat_id, message)
         
@@ -446,3 +446,43 @@ class TelegramBot:
         
         self.logger.info("Message queue processor stopped")
         
+    def start_queue_processor(self):
+        """Start background queue processor"""
+        if self.queue_processor_running:
+            self.logger.warning("Queue processor already running")
+            return
+        
+        self.queue_processor_running = True
+        self.queue_processor_thread = Thread(target=self._process_queue, daemon=True)
+        self.queue_processor_thread.start()
+        self.logger.info("Queue processor started")
+    
+    def stop_queue_processor(self):
+        """Stop background queue processor"""
+        self.queue_processor_running = False
+        if self.queue_processor_thread:
+            self.queue_processor_thread.join(timeout=5)
+        self.logger.info("Queue processor stopped")
+    
+    def get_queue_size(self) -> int:
+        """Get number of queued messages"""
+        return len(self.message_queue)
+    
+    def is_connected(self) -> bool:
+        """Check if bot is connected (based on last successful send)"""
+        if not self.is_online:
+            return False
+        
+        # Consider offline if no successful send in last 5 minutes
+        time_since_check = time.time() - self.last_connection_check
+        return time_since_check < 300
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        self.stop_queue_processor()
+        self._save_queued_messages()
+        
+        if self.loop and not self.loop.is_closed():
+            self.loop.close()
+        
+        self.logger.info("Telegram bot cleanup complete")
