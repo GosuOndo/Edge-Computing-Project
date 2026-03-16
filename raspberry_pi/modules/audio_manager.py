@@ -29,6 +29,7 @@ class AudioManager:
             return True
 
         try:
+            pygame.mixer.pre_init(frequency=22050, size=-16, channels=2, buffer=512)
             pygame.mixer.init()
             pygame.mixer.music.set_volume(self.volume)
             self.mixer_initialized = True
