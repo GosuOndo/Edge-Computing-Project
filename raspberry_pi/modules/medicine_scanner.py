@@ -55,34 +55,61 @@ class MedicineScanner:
     def initialize_camera(self) -> bool:
         """
         Initialize camera
-        
+
         Returns:
             True if successful
         """
         try:
             self.camera = cv2.VideoCapture(self.camera_device)
-            
+
             if not self.camera.isOpened():
-                self.logger.error("Failed to open camera")
+                self.logger.error(f"Failed to open camera device {self.camera_device}")
                 return False
-            
+
             # Set resolution
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
-            
-            # Test capture
-            ret, frame = self.camera.read()
-            if not ret:
+
+            # Warm up webcam
+            time.sleep(2.0)
+
+            # Try several frames, but do NOT fail just because they are dark
+            ret = False
+            frame = None
+            frame_means = []
+
+            for _ in range(10):
+                ret, frame = self.camera.read()
+
+                if ret and frame is not None:
+                    frame_means.append(round(float(frame.mean()), 2))
+                else:
+                    frame_means.append(None)
+
+                time.sleep(0.1)
+
+            self.logger.info(f"Camera init warm-up frame means: {frame_means}")
+
+            if not ret or frame is None:
                 self.logger.error("Failed to capture test frame")
                 return False
-            
+
+            # Do not hard-fail on dark frame; only warn
+            if frame.mean() <= 5:
+                self.logger.warning("Camera frame appears dark/empty, but continuing")
+
             self.camera_ready = True
-            self.logger.info(f"Camera initialized at {self.resolution[0]}x{self.resolution[1]}")
+            self.logger.info(
+                f"Camera initialized at {self.resolution[0]}x{self.resolution[1]} "
+                f"(device {self.camera_device})"
+            )
             return True
-            
+
         except Exception as e:
             self.logger.error(f"Camera initialization failed: {e}")
             return False
+    
+
     
     def release_camera(self):
         """Release camera resources"""
@@ -91,23 +118,27 @@ class MedicineScanner:
             self.camera_ready = False
             self.logger.info("Camera released")
             
+
     def capture_frame(self) -> Optional[np.ndarray]:
         """
         Capture a single frame from camera
-        
+
         Returns:
             Frame as numpy array or None if failed
         """
         if not self.camera_ready:
             self.logger.warning("Camera not initialized")
             return None
-        
+
         ret, frame = self.camera.read()
-        
-        if not ret:
+
+        if not ret or frame is None:
             self.logger.error("Failed to capture frame")
             return None
-        
+
+        if frame.mean() <= 5:
+            self.logger.warning("Captured frame is nearly black")
+
         return frame
     
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:

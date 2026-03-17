@@ -32,6 +32,8 @@ from modules.display_manager import DisplayManager
 from modules.audio_manager import AudioManager
 from modules.decision_engine import DecisionEngine, DecisionResult
 from modules.database import Database
+from modules.tag_runtime_service import TagRuntimeService
+from modules.identity_manager import IdentityManager
 
 
 class MedicationSystem:
@@ -102,8 +104,12 @@ class MedicationSystem:
             self.weight_manager.set_pill_removal_callback(self._on_pill_removal)
 
             # Medicine Scanner (OCR)
-            self.scanner = MedicineScanner(self.config['ocr'], self.logger)
-
+            # self.scanner = MedicineScanner(self.config['ocr'], self.logger)
+            
+            scanner_config = dict(self.config['ocr'])
+            scanner_config.update(self.config['hardware'].get('camera', {}))
+            self.scanner = MedicineScanner(scanner_config, self.logger)
+            
             # Patient Monitor (MediaPipe)
             self.patient_monitor = PatientMonitor(
                 self.config['patient_monitoring'],
@@ -141,11 +147,31 @@ class MedicationSystem:
             else:
                 self.audio = None
                 self.logger.info("Audio manager skipped (headless test mode)")
-                
+
             # Decision Engine
             self.decision_engine = DecisionEngine(
                 self.config['decision_engine'],
                 self.logger
+            )
+
+            # Tag Runtime Service
+            identity_cfg = self.config.get("identity", {})
+            tag_topic = identity_cfg.get("tag", {}).get("mqtt_topic", "medication/tag/read/+")
+            self.tag_runtime_service = TagRuntimeService(
+                mqtt_config=self.config["mqtt"],
+                database=self.database,
+                logger=self.logger,
+                topic=tag_topic
+            )
+            self.tag_runtime_service.start()
+
+            # Identity Manager
+            self.identity_manager = IdentityManager(
+                config=self.config,
+                scanner=self.scanner,
+                database=self.database,
+                tag_runtime_service=self.tag_runtime_service,
+                logger=self.logger
             )
 
             # Medication Scheduler
@@ -249,6 +275,11 @@ class MedicationSystem:
 
         # Store current medication context
         self.current_medication = reminder_data
+        
+        if "medicine_id" not in self.current_medication:
+            # Temporary fallback until schedule config is fully medicine_id-based
+            if self.current_medication["station_id"] == "station_1":
+                self.current_medication["medicine_id"] = "M001"
 
         station_id = reminder_data['station_id']
         self.weight_manager.enable_event_detection(station_id)
@@ -325,18 +356,58 @@ class MedicationSystem:
         medicine_name = self.current_medication['medicine_name']
         expected_dosage = self.current_medication['dosage_pills']
 
-        # Step 1: OCR Verification
+        # Step 1: Identity Verification (Tag -> QR -> OCR)
         if self.display:
-            self.display.show_monitoring_screen(0, 5, "Scanning label...")
+            self.display.show_monitoring_screen(0, 5, "Verifying medicine identity...")
 
+        identity_result = None
         ocr_result = None
+
+        expected_medicine_id = self.current_medication.get("medicine_id", "M001")
+        expected_station_id = self.current_medication["station_id"]
+
         try:
             self.scanner.initialize_camera()
-            ocr_result = self.scanner.scan_label(num_attempts=2)
-            self.scanner.release_camera()
-            self.logger.info(f"OCR result: {ocr_result}")
+
+            identity_result = self.identity_manager.verify_identity(
+                expected_medicine_id=expected_medicine_id,
+                expected_medicine_name=medicine_name,
+                expected_station_id=expected_station_id
+            )
+
+            self.logger.info(f"Identity result: {identity_result}")
+
+            # Keep decision engine compatible by converting identity result into OCR-like shape
+            if identity_result.get("success"):
+                ocr_result = {
+                    "success": True,
+                    "medicine_name": identity_result.get("medicine_name", medicine_name),
+                    "confidence": identity_result.get("confidence", 1.0),
+                    "verified": True,
+                    "method": identity_result.get("method")
+                }
+            else:
+                ocr_result = {
+                    "success": False,
+                    "medicine_name": None,
+                    "confidence": 0.0,
+                    "verified": False,
+                    "error": identity_result.get("reason", "Identity verification failed"),
+                    "method": identity_result.get("method", "none")
+                }
+
         except Exception as e:
-            self.logger.warning(f"OCR verification failed: {e}")
+            self.logger.warning(f"Identity verification failed: {e}")
+            ocr_result = {
+                "success": False,
+                "medicine_name": None,
+                "confidence": 0.0,
+                "verified": False,
+                "error": str(e),
+                "method": "none"
+            }
+        finally:
+            self.scanner.release_camera()
 
         if not self.running:
             self.logger.info("System stopping; aborting verification early.")
@@ -568,6 +639,9 @@ class MedicationSystem:
 
             if self.audio:
                 self.audio.cleanup()
+                
+            if hasattr(self, "tag_runtime_service") and self.tag_runtime_service:
+                self.tag_runtime_service.stop()
 
             if hasattr(self, "database") and self.database:
                 self.database.cleanup()

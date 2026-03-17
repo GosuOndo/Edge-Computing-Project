@@ -1,7 +1,8 @@
 """
 Smart Medication System - Database Module
 
-SQLite database for logging medication events and tracking compliance.
+SQLite database for logging medication events, tracking compliance,
+and storing registered medicine records from tag/QR/OCR onboarding.
 """
 
 import sqlite3
@@ -12,7 +13,6 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from threading import Lock
 
-
 class Database:
     """
     SQLite database for medication event logging
@@ -20,6 +20,7 @@ class Database:
     Tables:
     - medication_events: All medication intake events
     - compliance_history: Daily compliance summaries
+    - registered_medicines: Registered medicine records from tag/QR/OCR onboarding
     """
     
     def __init__(self, config: dict, logger):
@@ -111,6 +112,35 @@ class Database:
                     compliance_rate REAL NOT NULL,
                     behavioral_issues INTEGER NOT NULL
                 )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS registered_medicines (
+                    medicine_id TEXT PRIMARY KEY,
+                    patient_id TEXT,
+                    medicine_name TEXT NOT NULL,
+                    dosage_amount INTEGER,
+                    dosage_unit TEXT,
+                    time_slots TEXT,
+                    meal_rule TEXT,
+                    station_id TEXT,
+                    tag_uid TEXT UNIQUE,
+                    tag_payload TEXT,
+                    source_method TEXT,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_registered_medicines_tag_uid
+                ON registered_medicines(tag_uid)
+            ''')
+            
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_registered_medicines_station
+                ON registered_medicines(station_id)
             ''')
             
             self.connection.commit()
@@ -382,6 +412,264 @@ class Database:
         except Exception as e:
             self.logger.error(f"Failed to get statistics: {e}")
             return {}
+    
+    def upsert_registered_medicine(self, record: Dict[str, Any]) -> bool:
+        """
+        Insert or update a registered medicine from tag/QR/OCR onboarding.
+        """
+        try:
+            with self.db_lock:
+                cursor = self.connection.cursor()
+                
+                now_ts = time.time()
+                
+                cursor.execute('''
+                    INSERT INTO registered_medicines (
+                        medicine_id,
+                        patient_id,
+                        medicine_name,
+                        dosage_amount,
+                        dosage_unit,
+                        time_slots,
+                        meal_rule,
+                        station_id,
+                        tag_uid,
+                        tag_payload,
+                        source_method,
+                        active,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(medicine_id) DO UPDATE SET
+                        patient_id = excluded.patient_id,
+                        medicine_name = excluded.medicine_name,
+                        dosage_amount = excluded.dosage_amount,
+                        dosage_unit = excluded.dosage_unit,
+                        time_slots = excluded.time_slots,
+                        meal_rule = excluded.meal_rule,
+                        station_id = excluded.station_id,
+                        tag_uid = excluded.tag_uid,
+                        tag_payload = excluded.tag_payload,
+                        source_method = excluded.source_method,
+                        active = excluded.active,
+                        updated_at = excluded.updated_at
+                ''', (
+                    record.get("medicine_id"),
+                    record.get("patient_id"),
+                    record.get("medicine_name"),
+                    record.get("dosage_amount"),
+                    record.get("dosage_unit", "TABLET"),
+                    record.get("time_slots"),
+                    record.get("meal_rule"),
+                    record.get("station_id"),
+                    record.get("tag_uid"),
+                    record.get("tag_payload"),
+                    record.get("source_method", "tag"),
+                    1 if record.get("active", True) else 0,
+                    record.get("created_at", now_ts),
+                    now_ts
+                ))
+                
+                self.connection.commit()
+                self.logger.info(f"Registered medicine upserted: {record.get('medicine_id')}")
+                return True
+                
+        except Exception as e:
+            self.logger.error(f"Failed to upsert registered medicine: {e}")
+            return False
+
+    def get_registered_medicine_by_tag_uid(self, tag_uid: str) -> Optional[Dict[str, Any]]:
+        """
+        Get registered medicine by tag UID.
+        """
+        try:
+            with self.db_lock:
+                cursor = self.connection.cursor()
+                
+                cursor.execute('''
+                    SELECT * FROM registered_medicines
+                    WHERE tag_uid = ? AND active = 1
+                    LIMIT 1
+                ''', (tag_uid,))
+                
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                
+                return {
+                    "medicine_id": row["medicine_id"],
+                    "patient_id": row["patient_id"],
+                    "medicine_name": row["medicine_name"],
+                    "dosage_amount": row["dosage_amount"],
+                    "dosage_unit": row["dosage_unit"],
+                    "time_slots": row["time_slots"],
+                    "meal_rule": row["meal_rule"],
+                    "station_id": row["station_id"],
+                    "tag_uid": row["tag_uid"],
+                    "tag_payload": row["tag_payload"],
+                    "source_method": row["source_method"],
+                    "active": bool(row["active"]),
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"]
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Failed to get registered medicine by tag UID: {e}")
+            return None
+
+    def get_registered_medicine_by_id(self, medicine_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get registered medicine by medicine ID.
+        """
+        try:
+            with self.db_lock:
+                cursor = self.connection.cursor()
+                
+                cursor.execute('''
+                    SELECT * FROM registered_medicines
+                    WHERE medicine_id = ? AND active = 1
+                    LIMIT 1
+                ''', (medicine_id,))
+                
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                
+                return {
+                    "medicine_id": row["medicine_id"],
+                    "patient_id": row["patient_id"],
+                    "medicine_name": row["medicine_name"],
+                    "dosage_amount": row["dosage_amount"],
+                    "dosage_unit": row["dosage_unit"],
+                    "time_slots": row["time_slots"],
+                    "meal_rule": row["meal_rule"],
+                    "station_id": row["station_id"],
+                    "tag_uid": row["tag_uid"],
+                    "tag_payload": row["tag_payload"],
+                    "source_method": row["source_method"],
+                    "active": bool(row["active"]),
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"]
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Failed to get registered medicine by ID: {e}")
+            return None
+            
+    def list_registered_medicines(self) -> List[Dict[str, Any]]:
+        """
+        Get all active registered medicines.
+        """
+        try:
+            with self.db_lock:
+                cursor = self.connection.cursor()
+
+                cursor.execute('''
+                    SELECT * FROM registered_medicines
+                    WHERE active = 1
+                    ORDER BY medicine_id
+                ''')
+
+                rows = cursor.fetchall()
+
+                records = []
+                for row in rows:
+                    records.append({
+                        "medicine_id": row["medicine_id"],
+                        "patient_id": row["patient_id"],
+                        "medicine_name": row["medicine_name"],
+                        "dosage_amount": row["dosage_amount"],
+                        "dosage_unit": row["dosage_unit"],
+                        "time_slots": row["time_slots"],
+                        "meal_rule": row["meal_rule"],
+                        "station_id": row["station_id"],
+                        "tag_uid": row["tag_uid"],
+                        "tag_payload": row["tag_payload"],
+                        "source_method": row["source_method"],
+                        "active": bool(row["active"]),
+                        "created_at": row["created_at"],
+                        "updated_at": row["updated_at"],
+                    })
+
+                return records
+
+        except Exception as e:
+            self.logger.error(f"Failed to list registered medicines: {e}")
+            return []
+
+    def get_registered_medicine_by_station(self, station_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get registered medicine assigned to a station.
+        """
+        try:
+            with self.db_lock:
+                cursor = self.connection.cursor()
+
+                cursor.execute('''
+                    SELECT * FROM registered_medicines
+                    WHERE station_id = ? AND active = 1
+                    LIMIT 1
+                ''', (station_id,))
+
+                row = cursor.fetchone()
+                if not row:
+                    return None
+
+                return {
+                    "medicine_id": row["medicine_id"],
+                    "patient_id": row["patient_id"],
+                    "medicine_name": row["medicine_name"],
+                    "dosage_amount": row["dosage_amount"],
+                    "dosage_unit": row["dosage_unit"],
+                    "time_slots": row["time_slots"],
+                    "meal_rule": row["meal_rule"],
+                    "station_id": row["station_id"],
+                    "tag_uid": row["tag_uid"],
+                    "tag_payload": row["tag_payload"],
+                    "source_method": row["source_method"],
+                    "active": bool(row["active"]),
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+
+        except Exception as e:
+            self.logger.error(f"Failed to get registered medicine by station: {e}")
+            return None
+            
+    def assign_station_to_medicine(self, medicine_id: str, station_id: str) -> bool:
+        """
+        Update station assignment for a registered medicine.
+        """
+        try:
+            with self.db_lock:
+                cursor = self.connection.cursor()
+
+                cursor.execute('''
+                    UPDATE registered_medicines
+                    SET station_id = ?, updated_at = ?
+                    WHERE medicine_id = ?
+                ''', (
+                    station_id,
+                    time.time(),
+                    medicine_id
+                ))
+
+                self.connection.commit()
+
+                if cursor.rowcount == 0:
+                    self.logger.warning(
+                        f"No registered medicine found for station assignment: {medicine_id}"
+                    )
+                    return False
+
+                self.logger.info(
+                    f"Assigned {medicine_id} to {station_id}"
+                )
+                return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to assign station to medicine: {e}")
+            return False
     
     def cleanup(self):
         """Close database connection"""
