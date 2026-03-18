@@ -65,14 +65,22 @@ ocr:
 # Patient Monitoring Configuration
 patient_monitoring:
   enabled: true
-  duration_seconds: 30  # Monitor for 30 seconds after pill removal
-  fps: 20
+  duration_seconds: 30       # how long to watch after pill removal
+  fps: 20                    # capture frame rate
+ 
+  # MediaPipe thresholds
+  mediapipe:
+    mouth_open_ratio: 0.04   # inner-lip gap / face height  (higher = harder to trigger)
+    proximity_ratio:  0.18   # fingertip–mouth dist / frame min dim (higher = wider zone)
+    cooldown_secs:    2.5    # min seconds between counted intakes (higher = less counting)
+ 
   detection:
     swallow:
       enabled: true
-      sensitivity: 0.85
+      sensitivity: 0.85     
+      
     cough:
-      enabled: true
+      enabled: false         
       sensitivity: 0.80
     hand_motion:
       enabled: true
