@@ -18,7 +18,7 @@ hardware:
   display:
     width: 1024
     height: 600
-    fullscreen: true
+    fullscreen: false
     
   audio:
     enabled: true
@@ -31,8 +31,8 @@ mqtt:
   client_id: "medication_system_pi"
   topics:
     weight_data: "medication/weight/+"  # + is wildcard for station_id
-    commands: "medication/commands"
-    status: "medication/status"
+    commands: "medication/command"
+    status: "medication/status/+"
   qos: 1
   keepalive: 60
 
@@ -40,33 +40,48 @@ mqtt:
 weight_sensors:
   station_1:
     id: "station_1"
-    medicine_name: ""  # Set during setup
-    pill_weight_mg: 500  # Average pill weight in milligrams
+    medicine_name: "Aspirin 100mg"  # Set during setup
+    pill_weight_mg: 280  # Average pill weight in milligrams (mayb 330?)
     threshold_stable_g: 0.05  # Stability threshold
-    threshold_delta_g: 0.2  # Minimum change to trigger event
-    
-  station_2:
-    id: "station_2"
-    medicine_name: ""
-    pill_weight_mg: 500
-    threshold_stable_g: 0.05
-    threshold_delta_g: 0.2
+    threshold_delta_g: 0.22  # Minimum change to trigger event
+    event_settle_seconds: 1.5
+    event_cooldown_seconds: 2.0
+    min_delta_g: 0.20
 
 # OCR Configuration
 ocr:
   language: "eng"
-  config: "--psm 6"  # Tesseract config: Assume a single uniform block of text
+  config: "--psm 11"  # Tesseract config: Assume a single uniform block of text
   min_confidence: 0.75
   preprocessing:
     grayscale: true
     denoise: true
     threshold: true
 
+identity:
+  primary_method: "tag"
+  fallback_methods: ["qr", "ocr"]
+
+  tag:
+    enabled: true
+    mqtt_topic: "medication/tag/read/+"
+    max_attempts: 1
+    attempt_timeout_seconds: 3
+
+  qr:
+    enabled: true
+    max_attempts: 1
+
+  ocr:
+    enabled: true
+    max_attempts: 1
+
 # Patient Monitoring Configuration
 patient_monitoring:
   enabled: true
   duration_seconds: 30       # how long to watch after pill removal
   fps: 20                    # capture frame rate
+  device_id: 0
  
   # MediaPipe thresholds
   mediapipe:
@@ -102,11 +117,6 @@ schedule:
       station_id: "station_1"
       dosage_pills: 2
       times: ["08:00", "20:00"]
-      
-    - name: "Paracetamol 500mg"
-      station_id: "station_2"
-      dosage_pills: 1
-      times: ["12:00"]
   
   reminder:
     advance_minutes: 5  # Remind 5 minutes before
@@ -115,7 +125,7 @@ schedule:
 # Decision Engine Rules
 decision_engine:
   tolerance:
-    pill_count: 1  # Allow plus minus 1 pill difference
+    pill_count: 0  # Allow plus minus 1 pill difference
   
   verification:
     require_ocr: false  # Set to true to require OCR match
@@ -166,3 +176,4 @@ profiling:
   latency_logging: true
   resource_logging: true
   log_interval_seconds: 1
+

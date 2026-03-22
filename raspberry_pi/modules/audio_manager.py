@@ -1,6 +1,5 @@
 """Audio Manager - TTS and alerts"""
-import os
-os.environ["SDL_AUDIODRIVER"] = "alsa"
+
 
 import time
 from pathlib import Path

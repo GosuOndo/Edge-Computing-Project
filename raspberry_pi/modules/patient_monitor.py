@@ -1,495 +1,477 @@
 """
-Smart Medication System - Patient Monitoring Module
+Patient Monitor - Detects medication intake using MediaPipe FaceMesh and Hands.
 
-Uses MediaPipe to monitor patient behavior during medication intake.
-Detects swallowing, coughing, and proper intake patterns.
+Detection logic:
+    An intake event is counted when BOTH conditions are true simultaneously:
+    - Mouth is open (lip distance / face height ratio exceeds threshold)
+    - A fingertip is within a proximity radius of the mouth centre
 
-This is a CRITICAL module addressing the professor's requirement for
-behavioral monitoring during and after medication intake.
+    This conjunction prevents false positives from breathing or head movement,
+    which was the main failure mode of the previous pose-based implementation.
+
+Compliance statuses returned (matches decision_engine.py expected values):
+    good      - at least 1 confirmed intake event detected
+    acceptable - hand moved near mouth but no full intake event registered
+    no_intake  - no relevant motion detected at all
 """
 
 import cv2
-import mediapipe as mp
-import numpy as np
+import threading
 import time
-from typing import Dict, Any, Optional
+import numpy as np
+import sys
 from collections import deque
-from threading import Thread, Event
+from typing import Dict, Any, Optional
+
+import mediapipe as mp
+from mediapipe.python.solutions import face_mesh as _mp_face_mod
+from mediapipe.python.solutions import hands as _mp_hands_mod
+from mediapipe.python.solutions import drawing_utils as _mp_draw
 
 
+# FaceMesh landmark indices used for mouth and face height measurement
+_MOUTH_UPPER = 13
+_MOUTH_LOWER = 14
+_FACE_TOP    = 10
+_FACE_BOTTOM = 152
+
+# Fingertip landmark indices (thumb through pinky)
+_FINGERTIPS = [4, 8, 12, 16, 20]
+
+
+class _IntakeDetector:
+    """
+    Stateful per-frame intake detector.
+
+    Fires an intake event when mouth is open AND a fingertip is close to the mouth.
+    A cooldown period prevents a single intake from being counted multiple times.
+    """
+
+    def __init__(self, mouth_open_ratio=0.04, proximity_ratio=0.18, cooldown_secs=2.5):
+        # mouth_open_ratio: lip gap / face height threshold to consider mouth open
+        # proximity_ratio:  fingertip must be within this fraction of frame size to mouth
+        # cooldown_secs:    minimum gap between two separate intake events
+        self.mouth_open_ratio = mouth_open_ratio
+        self.proximity_ratio  = proximity_ratio
+        self.cooldown_secs    = cooldown_secs
+        
+        self._face = _mp_face_mod.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        self._hands = _mp_hands_mod.Hands(
+            max_num_hands=2,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+        self.intake_count      = 0
+        self._intake_active    = False
+        self._last_intake_time = 0.0
+        # Smoothing buffer reduces jitter in mouth ratio measurement
+        self._mouth_ratio_buf  = deque(maxlen=5)
+
+        # Latest per-frame state read by the monitoring loop
+        self.mouth_open       = False
+        self.hands_near       = False
+        self.intake_triggered = False
+
+    @staticmethod
+    def _px(lm, w, h):
+        """Convert normalised landmark coordinates to pixel coordinates."""
+        return int(lm.x * w), int(lm.y * h)
+
+    def _mouth_ratio(self, face_lm, h, w):
+        """Compute smoothed lip gap / face height ratio."""
+        upper  = face_lm.landmark[_MOUTH_UPPER]
+        lower  = face_lm.landmark[_MOUTH_LOWER]
+        top    = face_lm.landmark[_FACE_TOP]
+        bottom = face_lm.landmark[_FACE_BOTTOM]
+        face_h = abs(bottom.y - top.y) or 1e-6
+        ratio  = abs(lower.y - upper.y) / face_h
+        self._mouth_ratio_buf.append(ratio)
+        return float(np.mean(self._mouth_ratio_buf))
+
+    def process_frame(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Run detection on a BGR frame.
+        Updates self.mouth_open, self.hands_near, self.intake_triggered, self.intake_count.
+        Returns the annotated frame for optional display.
+        """
+        h, w = frame.shape[:2]
+        rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        mouth_open   = False
+        mouth_center = None
+        all_tips     = []
+
+        # Face and mouth detection
+        face_res = self._face.process(rgb)
+        if face_res.multi_face_landmarks:
+            fl    = face_res.multi_face_landmarks[0]
+            ratio = self._mouth_ratio(fl, h, w)
+            mouth_open = ratio > self.mouth_open_ratio
+
+            ux, uy = self._px(fl.landmark[_MOUTH_UPPER], w, h)
+            lx, ly = self._px(fl.landmark[_MOUTH_LOWER], w, h)
+            mouth_center = ((ux + lx) // 2, (uy + ly) // 2)
+
+            # Draw lip landmarks
+            for idx in [_MOUTH_UPPER, _MOUTH_LOWER, 78, 308]:
+                px, py = self._px(fl.landmark[idx], w, h)
+                cv2.circle(frame, (px, py), 3, (0, 230, 255), -1)
+
+            col = (0, 255, 136) if mouth_open else (255, 51, 102)
+            cv2.circle(frame, mouth_center, 6, col, -1)
+            thresh_px = int(self.proximity_ratio * min(w, h))
+            cv2.circle(frame, mouth_center, thresh_px, (0, 229, 255), 1, cv2.LINE_AA)
+
+        # Hand fingertip detection
+        hand_res = self._hands.process(rgb)
+        if hand_res.multi_hand_landmarks:
+            for hand_lm in hand_res.multi_hand_landmarks:
+                _mp_draw.draw_landmarks(
+                    frame, hand_lm, _mp_hands_mod.HAND_CONNECTIONS,
+                    _mp_draw.DrawingSpec(color=(40, 50, 70), thickness=1, circle_radius=1),
+                    _mp_draw.DrawingSpec(color=(40, 50, 70), thickness=1),
+                )
+                for tip_idx in _FINGERTIPS:
+                    tx, ty = self._px(hand_lm.landmark[tip_idx], w, h)
+                    all_tips.append((tx, ty))
+                    cv2.circle(frame, (tx, ty), 7, (255, 179, 0), -1)
+                    cv2.circle(frame, (tx, ty), 7, (255, 255, 255), 1)
+                    
+        # Check if any fingertip is within proximity of mouth centre
+        hands_near = False
+        if mouth_center and all_tips:
+            thresh_px = self.proximity_ratio * min(w, h)
+            mx, my = mouth_center
+            for tx, ty in all_tips:
+                if np.hypot(tx - mx, ty - my) < thresh_px:
+                    hands_near = True
+                    break
+
+        # Intake event: mouth open AND hand near, with cooldown
+        now = time.time()
+        triggered = False
+        if mouth_open and hands_near:
+            if not self._intake_active and (now - self._last_intake_time) > self.cooldown_secs:
+                self.intake_count     += 1
+                self._last_intake_time = now
+                self._intake_active    = True
+                triggered              = True
+        else:
+            self._intake_active = False
+
+        self._draw_hud(frame, mouth_open, hands_near)
+
+        self.mouth_open       = mouth_open
+        self.hands_near       = hands_near
+        self.intake_triggered = triggered
+
+        return frame
+
+    def _draw_hud(self, frame, mouth_open, hands_near):
+        """Draw a small status overlay on the frame."""
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (8, 8), (240, 88), (13, 15, 20), -1)
+        cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+
+        col_m = (0, 255, 136) if mouth_open else (80, 80, 80)
+        col_h = (0, 255, 136) if hands_near else (80, 80, 80)
+        cv2.putText(frame, f"MOUTH OPEN : {'YES' if mouth_open else 'NO'}", (16, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, col_m, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"HAND NEAR  : {'YES' if hands_near else 'NO'}", (16, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, col_h, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"INTAKES    : {self.intake_count}", (16, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 229, 255), 1, cv2.LINE_AA)
+
+        if self.intake_triggered:
+            cv2.rectangle(frame, (2, 2), (w - 2, h - 2), (0, 229, 255), 3)
+
+    def release(self):
+        """Close MediaPipe models and free resources."""
+        self._face.close()
+        self._hands.close()
+        
 class PatientMonitor:
     """
-    Patient behavior monitoring using MediaPipe
+    Monitors patient medication intake using MediaPipe FaceMesh and Hands.
 
-    Monitors:
-    - Swallowing motion (head tilt detection)
-    - Coughing/gagging (mouth opening detection)
-    - Hand-to-mouth motion (pill intake confirmation)
-    - Overall compliance behavior
+    Public interface used by main.py:
+        start_monitoring(duration, callback) -> bool
+        is_monitoring_active()               -> bool
+        get_results()                        -> dict
+        cleanup()
+
+    The results dict uses compliance_status values that match decision_engine.py:
+        good      - at least 1 confirmed intake event
+        acceptable - hand near mouth but no full intake event
+        no_intake  - no relevant motion at all
     """
 
-    def __init__(self, config: dict, logger):
-        """
-        Initialize patient monitor
-
-        Args:
-            config: Patient monitoring configuration
-            logger: Logger instance
-        """
+    def __init__(self, config: dict, logger=None):
         self.config = config
         self.logger = logger
+        self._log = (lambda msg: logger.info(msg)) if logger else print
 
-        # Camera configuration
-        self.camera_device = config.get('device_id', 0)
-        self.fps = config.get('fps', 20)
-        self.enabled = config.get('enabled', True)
+        # device_id is at the top level of the patient_monitoring config section
+        self._device_id = config.get("device_id", 0)
+        self._fps       = config.get("fps", 20)
 
-        # Monitoring configuration
-        self.monitoring_duration = config.get('duration_seconds', 30)
+        # Optional MediaPipe threshold overrides via config.yaml patient_monitoring.mediapipe
+        mp_cfg = config.get("mediapipe", {})
+        self._mouth_open_ratio = mp_cfg.get("mouth_open_ratio", 0.04)
+        self._proximity_ratio  = mp_cfg.get("proximity_ratio",  0.18)
+        self._cooldown_secs    = mp_cfg.get("cooldown_secs",    2.5)
 
-        # Detection configuration
-        detection_config = config.get('detection', {})
-        self.swallow_enabled = detection_config.get('swallow', {}).get('enabled', True)
-        self.swallow_sensitivity = detection_config.get('swallow', {}).get('sensitivity', 0.85)
-        self.cough_enabled = detection_config.get('cough', {}).get('enabled', True)
-        self.cough_sensitivity = detection_config.get('cough', {}).get('sensitivity', 0.80)
-        self.hand_motion_enabled = detection_config.get('hand_motion', {}).get('enabled', True)
+        self._active   = False
+        self._thread: Optional[threading.Thread] = None
+        self._results: Optional[dict] = None
+        self._detector: Optional[_IntakeDetector] = None
+        self._cap: Optional[cv2.VideoCapture] = None
 
-        # MediaPipe initialization
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.mp_pose = mp.solutions.pose
-        self.mp_drawing = mp.solutions.drawing_utils
+        self._log("Patient monitor initialized with MediaPipe")
 
-        self.face_mesh = None
-        self.pose = None
-
-        # Camera
-        self.camera = None
-        self.camera_ready = False
-
-        # Monitoring state
-        self.is_monitoring = False
-        self.monitoring_thread = None
-        self.stop_event = Event()
-
-        # Detection history
-        self.swallow_history = deque(maxlen=30)
-        self.mouth_opening_history = deque(maxlen=30)
-        self.hand_position_history = deque(maxlen=30)
-
-        # Results
-        self.monitoring_results = {}
-
-        self.logger.info("Patient monitor initialized with MediaPipe")
-
-    def initialize_camera(self) -> bool:
+    def start_monitoring(self, duration: int = 30, callback=None) -> bool:
         """
-        Initialize camera for monitoring
+        Start monitoring in a background thread.
 
+        Args:
+            duration: seconds to monitor
+            callback: optional fn(detections, elapsed, duration) called approximately once per second
         Returns:
-            True if successful
+            True if started, False if already running or disabled
         """
-        try:
-            if self.camera is not None and self.camera_ready:
-                return True
-
-            self.camera = cv2.VideoCapture(self.camera_device)
-            
-            if not self.camera.isOpened():
-                self.logger.error("Failed to open camera for patient monitoring")
-                self.camera = None
-                return False
-
-            self.camera.set(cv2.CAP_PROP_FPS, self.fps)
-
-            ret, frame = self.camera.read()
-            if not ret or frame is None:
-                self.logger.error("Failed to capture test frame")
-                self.release_camera()
-                return False
-
-            self.camera_ready = True
-            self.logger.info(f"Camera ready for patient monitoring ({self.fps} FPS)")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Camera initialization failed: {e}")
-            self.release_camera()
+        if self._active:
+            self._log("PatientMonitor: already running")
             return False
 
-    def release_camera(self):
-        """Release camera resources"""
-        if self.camera:
-            try:
-                self.camera.release()
-            except Exception as e:
-                self.logger.debug(f"Camera release warning: {e}")
-            finally:
-                self.camera = None
-                self.camera_ready = False
-                self.logger.info("Camera released")
+        if not self.config.get("enabled", True):
+            self._log("PatientMonitor: disabled in config")
+            return False
 
-    def initialize_mediapipe(self):
-        """Initialize MediaPipe models"""
-        try:
-            if self.face_mesh is None:
-                self.face_mesh = self.mp_face_mesh.FaceMesh(
-                    max_num_faces=1,
-                    refine_landmarks=True,
-                    min_detection_confidence=0.5,
-                    min_tracking_confidence=0.5
-                )
+        self._detector = _IntakeDetector(
+            mouth_open_ratio=self._mouth_open_ratio,
+            proximity_ratio=self._proximity_ratio,
+            cooldown_secs=self._cooldown_secs,
+        )
+        self._results = None
+        self._active  = True
 
-            if self.pose is None:
-                self.pose = self.mp_pose.Pose(
-                    min_detection_confidence=0.5,
-                    min_tracking_confidence=0.5
-                )
-
-            self.logger.info("MediaPipe models initialized")
-
-        except Exception as e:
-            self.logger.error(f"MediaPipe initialization failed: {e}")
-            raise
-
-    def cleanup_mediapipe(self):
-        """Cleanup MediaPipe resources"""
-        if self.face_mesh:
-            try:
-                self.face_mesh.close()
-            except Exception as e:
-                self.logger.debug(f"Face mesh cleanup warning: {e}")
-            finally:
-                self.face_mesh = None
-
-        if self.pose:
-            try:
-                self.pose.close()
-            except Exception as e:
-                self.logger.debug(f"Pose cleanup warning: {e}")
-            finally:
-                self.pose = None
-
-        self.logger.info("MediaPipe resources released")
-
-    def detect_swallowing(self, face_landmarks) -> Optional[float]:
-        """Detect swallowing motion via head tilt"""
-        if not face_landmarks or not self.swallow_enabled:
-            return None
-
-        try:
-            nose = face_landmarks.landmark[1]
-            chin = face_landmarks.landmark[152]
-
-            vertical_dist = abs(nose.y - chin.y)
-            self.swallow_history.append(vertical_dist)
-
-            if len(self.swallow_history) < 10:
-                return None
-
-            recent_avg = np.mean(list(self.swallow_history)[-5:])
-            baseline_avg = np.mean(list(self.swallow_history)[:5])
-
-            tilt_change = baseline_avg - recent_avg
-            confidence = min(max(tilt_change * 10, 0.0), 1.0)
-
-            if confidence >= self.swallow_sensitivity:
-                return confidence
-
-            return None
-
-        except Exception as e:
-            self.logger.debug(f"Swallow detection error: {e}")
-            return None
-
-    def detect_coughing(self, face_landmarks) -> Optional[float]:
-        """Detect coughing/gagging via sudden mouth opening"""
-        if not face_landmarks or not self.cough_enabled:
-            return None
-
-        try:
-            upper_lip = face_landmarks.landmark[13]
-            lower_lip = face_landmarks.landmark[14]
-
-            mouth_opening = abs(upper_lip.y - lower_lip.y)
-            self.mouth_opening_history.append(mouth_opening)
-
-            if len(self.mouth_opening_history) < 10:
-                return None
-
-            recent_max = max(list(self.mouth_opening_history)[-5:])
-            baseline_avg = np.mean(list(self.mouth_opening_history)[:-5])
-
-            opening_change = recent_max - baseline_avg
-            confidence = min(max(opening_change * 20, 0.0), 1.0)
-
-            if confidence >= self.cough_sensitivity:
-                return confidence
-
-            return None
-
-        except Exception as e:
-            self.logger.debug(f"Cough detection error: {e}")
-            return None
-
-    def detect_hand_to_mouth(self, pose_landmarks, face_landmarks) -> Optional[float]:
-        """Detect hand-to-mouth motion"""
-        if not pose_landmarks or not face_landmarks or not self.hand_motion_enabled:
-            return None
-
-        try:
-            nose = face_landmarks.landmark[1]
-            mouth_pos = np.array([nose.x, nose.y])
-
-            right_hand = pose_landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_WRIST]
-            left_hand = pose_landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_WRIST]
-
-            right_hand_pos = np.array([right_hand.x, right_hand.y])
-            left_hand_pos = np.array([left_hand.x, left_hand.y])
-
-            right_dist = np.linalg.norm(right_hand_pos - mouth_pos)
-            left_dist = np.linalg.norm(left_hand_pos - mouth_pos)
-
-            min_dist = min(right_dist, left_dist)
-            self.hand_position_history.append(min_dist)
-
-            if len(self.hand_position_history) < 10:
-                return None
-
-            if min_dist < 0.15:
-                confidence = 1.0 - (min_dist / 0.15)
-                return confidence
-
-            return None
-
-        except Exception as e:
-            self.logger.debug(f"Hand motion detection error: {e}")
-            return None
-
-    def process_frame(self, frame: np.ndarray) -> Dict[str, Any]:
-        """
-        Process a single frame for behavior detection
-        """
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        face_results = self.face_mesh.process(rgb_frame)
-        pose_results = self.pose.process(rgb_frame)
-
-        detections = {
-            'swallow_detected': False,
-            'swallow_confidence': 0.0,
-            'cough_detected': False,
-            'cough_confidence': 0.0,
-            'hand_motion_detected': False,
-            'hand_motion_confidence': 0.0,
-            'timestamp': time.time()
-        }
+        self._thread = threading.Thread(
+            target=self._monitor_loop,
+            args=(duration, callback),
+            daemon=True,
+            name="PatientMonitorThread",
+        )
+        self._thread.start()
+        self._log(f"Patient monitoring started ({duration}s)")
+        return True
         
-        if face_results.multi_face_landmarks:
-            face_landmarks = face_results.multi_face_landmarks[0]
+    def is_monitoring_active(self) -> bool:
+        """Returns True while the background monitoring thread is running."""
+        return self._active
 
-            swallow_conf = self.detect_swallowing(face_landmarks)
-            if swallow_conf:
-                detections['swallow_detected'] = True
-                detections['swallow_confidence'] = swallow_conf
-
-            cough_conf = self.detect_coughing(face_landmarks)
-            if cough_conf:
-                detections['cough_detected'] = True
-                detections['cough_confidence'] = cough_conf
-
-            if pose_results.pose_landmarks:
-                hand_conf = self.detect_hand_to_mouth(
-                    pose_results.pose_landmarks,
-                    face_landmarks
-                )
-                if hand_conf:
-                    detections['hand_motion_detected'] = True
-                    detections['hand_motion_confidence'] = hand_conf
-
-        return detections
-
-    def _monitoring_loop(self, duration: int, callback: Optional[callable] = None):
+    def get_results(self) -> dict:
         """
-        Main monitoring loop (runs in thread)
+        Return the monitoring result dict.
+        Safe to call after is_monitoring_active() returns False.
+        Returns a no_intake default if monitoring has not completed yet.
         """
-        self.logger.info(f"Starting patient monitoring ({duration}s window)")
+        if self._results is None:
+            return {
+                "compliance_status": "no_intake",
+                "swallow_count":     0,
+                "cough_count":       0,
+                "hand_motion_count": 0,
+            }
+        return self._results
 
-        detections_log = []
-        swallow_count = 0
-        cough_count = 0
-        hand_motion_count = 0
-        start_time = time.time()
-        frame_count = 0
-        elapsed = 0.0
+    def cleanup(self):
+        """Stop monitoring and release all camera and MediaPipe resources."""
+        self._active = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+        self._release_resources()
+        self._log("Patient monitor cleanup complete")
 
+    def _release_resources(self):
+        if self._cap:
+            self._cap.release()
+            self._cap = None
+        if self._detector:
+            self._detector.release()
+            self._detector = None
+
+    def _monitor_loop(self, duration: int, callback):
+        """Background thread: open camera, run detection, collect results."""
+        cap = cv2.VideoCapture(self._device_id)
+        if not cap.isOpened():
+            self._log(f"PatientMonitor: cannot open camera (device {self._device_id})")
+            self._active  = False
+            self._results = self._build_result(0, 0)
+            return
+
+        self._cap = cap
+        cap.set(cv2.CAP_PROP_FPS, self._fps)
+
+        # Warm up the camera - Pi USB cameras need a few seconds before producing valid frames
+        self._log("PatientMonitor: warming up camera...")
+        warm_start = time.time()
+        while time.time() - warm_start < 3.0:
+            cap.read()
+
+        start_time      = time.time()
+        hand_motion_cnt = 0
+        frame_interval  = 1.0 / self._fps
+        next_frame_time = time.time()
+
+        self._log("PatientMonitor: monitoring loop started")
+        
         try:
-            while not self.stop_event.is_set():
+            while self._active:
                 elapsed = time.time() - start_time
                 if elapsed >= duration:
                     break
 
-                if not self.camera or not self.camera_ready:
-                    self.logger.warning("Camera not ready during monitoring")
-                    break
+                now = time.time()
+                if now < next_frame_time:
+                    time.sleep(max(0, next_frame_time - now))
+                next_frame_time += frame_interval
 
-                ret, frame = self.camera.read()
-                if not ret or frame is None:
-                    self.logger.warning("Failed to capture frame during monitoring")
-                    time.sleep(0.05)
+                ret, frame = cap.read()
+                if not ret:
                     continue
 
-                detections = self.process_frame(frame)
-                detections_log.append(detections)
+                frame = cv2.flip(frame, 1)
+                self._detector.process_frame(frame)
 
-                if detections['swallow_detected']:
-                    swallow_count += 1
-                if detections['cough_detected']:
-                    cough_count += 1
-                if detections['hand_motion_detected']:
-                    hand_motion_count += 1
+                if self._detector.hands_near:
+                    hand_motion_cnt += 1
 
-                if callback and not self.stop_event.is_set():
+                # Fire callback approximately once per second
+                if callback and int(elapsed) != int(elapsed - frame_interval):
+                    detections = {
+                        "swallow_count":    self._detector.intake_count,
+                        "hand_motion":      self._detector.hands_near,
+                        "mouth_open":       self._detector.mouth_open,
+                    }
                     try:
                         callback(detections, elapsed, duration)
-                    except Exception as e:
-                        self.logger.error(f"Monitoring callback error: {e}")
+                    except Exception as cb_err:
+                        self._log(f"PatientMonitor callback error: {cb_err}")
 
-                frame_count += 1
-                time.sleep(max(0.01, 1.0 / self.fps))
-
-            self.monitoring_results = {
-                'duration_seconds': elapsed,
-                'frames_processed': frame_count,
-                'fps_actual': frame_count / elapsed if elapsed > 0 else 0,
-                'swallow_detected': swallow_count > 0,
-                'swallow_count': swallow_count,
-                'swallow_frames': sum(1 for d in detections_log if d['swallow_detected']),
-                'cough_detected': cough_count > 0,
-                'cough_count': cough_count,
-                'cough_frames': sum(1 for d in detections_log if d['cough_detected']),
-                'hand_motion_detected': hand_motion_count > 0,
-                'hand_motion_count': hand_motion_count,
-                'hand_motion_frames': sum(1 for d in detections_log if d['hand_motion_detected']),
-                'compliance_status': self._assess_compliance(swallow_count, cough_count, hand_motion_count),
-                'detections_log': detections_log,
-                'timestamp': time.time()
-            }
-
-            self.logger.info(
-                f"Monitoring complete: "
-                f"Swallows={swallow_count}, Coughs={cough_count}, "
-                f"Hand motions={hand_motion_count}"
-            )
-            
         except Exception as e:
-            self.logger.error(f"Monitoring loop failed: {e}")
-            self.monitoring_results = {
-                'duration_seconds': elapsed,
-                'frames_processed': frame_count,
-                'fps_actual': frame_count / elapsed if elapsed > 0 else 0,
-                'swallow_detected': False,
-                'swallow_count': 0,
-                'swallow_frames': 0,
-                'cough_detected': False,
-                'cough_count': 0,
-                'cough_frames': 0,
-                'hand_motion_detected': False,
-                'hand_motion_count': 0,
-                'hand_motion_frames': 0,
-                'compliance_status': 'no_intake',
-                'detections_log': detections_log,
-                'timestamp': time.time(),
-                'error': str(e)
-            }
-
+            self._log(f"PatientMonitor: error in monitoring loop: {e}")
         finally:
-            self.is_monitoring = False
-            self.logger.info("Patient monitoring stopped")
+            intake_count = self._detector.intake_count if self._detector else 0
+            self._results = self._build_result(intake_count, hand_motion_cnt)
+            self._release_resources()
+            self._active = False
+            self._log(
+                f"Patient monitoring finished: "
+                f"intakes={intake_count}, "
+                f"status={self._results['compliance_status']}"
+            )
 
-    def _assess_compliance(self, swallow_count: int, cough_count: int, hand_motion_count: int) -> str:
+    def _build_result(self, intake_count: int, hand_motion_count: int) -> dict:
         """
-        Assess overall compliance based on detections
+        Map raw counts to compliance_status values expected by decision_engine.py.
+
+        good       - at least 1 confirmed intake (mouth open + hand near simultaneously)
+        acceptable - hand moved near mouth but no full intake registered
+        no_intake  - no relevant motion detected
         """
-        if swallow_count > 0 and hand_motion_count > 0 and cough_count == 0:
-            return "good"
+        if intake_count >= 1:
+            status = "good"
+        elif hand_motion_count > 0:
+            status = "acceptable"
+        else:
+            status = "no_intake"
 
-        if swallow_count > 0 and cough_count <= 2:
-            return "acceptable"
-
-        if cough_count > 5:
-            return "concerning"
-
-        if swallow_count == 0 and hand_motion_count == 0:
-            return "no_intake"
-
-        return "unclear"
-
-    def start_monitoring(self, duration: int = None, callback: Optional[callable] = None) -> bool:
-        """
-        Start patient behavior monitoring
-        """
-        if self.is_monitoring:
-            self.logger.warning("Monitoring already in progress")
-            return False
-
-        if not self.enabled:
-            self.logger.warning("Patient monitoring is disabled")
-            return False
-
-        if not self.camera_ready:
-            if not self.initialize_camera():
-                return False
-
-        if not self.face_mesh or not self.pose:
-            self.initialize_mediapipe()
-
-        self.monitoring_results = {}
-        self.swallow_history.clear()
-        self.mouth_opening_history.clear()
-        self.hand_position_history.clear()
-
-        if duration is None:
-            duration = self.monitoring_duration
-
-        self.is_monitoring = True
-        self.stop_event.clear()
-        self.monitoring_thread = Thread(
-            target=self._monitoring_loop,
-            args=(duration, callback),
-            daemon=True
-        )
-        self.monitoring_thread.start()
-
-        self.logger.info(f"Patient monitoring started ({duration}s)")
-        return True
-
-    def stop_monitoring(self):
-        """Stop patient monitoring"""
-        if not self.is_monitoring:
-            return
-
-        self.stop_event.set()
-
-        if self.monitoring_thread and self.monitoring_thread.is_alive():
-            self.monitoring_thread.join(timeout=2)
-
-        if self.monitoring_thread and self.monitoring_thread.is_alive():
-            self.logger.warning("Monitoring thread did not stop within timeout")
-
-        self.is_monitoring = False
+        return {
+            "compliance_status": status,
+            # swallow_count maps to intake events for decision engine compatibility
+            "swallow_count":     intake_count,
+            # cough detection is not used in the new approach - always 0
+            "cough_count":       0,
+            "hand_motion_count": hand_motion_count,
+        }
         
-    def get_results(self) -> Dict[str, Any]:
-        """Get monitoring results"""
-        return self.monitoring_results.copy()
+# Standalone test - run directly to verify detection with a live camera feed
+if __name__ == "__main__":
+    DURATION  = int(sys.argv[1]) if len(sys.argv) > 1 else 9999
+    DEVICE_ID = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 
-    def is_monitoring_active(self) -> bool:
-        """Check if monitoring is currently active"""
-        return self.is_monitoring
+    print("=" * 55)
+    print("  PatientMonitor standalone test")
+    print(f"  Camera  : /dev/video{DEVICE_ID}")
+    print(f"  Duration: {'unlimited' if DURATION == 9999 else str(DURATION) + 's'}  (Q/ESC to stop)")
+    print("  R = reset counter")
+    print("=" * 55)
 
-    def cleanup(self):
-        """Cleanup all resources"""
-        self.stop_monitoring()
-        self.release_camera()
-        self.cleanup_mediapipe()
-        self.logger.info("Patient monitor cleanup complete")
+    detector = _IntakeDetector(
+        mouth_open_ratio=0.04,
+        proximity_ratio=0.18,
+        cooldown_secs=2.5,
+    )
+
+    cap = cv2.VideoCapture(DEVICE_ID)
+    if not cap.isOpened():
+        print(f"ERROR: Cannot open camera {DEVICE_ID}")
+        sys.exit(1)
+
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    start = time.time()
+    print("\nLive feed open. Monitoring...\n")
+
+    while True:
+        elapsed = time.time() - start
+        if elapsed >= DURATION:
+            break
+
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        frame = cv2.flip(frame, 1)
+        annotated = detector.process_frame(frame)
+
+        h, w = annotated.shape[:2]
+        if DURATION < 9999:
+            bar_w = int(w * min(elapsed / DURATION, 1.0))
+            cv2.rectangle(annotated, (0, h - 6), (bar_w, h), (0, 229, 255), -1)
+            cv2.putText(annotated, f"{max(0, DURATION - elapsed):.0f}s remaining",
+                        (w - 135, h - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1, cv2.LINE_AA)
+
+        cv2.imshow("PatientMonitor test  (Q=quit  R=reset)", annotated)
+
+        key = cv2.waitKey(33) & 0xFF
+        if key in (ord('q'), ord('Q'), 27):
+            break
+        if key in (ord('r'), ord('R')):
+            detector.intake_count = 0
+            print("  Counter reset to 0")
+
+        if detector.intake_triggered:
+            print(f"  INTAKE #{detector.intake_count}  (t={elapsed:.1f}s)")
+
+    cap.release()
+    cv2.destroyAllWindows()
+    detector.release()
+    
+    intake_count = detector.intake_count
+    status = "good" if intake_count >= 1 else ("acceptable" if detector.hands_near else "no_intake")
+
+    print("\n" + "=" * 55)
+    print("  RESULTS")
+    print("=" * 55)
+    print(f"  Duration monitored : {time.time() - start:.1f}s")
+    print(f"  Intakes detected   : {intake_count}")
+    print(f"  Compliance status  : {status.upper()}")
+    print("=" * 55)

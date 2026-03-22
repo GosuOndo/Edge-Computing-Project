@@ -6,118 +6,337 @@ from datetime import datetime
 from threading import Lock
 
 class DisplayManager:
+
     def __init__(self, config: dict, logger):
         self.config = config
         self.logger = logger
         self.width = config.get('width', 1024)
         self.height = config.get('height', 600)
         self.fullscreen = config.get('fullscreen', True)
-        
+
+        # Central colour palette - change values here to restyle every screen at once
         self.colors = {
-            'background': (240, 240, 245), 'primary': (44, 95, 126),
-            'secondary': (74, 144, 164), 'success': (82, 183, 136),
-            'warning': (244, 162, 97), 'error': (232, 93, 117),
-            'text_dark': (43, 45, 66), 'text_light': (141, 153, 174),
-            'white': (255, 255, 255)
+            'background':  (240, 240, 245),
+            'primary':     (44,  95,  126),
+            'secondary':   (74,  144, 164),
+            'success':     (82,  183, 136),
+            'warning':     (244, 162, 97),
+            'error':       (232, 93,  117),
+            'text_dark':   (43,  45,  66),
+            'text_light':  (141, 153, 174),
+            'white':       (255, 255, 255),
+            'black':       (0,   0,   0),
         }
-        
+
         self.screen = None
         self.clock = None
         self.initialized = False
-        self.current_screen = 'idle'
-        self.screen_data = {}
+        # Lock prevents two threads from drawing at the same time
         self.screen_lock = Lock()
         self.fonts = {}
-        
-    def initialize(self):
+
+    def initialize(self) -> bool:
+        """Start pygame, create the window, and load fonts. Must be called before any show_* method."""
         try:
             pygame.init()
-            if self.fullscreen:
-                self.screen = pygame.display.set_mode((self.width, self.height), pygame.FULLSCREEN)
-            else:
-                self.screen = pygame.display.set_mode((self.width, self.height))
+            flags = pygame.FULLSCREEN if self.fullscreen else 0
+            self.screen = pygame.display.set_mode((self.width, self.height), flags)
+            pygame.display.set_caption("Smart Medication System")
             self.clock = pygame.time.Clock()
+
+            # Font sizes in pixels - None uses pygame's built-in default font
             self.fonts = {
-                'huge': pygame.font.Font(None, 72), 'large': pygame.font.Font(None, 48),
-                'medium': pygame.font.Font(None, 32), 'normal': pygame.font.Font(None, 24)
+                'huge':   pygame.font.Font(None, 96),
+                'large':  pygame.font.Font(None, 56),
+                'medium': pygame.font.Font(None, 38),
+                'normal': pygame.font.Font(None, 28),
+                'small':  pygame.font.Font(None, 22),
             }
+
             self.initialized = True
-            self.show_idle_screen()
+            self.logger.info("Display initialized")
             return True
+
         except Exception as e:
             self.logger.error(f"Display init failed: {e}")
             return False
-    
-    def _draw_text(self, text, font_key, color, x, y, center=False):
+
+    def _draw_text(self, text, font_key, color_key, x, y, center=False):
+        """Render a single line of text. center=True places the anchor at the middle of the string."""
         font = self.fonts[font_key]
-        surf = font.render(text, True, self.colors[color])
-        if center:
-            rect = surf.get_rect(center=(x, y))
-        else:
-            rect = surf.get_rect(topleft=(x, y))
-        self.screen.blit(surf, rect)
-    
+        color = self.colors[color_key]
+        surface = font.render(str(text), True, color)
+        rect = surface.get_rect(center=(x, y)) if center else surface.get_rect(topleft=(x, y))
+        self.screen.blit(surface, rect)
+
+    def _draw_rect(self, color_key, x, y, w, h, radius=0):
+        """Draw a filled rectangle, used for accent bars and progress fill."""
+        pygame.draw.rect(self.screen, self.colors[color_key], (x, y, w, h), border_radius=radius)
+
+    def _fill(self, color_key):
+        """Clear the entire screen with a solid background colour."""
+        self.screen.fill(self.colors[color_key])
+        
     def show_idle_screen(self, next_medication=None):
+        """
+        Default screen shown when no dose event is active.
+        Displays the current time and the next scheduled medication if provided.
+        next_medication dict expects keys: medicine_name, time.
+        """
+        if not self.initialized:
+            return
         with self.screen_lock:
-            self.current_screen = 'idle'
-            self.screen_data = {'next_medication': next_medication}
-        if self.initialized:
-            self.screen.fill(self.colors['background'])
+            self._fill('background')
+
             time_str = datetime.now().strftime('%H:%M')
-            self._draw_text(time_str, 'huge', 'primary', self.width//2, 150, True)
+            date_str = datetime.now().strftime('%A, %d %B %Y')
+
+            self._draw_text(time_str, 'huge', 'primary', self.width // 2, 160, center=True)
+            self._draw_text(date_str, 'normal', 'text_light', self.width // 2, 240, center=True)
+
+            # Visual divider between clock and next-medication section
+            divider_y = 280
+            pygame.draw.line(
+                self.screen, self.colors['text_light'],
+                (100, divider_y), (self.width - 100, divider_y), 1
+            )
+
+            if next_medication:
+                self._draw_text("Next medication", 'normal', 'text_light', self.width // 2, 320, center=True)
+                name = next_medication.get('medicine_name', '')
+                time_val = next_medication.get('time', '')
+                self._draw_text(name, 'large', 'primary', self.width // 2, 370, center=True)
+                self._draw_text(f"at {time_val}", 'medium', 'secondary', self.width // 2, 430, center=True)
+            else:
+                self._draw_text("No medications scheduled", 'medium', 'text_light', self.width // 2, 360, center=True)
+
+            self._draw_text("Smart Medication System", 'small', 'text_light', self.width // 2, 570, center=True)
             pygame.display.flip()
-    
+
     def show_reminder_screen(self, medicine_name, dosage, time_str):
+        """
+        Full-screen reminder shown when a scheduled dose is due.
+        Uses the primary (blue) background to grab attention.
+        """
+        if not self.initialized:
+            return
         with self.screen_lock:
-            self.current_screen = 'reminder'
-            self.screen_data = {'medicine_name': medicine_name, 'dosage': dosage}
-        if self.initialized:
-            self.screen.fill(self.colors['primary'])
-            self._draw_text("TIME FOR MEDICATION", 'large', 'white', self.width//2, 100, True)
-            self._draw_text(medicine_name, 'huge', 'white', self.width//2, 250, True)
-            self._draw_text(f"{dosage} pill(s)", 'large', 'white', self.width//2, 350, True)
-            pygame.display.flip()
-    
-    def show_monitoring_screen(self, elapsed, duration, status="Monitoring..."):
-        if self.initialized:
-            self.screen.fill(self.colors['background'])
-            self._draw_text("MONITORING", 'large', 'primary', self.width//2, 100, True)
-            progress = elapsed / duration if duration > 0 else 0
-            bar_w, bar_h = 600, 40
-            bar_x, bar_y = (self.width - bar_w) // 2, 300
-            pygame.draw.rect(self.screen, self.colors['text_light'], (bar_x, bar_y, bar_w, bar_h), border_radius=20)
-            fill_w = int(bar_w * min(progress, 1.0))
-            if fill_w > 0:
-                pygame.draw.rect(self.screen, self.colors['secondary'], (bar_x, bar_y, fill_w, bar_h), border_radius=20)
-            self._draw_text(f"{int(duration-elapsed)}s left", 'large', 'text_light', self.width//2, 370, True)
+            self._fill('primary')
+
+            self._draw_text("TIME FOR MEDICATION", 'large', 'white', self.width // 2, 80, center=True)
+
+            pygame.draw.line(
+                self.screen, self.colors['secondary'],
+                (80, 130), (self.width - 80, 130), 2
+            )
+
+            self._draw_text(medicine_name, 'huge', 'white', self.width // 2, 230, center=True)
+            self._draw_text(f"Take {dosage} pill(s)", 'large', 'white', self.width // 2, 340, center=True)
+            self._draw_text(f"Scheduled at {time_str}", 'medium', 'white', self.width // 2, 410, center=True)
+
+            pygame.draw.line(
+                self.screen, self.colors['secondary'],
+                (80, 460), (self.width - 80, 460), 2
+            )
+            self._draw_text(
+                "Remove pills from bottle, then place bottle back on scale",
+                'normal', 'white', self.width // 2, 500, center=True
+            )
+
             pygame.display.flip()
             
-    def show_success_screen(self, medicine_name, message="Success!"):
-        if self.initialized:
-            self.screen.fill(self.colors['background'])
-            self._draw_text("?", 'huge', 'success', self.width//2, 150, True)
-            self._draw_text(message, 'large', 'success', self.width//2, 280, True)
+    def show_monitoring_screen(self, elapsed, duration, message="Monitoring intake..."):
+        """
+        Shown during the 30-second patient monitoring window.
+        elapsed and duration drive the progress bar so the patient can see how long remains.
+        Called repeatedly from the main thread as elapsed updates.
+        """
+        if not self.initialized:
+            return
+        with self.screen_lock:
+            self._fill('background')
+
+            self._draw_text("MONITORING INTAKE", 'large', 'primary', self.width // 2, 100, center=True)
+            self._draw_text(message, 'normal', 'text_light', self.width // 2, 160, center=True)
+
+            # Progress bar dimensions
+            bar_w = 700
+            bar_h = 36
+            bar_x = (self.width - bar_w) // 2
+            bar_y = 280
+
+            # Draw grey background track, then coloured fill on top
+            self._draw_rect('text_light', bar_x, bar_y, bar_w, bar_h, radius=18)
+
+            progress = min(elapsed / duration, 1.0) if duration > 0 else 0
+            fill_w = int(bar_w * progress)
+            if fill_w > 0:
+                pygame.draw.rect(
+                    self.screen, self.colors['secondary'],
+                    (bar_x, bar_y, fill_w, bar_h), border_radius=18
+                )
+
+            pct = int(progress * 100)
+            self._draw_text(f"{pct}%", 'medium', 'text_dark', self.width // 2, bar_y + bar_h + 30, center=True)
+
+            remaining = max(0, int(duration - elapsed))
+            self._draw_text(f"{remaining} seconds remaining", 'medium', 'text_light', self.width // 2, 390, center=True)
+            self._draw_text(
+                "Please remain in front of the camera",
+                'normal', 'text_light', self.width // 2, 450, center=True
+            )
+
             pygame.display.flip()
-    
+
+    def show_success_screen(self, medicine_name, message="Medication taken successfully!"):
+        """Shown when the decision engine confirms a correct dose was taken."""
+        if not self.initialized:
+            return
+        with self.screen_lock:
+            self._fill('background')
+
+            # Thin accent bars at top and bottom signal success visually
+            self._draw_rect('success', 0, 0, self.width, 12)
+
+            self._draw_text("[SUCCESS]", 'large', 'success', self.width // 2, 120, center=True)
+            self._draw_text(medicine_name, 'huge', 'text_dark', self.width // 2, 230, center=True)
+            self._draw_text(message, 'medium', 'success', self.width // 2, 330, center=True)
+            self._draw_text(
+                "Well done! Your caregiver has been notified.",
+                'normal', 'text_light', self.width // 2, 400, center=True
+            )
+
+            time_str = datetime.now().strftime('%H:%M:%S')
+            self._draw_text(f"Confirmed at {time_str}", 'small', 'text_light', self.width // 2, 460, center=True)
+
+            self._draw_rect('success', 0, self.height - 12, self.width, 12)
+
+            pygame.display.flip()
+            
     def show_warning_screen(self, title, message):
-        if self.initialized:
-            self.screen.fill(self.colors['background'])
-            self._draw_text("?", 'huge', 'warning', self.width//2, 120, True)
-            self._draw_text(title, 'large', 'warning', self.width//2, 240, True)
+        """
+        Generic warning screen used for incorrect dosage, behavioral issues,
+        and no intake detected. title is the short category, message is the detail.
+        """
+        if not self.initialized:
+            return
+        with self.screen_lock:
+            self._fill('background')
+
+            self._draw_rect('warning', 0, 0, self.width, 12)
+
+            self._draw_text("[WARNING]", 'large', 'warning', self.width // 2, 120, center=True)
+            self._draw_text(title, 'large', 'text_dark', self.width // 2, 230, center=True)
+            self._draw_text(message, 'medium', 'text_light', self.width // 2, 310, center=True)
+            self._draw_text(
+                "Please contact your caregiver if you need help.",
+                'normal', 'text_light', self.width // 2, 400, center=True
+            )
+
+            self._draw_rect('warning', 0, self.height - 12, self.width, 12)
+
             pygame.display.flip()
-    
+
     def show_error_screen(self, error_message):
-        if self.initialized:
-            self.screen.fill(self.colors['background'])
-            self._draw_text("?", 'huge', 'error', self.width//2, 120, True)
-            self._draw_text("ERROR", 'large', 'error', self.width//2, 240, True)
+        """Shown on unhandled system errors. Prompts the patient to restart."""
+        if not self.initialized:
+            return
+        with self.screen_lock:
+            self._fill('background')
+
+            self._draw_rect('error', 0, 0, self.width, 12)
+
+            self._draw_text("[ERROR]", 'large', 'error', self.width // 2, 120, center=True)
+            self._draw_text("System Error", 'large', 'text_dark', self.width // 2, 230, center=True)
+            self._draw_text(str(error_message), 'normal', 'text_light', self.width // 2, 310, center=True)
+            self._draw_text(
+                "Please restart the system or contact support.",
+                'normal', 'text_light', self.width // 2, 380, center=True
+            )
+
+            self._draw_rect('error', 0, self.height - 12, self.width, 12)
+
             pygame.display.flip()
-    
+
+    def show_registration_screen(self, station_id, status_message="Waiting for medicine..."):
+        """
+        Shown during the one-time registration phase when no medicine is yet
+        registered for a station. Instructs the patient to place the bottle and tap the tag.
+        """
+        if not self.initialized:
+            return
+        with self.screen_lock:
+            self._fill('background')
+
+            self._draw_text("MEDICINE REGISTRATION", 'large', 'primary', self.width // 2, 80, center=True)
+
+            pygame.draw.line(
+                self.screen, self.colors['text_light'],
+                (80, 130), (self.width - 80, 130), 2
+            )
+
+            self._draw_text(f"Station: {station_id}", 'medium', 'text_light', self.width // 2, 180, center=True)
+            self._draw_text(status_message, 'large', 'primary', self.width // 2, 280, center=True)
+
+            self._draw_text(
+                "Place the medicine bottle on the scale",
+                'normal', 'text_light', self.width // 2, 370, center=True
+            )
+            self._draw_text(
+                "and tap the RFID tag to the reader",
+                'normal', 'text_light', self.width // 2, 405, center=True
+            )
+
+            pygame.display.flip()
+            
+    def show_registration_success_screen(self, medicine_name, schedule_times):
+        """
+        Shown after a medicine is successfully registered.
+        schedule_times is a list of strings like ['08:00', '20:00'].
+        """
+        if not self.initialized:
+            return
+        with self.screen_lock:
+            self._fill('background')
+
+            self._draw_rect('success', 0, 0, self.width, 12)
+
+            self._draw_text("REGISTERED", 'large', 'success', self.width // 2, 100, center=True)
+            self._draw_text(medicine_name, 'huge', 'text_dark', self.width // 2, 210, center=True)
+            self._draw_text("Medicine registered successfully", 'medium', 'success', self.width // 2, 300, center=True)
+
+            if schedule_times:
+                times_str = "  ".join(schedule_times)
+                self._draw_text(f"Scheduled at: {times_str}", 'medium', 'text_light', self.width // 2, 370, center=True)
+
+            self._draw_text(
+                "Your caregiver has been notified.",
+                'normal', 'text_light', self.width // 2, 440, center=True
+            )
+
+            self._draw_rect('success', 0, self.height - 12, self.width, 12)
+
+            pygame.display.flip()
+
     def update(self):
+        """
+        Must be called every loop iteration from the main thread.
+        Drains the pygame event queue (prevents the OS from marking the window
+        as unresponsive) and caps the frame rate at 30 fps.
+        """
         if self.initialized:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pass
             self.clock.tick(30)
-    
+
     def cleanup(self):
+        """Shut down pygame cleanly. Safe to call even if initialize() was never called."""
         if self.initialized:
-            pygame.quit()
-            self.initialized = False
+            try:
+                pygame.quit()
+            except Exception as e:
+                self.logger.warning(f"Display cleanup warning: {e}")
+            finally:
+                self.initialized = False
+            self.logger.info("Display cleanup complete")

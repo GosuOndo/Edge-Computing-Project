@@ -1,91 +1,74 @@
 """
-Smart Medication System - Telegram Bot Module
+Telegram Bot - Sends medication reminders and alerts to patient and caregiver.
+Queues messages locally when the network is unavailable and retries automatically.
 
-Handles all Telegram notifications including patient reminders and caregiver alerts.
-Implements offline queueing for reliability when network is unavailable.
+Offline behaviour: if a send fails, the message is appended to a local JSON file
+(data/telegram_queue.json). A background thread retries the queue every 30 seconds
+so no alert is permanently lost during a network outage.
 """
 
 import asyncio
-from telegram import Bot
-from telegram.error import TelegramError, NetworkError, RetryAfter
 import time
-from typing import Dict, Any, List, Optional
-from collections import deque
-from threading import Thread, Lock
 import json
 from pathlib import Path
+from collections import deque
+from threading import Thread, Lock
+from typing import Dict, Any, List, Optional
+
+from telegram import Bot
+from telegram.error import TelegramError, NetworkError, RetryAfter
 
 
 class TelegramBot:
-    """
-    Telegram bot for medication reminders and alerts
-    
-    Sends:
-    - Patient reminders (scheduled medication times)
-    - Caregiver alerts (missed doses, incorrect dosage, behavioral issues)
-    - Compliance reports (daily summaries)
-    """
-    
+
     def __init__(self, config: dict, logger):
-        """
-        Initialize Telegram bot
-        
-        Args:
-            config: Telegram configuration dictionary
-            logger: Logger instance
-        """
         self.config = config
         self.logger = logger
-        
-        # Configuration
+
         self.enabled = config.get('enabled', True)
-        self.bot_token = config.get('bot_token')
-        self.patient_chat_id = config.get('patient_chat_id')
-        self.caregiver_chat_id = config.get('caregiver_chat_id')
+        self.bot_token = config.get('bot_token', '')
+        # Separate chat IDs allow patient and caregiver to receive different messages
+        self.patient_chat_id = config.get('patient_chat_id', '')
+        self.caregiver_chat_id = config.get('caregiver_chat_id', '')
         self.retry_attempts = config.get('retry_attempts', 3)
         self.retry_delay = config.get('retry_delay_seconds', 5)
-        
-        # Bot instance
+
+        # Bot instance used by the async send method
         self.bot = None
+        # A single event loop is reused across all synchronous send_message calls
         self.loop = None
-        
-        # Message queue for offline mode
-        self.message_queue = deque(maxlen=100)
+
+        # In-memory queue backed by a JSON file for persistence across reboots
+        self.message_queue: deque = deque(maxlen=100)
         self.queue_lock = Lock()
         self.queue_file = Path('data/telegram_queue.json')
-        
-        # Connection state
+
         self.is_online = False
         self.last_connection_check = 0
-        
-        # Background queue processor
+
         self.queue_processor_running = False
-        self.queue_processor_thread = None
-        
-        # Validate configuration
+        self.queue_processor_thread: Optional[Thread] = None
+
         if self.enabled:
             self._validate_config()
             self._initialize_bot()
+            # Reload any messages that were queued before the last shutdown
             self._load_queued_messages()
-        
+
         self.logger.info(f"Telegram bot initialized (enabled: {self.enabled})")
-    
+
     def _validate_config(self):
-        """Validate Telegram configuration"""
+        """Fail fast on startup if the token is still the placeholder value."""
         if not self.bot_token or 'YOUR_BOT_TOKEN' in self.bot_token:
             raise ValueError(
-                "Invalid Telegram bot token. Please configure TELEGRAM_BOT_TOKEN "
-                "in config.yaml or .env file"
+                "Telegram bot token not configured. Set bot_token in config.yaml."
             )
-        
         if not self.patient_chat_id:
             self.logger.warning("Patient chat ID not configured")
-        
         if not self.caregiver_chat_id:
             self.logger.warning("Caregiver chat ID not configured")
-    
+
     def _initialize_bot(self):
-        """Initialize Telegram bot instance"""
         try:
             self.bot = Bot(token=self.bot_token)
             self.logger.info("Telegram bot instance created")
@@ -94,37 +77,32 @@ class TelegramBot:
             raise
             
     def _load_queued_messages(self):
-        """Load queued messages from disk"""
+        """Restore unsent messages from the previous session."""
         if self.queue_file.exists():
             try:
                 with open(self.queue_file, 'r') as f:
                     queued = json.load(f)
-                    for msg in queued:
-                        self.message_queue.append(msg)
+                for msg in queued:
+                    self.message_queue.append(msg)
                 self.logger.info(f"Loaded {len(queued)} queued messages from disk")
             except Exception as e:
                 self.logger.error(f"Failed to load queued messages: {e}")
-    
+
     def _save_queued_messages(self):
-        """Save queued messages to disk"""
+        """Persist the current queue to disk so messages survive a reboot."""
         try:
             self.queue_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.queue_file, 'w') as f:
                 json.dump(list(self.message_queue), f, indent=2)
         except Exception as e:
             self.logger.error(f"Failed to save queued messages: {e}")
-    
+
     async def _send_message_async(self, chat_id: str, message: str, parse_mode: str = 'Markdown') -> bool:
         """
-        Send message asynchronously
-        
-        Args:
-            chat_id: Telegram chat ID
-            message: Message text
-            parse_mode: Message formatting (Markdown or HTML)
-            
-        Returns:
-            True if successful
+        Low-level async sender with per-attempt retry logic.
+        RetryAfter means Telegram is rate-limiting us - we honour the wait time it provides.
+        NetworkError means the Pi has no internet - we wait retry_delay seconds between attempts.
+        Any other TelegramError (e.g. bad chat_id) is a permanent failure, no point retrying.
         """
         for attempt in range(self.retry_attempts):
             try:
@@ -136,353 +114,294 @@ class TelegramBot:
                 self.is_online = True
                 self.last_connection_check = time.time()
                 return True
-                
+
             except RetryAfter as e:
-                wait_time = e.retry_after
-                self.logger.warning(f"Rate limited, waiting {wait_time}s")
-                await asyncio.sleep(wait_time)
-                
+                # Telegram told us exactly how long to wait
+                await asyncio.sleep(e.retry_after)
+
             except NetworkError as e:
                 self.is_online = False
-                self.logger.warning(f"Network error (attempt {attempt + 1}/{self.retry_attempts}): {e}")
+                self.logger.warning(f"Network error attempt {attempt + 1}: {e}")
                 if attempt < self.retry_attempts - 1:
                     await asyncio.sleep(self.retry_delay)
-                    
+
             except TelegramError as e:
+                # Permanent Telegram-side error (wrong token, banned bot, etc.)
                 self.logger.error(f"Telegram error: {e}")
                 return False
-                
+
             except Exception as e:
                 self.logger.error(f"Unexpected error sending message: {e}")
                 return False
-        
+
         return False
-    
+
     def send_message(self, chat_id: str, message: str, parse_mode: str = 'Markdown') -> bool:
         """
-        Send message (synchronous wrapper)
-        
-        Args:
-            chat_id: Telegram chat ID
-            message: Message text
-            parse_mode: Message formatting
-            
-        Returns:
-            True if successful
+        Public synchronous wrapper around the async sender.
+        Reuses a single event loop rather than creating a new one per call,
+        which avoids thread safety issues with asyncio on Python 3.10+.
+        If sending fails, the message is queued for later delivery.
         """
         if not self.enabled:
-            self.logger.debug("Telegram bot disabled, message not sent")
             return False
-        
+        if not chat_id:
+            self.logger.warning("send_message called with empty chat_id")
+            return False
+
         try:
-            # Create event loop if needed
             if self.loop is None or self.loop.is_closed():
                 self.loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(self.loop)
-            
-            # Send message
+
             result = self.loop.run_until_complete(
                 self._send_message_async(chat_id, message, parse_mode)
             )
-            
-            if result:
-                self.logger.info(f"Message sent to {chat_id}")
-            else:
-                # Queue message for later
+
+            if not result:
                 self._queue_message(chat_id, message, parse_mode)
-            
+
             return result
-            
+
         except Exception as e:
             self.logger.error(f"Error in send_message: {e}")
             self._queue_message(chat_id, message, parse_mode)
             return False
             
     def _queue_message(self, chat_id: str, message: str, parse_mode: str):
-        """Queue message for later delivery"""
+        """Add a failed message to the offline queue and persist it immediately."""
         with self.queue_lock:
-            queued_msg = {
+            self.message_queue.append({
                 'chat_id': chat_id,
                 'message': message,
                 'parse_mode': parse_mode,
                 'timestamp': time.time()
-            }
-            self.message_queue.append(queued_msg)
+            })
             self.logger.info(f"Message queued (queue size: {len(self.message_queue)})")
             self._save_queued_messages()
-    
+
+    @staticmethod
+    def _escape_md(text: str) -> str:
+        """
+        Escape Telegram Markdown v1 special characters in variable content.
+        Telegram treats _ as italic and * as bold markers, so any variable field
+        (medicine name, station ID, etc.) that contains these characters will
+        break the parser unless they are escaped with a backslash.
+        Characters that need escaping: _ * ` [
+        """
+        for ch in ('_', '*', '`', '['):
+            text = text.replace(ch, f'\\{ch}')
+        return text
+
     def send_medication_reminder(self, medicine_name: str, dosage: int, time_str: str) -> bool:
-        """
-        Send medication reminder to patient
-        
-        Args:
-            medicine_name: Name of medication
-            dosage: Number of pills
-            time_str: Scheduled time
-            
-        Returns:
-            True if sent successfully
-        """
+        name = self._escape_md(medicine_name)
         message = (
-            f"?? *Medication Reminder*\n\n"
-            f"?? Medicine: *{medicine_name}*\n"
-            f"?? Dosage: *{dosage} pill(s)*\n"
-            f"? Time: *{time_str}*\n\n"
+            f"*MEDICATION REMINDER*\n\n"
+            f"Medicine: *{name}*\n"
+            f"Dosage: *{dosage} pill(s)*\n"
+            f"Scheduled time: *{time_str}*\n\n"
             f"Please take your medication now."
         )
-        
         return self.send_message(self.patient_chat_id, message)
-    
+
     def send_dose_taken_confirmation(self, medicine_name: str, dosage: int) -> bool:
-        """
-        Send confirmation that dose was taken correctly
-        
-        Args:
-            medicine_name: Name of medication
-            dosage: Number of pills taken
-            
-        Returns:
-            True if sent successfully
-        """
+        name = self._escape_md(medicine_name)
+        taken_at = time.strftime('%H:%M:%S')
         message = (
-            f"? *Dose Confirmed*\n\n"
-            f"?? {medicine_name}\n"
-            f"?? {dosage} pill(s) taken correctly\n"
-            f"? {time.strftime('%H:%M:%S')}\n\n"
+            f"*DOSE CONFIRMED*\n\n"
+            f"Medicine: {name}\n"
+            f"Amount: {dosage} pill(s)\n"
+            f"Confirmed at: {taken_at}\n\n"
             f"Great job staying on track!"
         )
-        
         return self.send_message(self.patient_chat_id, message)
-    
+
     def send_incorrect_dosage_alert(self, medicine_name: str, expected: int, actual: int) -> bool:
-        """
-        Send alert about incorrect dosage
-        
-        Args:
-            medicine_name: Name of medication
-            expected: Expected number of pills
-            actual: Actual number taken
-            
-        Returns:
-            True if sent successfully
-        """
-        # Alert to patient
-        patient_message = (
-            f"?? *Dosage Warning*\n\n"
-            f"?? Medicine: {medicine_name}\n"
+        name = self._escape_md(medicine_name)
+        patient_msg = (
+            f"*DOSAGE WARNING*\n\n"
+            f"Medicine: {name}\n"
             f"Expected: {expected} pill(s)\n"
             f"Detected: {actual} pill(s)\n\n"
-            f"Please verify your dosage."
+            f"Please check your dosage and try again."
         )
-        
-        # Alert to caregiver
-        caregiver_message = (
-            f"?? *Incorrect Dosage Alert*\n\n"
+        caregiver_msg = (
+            f"*ALERT - Incorrect Dosage*\n\n"
             f"Patient took incorrect dosage:\n"
-            f"?? Medicine: {medicine_name}\n"
-            f"?? Expected: {expected} pill(s)\n"
-            f"?? Actual: {actual} pill(s)\n"
-            f"? Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            f"Medicine: {name}\n"
+            f"Expected: {expected} pill(s)\n"
+            f"Actual taken: {actual} pill(s)\n"
+            f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        
-        patient_sent = self.send_message(self.patient_chat_id, patient_message)
-        caregiver_sent = self.send_message(self.caregiver_chat_id, caregiver_message)
-        
+        patient_sent = self.send_message(self.patient_chat_id, patient_msg)
+        caregiver_sent = self.send_message(self.caregiver_chat_id, caregiver_msg)
         return patient_sent and caregiver_sent
         
     def send_missed_dose_alert(self, medicine_name: str, scheduled_time: str, timeout_minutes: int) -> bool:
-        """
-        Send alert about missed dose
-        
-        Args:
-            medicine_name: Name of medication
-            scheduled_time: Scheduled time
-            timeout_minutes: How long system waited
-            
-        Returns:
-            True if sent successfully
-        """
-        # Alert to patient
-        patient_message = (
-            f"? *Missed Dose Alert*\n\n"
-            f"?? Medicine: {medicine_name}\n"
-            f"? Scheduled: {scheduled_time}\n\n"
+        name = self._escape_md(medicine_name)
+        patient_msg = (
+            f"*MISSED DOSE*\n\n"
+            f"Medicine: {name}\n"
+            f"Scheduled at: {scheduled_time}\n\n"
             f"Please take your medication as soon as possible."
         )
-        
-        # Alert to caregiver
-        caregiver_message = (
-            f"?? *Missed Dose - Action Required*\n\n"
-            f"Patient missed medication dose:\n"
-            f"?? Medicine: {medicine_name}\n"
-            f"? Scheduled: {scheduled_time}\n"
-            f"?? Timeout: {timeout_minutes} minutes\n"
-            f"?? Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        caregiver_msg = (
+            f"*ALERT - Missed Dose*\n\n"
+            f"Patient missed a medication dose:\n"
+            f"Medicine: {name}\n"
+            f"Scheduled at: {scheduled_time}\n"
+            f"No action after: {timeout_minutes} minutes\n"
+            f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             f"Please check on the patient."
         )
-        
-        patient_sent = self.send_message(self.patient_chat_id, patient_message)
-        caregiver_sent = self.send_message(self.caregiver_chat_id, caregiver_message)
-        
+        patient_sent = self.send_message(self.patient_chat_id, patient_msg)
+        caregiver_sent = self.send_message(self.caregiver_chat_id, caregiver_msg)
         return patient_sent and caregiver_sent
-    
+
     def send_behavioral_alert(self, medicine_name: str, issue: str, details: Dict[str, Any]) -> bool:
-        """
-        Send alert about behavioral issues during intake
-        
-        Args:
-            medicine_name: Name of medication
-            issue: Type of issue (e.g., "excessive_coughing")
-            details: Additional details
-            
-        Returns:
-            True if sent successfully
-        """
-        # Format issue description
-        issue_descriptions = {
-            'excessive_coughing': '?? Excessive coughing detected',
-            'no_swallow': '? No swallowing motion detected',
-            'concerning': '?? Concerning behavioral patterns'
+        name = self._escape_md(medicine_name)
+        issue_labels = {
+            'excessive_coughing': 'Excessive coughing detected',
+            'no_swallow':         'No swallowing motion detected',
+            'concerning':         'Concerning behavior during intake',
         }
-        
-        issue_text = issue_descriptions.get(issue, f'?? {issue}')
-        
-        # Alert to caregiver only (don't alarm patient)
+        issue_text = issue_labels.get(issue, f'Behavioral issue: {self._escape_md(issue)}')
+
         message = (
-            f"?? *Behavioral Alert*\n\n"
+            f"*ALERT - Behavioral Issue*\n\n"
             f"Issue during medication intake:\n"
             f"{issue_text}\n\n"
-            f"?? Medicine: {medicine_name}\n"
-            f"? Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"Medicine: {name}\n"
+            f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             f"Details:\n"
         )
-        
-        # Add details
+
         if details.get('cough_count'):
-            message += f"• Coughs detected: {details['cough_count']}\n"
+            message += f"- Coughs detected: {details['cough_count']}\n"
         if details.get('swallow_count') is not None:
-            message += f"• Swallows detected: {details['swallow_count']}\n"
+            message += f"- Swallows detected: {details['swallow_count']}\n"
         if details.get('compliance_status'):
-            message += f"• Status: {details['compliance_status']}\n"
-        
+            message += f"- Status: {self._escape_md(str(details['compliance_status']))}\n"
+
         return self.send_message(self.caregiver_chat_id, message)
+
+    def send_registration_confirmation(
+        self,
+        medicine_name: str,
+        station_id: str,
+        dosage: int,
+        schedule_times: List[str]
+    ) -> bool:
+        # station_id contains underscores (e.g. station_1) which must be escaped
+        name = self._escape_md(medicine_name)
+        sid  = self._escape_md(station_id)
+        times_str = ', '.join(schedule_times) if schedule_times else 'Not set'
+        message = (
+            f"*MEDICINE REGISTERED*\n\n"
+            f"Medicine: *{name}*\n"
+            f"Station: {sid}\n"
+            f"Dosage: {dosage} pill(s) per dose\n"
+            f"Schedule: {times_str}\n\n"
+            f"The system will send reminders at the scheduled times."
+        )
+        patient_sent = self.send_message(self.patient_chat_id, message)
+        caregiver_sent = self.send_message(self.caregiver_chat_id, message)
+        return patient_sent and caregiver_sent
         
     def send_daily_compliance_report(self, report_data: Dict[str, Any]) -> bool:
-        """
-        Send daily compliance report to caregiver
-        
-        Args:
-            report_data: Compliance statistics
-            
-        Returns:
-            True if sent successfully
-        """
-        date_str = time.strftime('%Y-%m-%d')
-        
-        message = (
-            f"?? *Daily Compliance Report*\n"
-            f"?? Date: {date_str}\n\n"
-        )
-        
-        # Add statistics
-        total_doses = report_data.get('total_scheduled', 0)
-        taken_correctly = report_data.get('taken_correctly', 0)
-        taken_incorrectly = report_data.get('taken_incorrectly', 0)
+        total = report_data.get('total_scheduled', 0)
+        correct = report_data.get('taken_correctly', 0)
+        incorrect = report_data.get('taken_incorrectly', 0)
         missed = report_data.get('missed', 0)
-        
-        compliance_rate = (taken_correctly / total_doses * 100) if total_doses > 0 else 0
-        
-        message += f"? Taken correctly: {taken_correctly}/{total_doses}\n"
-        message += f"?? Incorrect dosage: {taken_incorrectly}\n"
-        message += f"? Missed: {missed}\n"
-        message += f"?? Compliance rate: {compliance_rate:.1f}%\n\n"
-        
-        # Behavioral summary
-        if report_data.get('behavioral_issues', 0) > 0:
-            message += f"?? Behavioral issues: {report_data['behavioral_issues']}\n"
-        
-        # Overall status
-        if compliance_rate >= 90:
-            message += "\n? Excellent compliance!"
-        elif compliance_rate >= 70:
-            message += "\n?? Good compliance"
+        rate = (correct / total * 100) if total > 0 else 0.0
+
+        if rate >= 90:
+            status = "Excellent compliance"
+        elif rate >= 70:
+            status = "Good compliance"
         else:
-            message += "\n?? Needs attention"
-        
+            status = "Needs attention"
+
+        message = (
+            f"*DAILY COMPLIANCE REPORT*\n"
+            f"Date: {time.strftime('%Y-%m-%d')}\n\n"
+            f"Taken correctly: {correct}/{total}\n"
+            f"Incorrect dosage: {incorrect}\n"
+            f"Missed: {missed}\n"
+            f"Compliance rate: {rate:.1f}%\n\n"
+            f"Status: {status}"
+        )
+
+        if report_data.get('behavioral_issues', 0) > 0:
+            message += f"\nBehavioral issues noted: {report_data['behavioral_issues']}"
+
         return self.send_message(self.caregiver_chat_id, message)
-    
+
     def _process_queue(self):
-        """Process queued messages (runs in background thread)"""
-        self.logger.info("Starting message queue processor")
-        
+        """
+        Background thread that retries queued messages every 30 seconds.
+        Processes one message per cycle so a large backlog does not cause
+        a burst of API calls that triggers rate limiting.
+        Sleeps for 60 seconds after an unexpected error to avoid a tight error loop.
+        """
+        self.logger.info("Message queue processor started")
         while self.queue_processor_running:
             try:
-                # Check if we have queued messages
                 if len(self.message_queue) > 0:
                     with self.queue_lock:
-                        # Try to send oldest message
-                        msg = self.message_queue[0]
-                        
-                        success = self.send_message(
-                            msg['chat_id'],
-                            msg['message'],
-                            msg['parse_mode']
-                        )
-                        
-                        if success:
-                            # Remove from queue
-                            self.message_queue.popleft()
-                            self._save_queued_messages()
-                            self.logger.info(
-                                f"Queued message sent ({len(self.message_queue)} remaining)"
+                        if self.message_queue:
+                            msg = self.message_queue[0]
+                            success = self.send_message(
+                                msg['chat_id'],
+                                msg['message'],
+                                msg.get('parse_mode', 'Markdown')
                             )
-                
-                # Sleep before next check
-                time.sleep(30)  # Check every 30 seconds
-                
+                            if success:
+                                self.message_queue.popleft()
+                                self._save_queued_messages()
+                                self.logger.info(
+                                    f"Queued message delivered ({len(self.message_queue)} remaining)"
+                                )
+                time.sleep(30)
             except Exception as e:
-                self.logger.error(f"Error in queue processor: {e}")
+                self.logger.error(f"Queue processor error: {e}")
                 time.sleep(60)
-        
+
         self.logger.info("Message queue processor stopped")
         
     def start_queue_processor(self):
-        """Start background queue processor"""
+        """Launch the background retry thread. Called once during system startup."""
         if self.queue_processor_running:
-            self.logger.warning("Queue processor already running")
             return
-        
         self.queue_processor_running = True
         self.queue_processor_thread = Thread(target=self._process_queue, daemon=True)
         self.queue_processor_thread.start()
         self.logger.info("Queue processor started")
-    
+
     def stop_queue_processor(self):
-        """Stop background queue processor"""
+        """Signal the retry thread to stop and wait up to 5 seconds for it to exit."""
         self.queue_processor_running = False
         if self.queue_processor_thread:
             self.queue_processor_thread.join(timeout=5)
         self.logger.info("Queue processor stopped")
-    
+
     def get_queue_size(self) -> int:
-        """Get number of queued messages"""
+        """Returns the number of messages currently waiting to be delivered."""
         return len(self.message_queue)
-    
+
     def is_connected(self) -> bool:
-        """Check if bot is connected (based on last successful send)"""
+        """
+        True if the last successful send was within the past 5 minutes.
+        Used by the main system to decide whether to surface a connectivity warning.
+        """
         if not self.is_online:
             return False
-        
-        # Consider offline if no successful send in last 5 minutes
-        time_since_check = time.time() - self.last_connection_check
-        return time_since_check < 300
-    
+        return (time.time() - self.last_connection_check) < 300
+
     def cleanup(self):
-        """Cleanup resources"""
+        """Stop the retry thread and persist any remaining queued messages before exit."""
         self.stop_queue_processor()
         self._save_queued_messages()
-        
         if self.loop and not self.loop.is_closed():
             self.loop.close()
-        
         self.logger.info("Telegram bot cleanup complete")

@@ -71,14 +71,14 @@ class MedicineScanner:
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
 
             # Warm up webcam
-            time.sleep(2.0)
+            time.sleep(4.0)
 
             # Try several frames, but do NOT fail just because they are dark
             ret = False
             frame = None
             frame_means = []
 
-            for _ in range(10):
+            for _ in range(20):
                 ret, frame = self.camera.read()
 
                 if ret and frame is not None:
