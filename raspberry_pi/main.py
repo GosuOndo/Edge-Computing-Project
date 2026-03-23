@@ -44,22 +44,8 @@ from modules.registration_manager import RegistrationManager
 class MedicationSystem:
     """
     Top-level orchestrator for the Smart Medication Verification System.
-
-    Responsibilities:
-    - Initialise and wire together all hardware and software modules
-    - Run registration flow at startup for any unregistered stations
-    - Run the main event loop on the main thread (required by pygame)
-    - Route weight events from the MQTT thread safely onto the main thread
-    - Drive the state machine through: IDLE -> REMINDER_ACTIVE -> VERIFYING
-      -> MONITORING_PATIENT -> IDLE
-
-    Thread safety note:
-    The MQTT client runs its own background thread. Callbacks that arrive on
-    that thread (_on_weight_data, _on_pill_removal) must never touch pygame
-    or make blocking calls. Instead they set pending_* flags which the main
-    loop picks up on its next tick.
     """
-    
+
     def __init__(
         self,
         config_path: str = "config/config.yaml",
@@ -68,27 +54,20 @@ class MedicationSystem:
     ):
         self.config = get_config(config_path)
         self.logger = get_logger(self.config.get_logging_config())
-
         self.logger.info("Smart Medication Verification System starting")
 
         self.enable_display = enable_display
         self.enable_audio = enable_audio
-
         self.running = False
         self._stop_called = False
 
         self.state_machine = StateMachine(self.logger)
         self.current_medication = None
 
-        # Weight events arrive on the MQTT thread; processed on the main thread
         self.pending_weight_event = None
         self.pending_weight_lock = False
-
-        # Manual reminders injected by test scripts
         self.pending_manual_reminder = None
         self.pending_manual_reminder_lock = False
-
-        # Monitoring progress for display (set by monitoring thread, read by main)
         self.pending_monitoring_ui = None
 
         self._initialize_modules()
@@ -99,14 +78,9 @@ class MedicationSystem:
     # ------------------------------------------------------------------
     # Module initialisation
     # ------------------------------------------------------------------
-
+    
     def _initialize_modules(self):
-        """
-        Instantiate every module and wire up callbacks.
-        Order matters: database and MQTT must come first.
-        """
         self.logger.info("Initializing modules...")
-
         try:
             self.database = Database(self.config["database"], self.logger)
             self.database.connect()
@@ -120,8 +94,6 @@ class MedicationSystem:
             )
             self.weight_manager.set_pill_removal_callback(self._on_pill_removal)
 
-            # Merge OCR config and camera hardware config so MedicineScanner
-            # gets device_id from hardware.camera
             scanner_config = dict(self.config["ocr"])
             scanner_config.update(self.config["hardware"].get("camera", {}))
             self.scanner = MedicineScanner(scanner_config, self.logger)
@@ -132,7 +104,7 @@ class MedicationSystem:
 
             self.telegram = TelegramBot(self.config["telegram"], self.logger)
             self.telegram.start_queue_processor()
-            
+
             if self.enable_display:
                 self.display = DisplayManager(
                     self.config["hardware"]["display"], self.logger
@@ -206,17 +178,29 @@ class MedicationSystem:
     # ------------------------------------------------------------------
     # Medicine ID resolution
     # ------------------------------------------------------------------
+    
+    def _resolve_medicine_id_for_station(
+        self, station_id: str, medicine_name: str = None
+    ):
+        """
+        Look up medicine_id for a station.
+        If medicine_name is provided, matches by both station_id AND name
+        so that multiple medicines on one station resolve correctly.
+        Falls back to the first registered medicine for the station.
+        """
+        if medicine_name:
+            all_registered = self.database.list_registered_medicines()
+            for r in all_registered:
+                if (r.get("station_id") == station_id and
+                        r.get("medicine_name", "").upper() == medicine_name.upper()):
+                    return r.get("medicine_id")
 
-    def _resolve_medicine_id_for_station(self, station_id: str):
-        """
-        Query the database to find which medicine_id is registered for
-        this station. Returns None if no medicine has been registered yet.
-        """
+        # Fallback: first medicine registered for this station
         registered = self.database.get_registered_medicine_by_station(station_id)
         if registered:
             return registered.get("medicine_id")
         return None
-        
+
     # ------------------------------------------------------------------
     # Manual reminder injection (test scripts)
     # ------------------------------------------------------------------
@@ -243,29 +227,17 @@ class MedicationSystem:
     # ------------------------------------------------------------------
 
     def _on_weight_data(self, data: dict):
-        """Forward raw weight data to the weight manager for FSM processing."""
         if not hasattr(self, "weight_manager"):
             return
         self.weight_manager.process_weight_data(data)
 
     def _on_pill_removal(self, event_data: dict):
-        """
-        Called by WeightManager from the MQTT thread when a pill removal is
-        confirmed by the two-phase FSM.
-
-        We only care when a reminder is active and the event is for the
-        correct station. The event is stored as pending rather than processed
-        here because verification makes blocking calls that must run on the
-        main thread.
-        """
         self.logger.info(
             f"Pill removal detected: {event_data['pills_removed']} pill(s) "
             f"from {event_data['station_id']}"
         )
-
         if self.state_machine.get_state() != SystemState.REMINDER_ACTIVE:
             return
-
         station_id = event_data["station_id"]
         if (
             self.current_medication
@@ -273,7 +245,7 @@ class MedicationSystem:
         ):
             self.pending_weight_event = event_data
             self.logger.info("Weight event queued for main-thread processing")
-
+            
     # ------------------------------------------------------------------
     # Main-thread event processing
     # ------------------------------------------------------------------
@@ -282,7 +254,6 @@ class MedicationSystem:
         """Drain a pending weight event on the main thread."""
         if self.pending_weight_lock or not self.pending_weight_event:
             return
-
         event_data = self.pending_weight_event
         self.pending_weight_event = None
         self.pending_weight_lock = True
@@ -295,29 +266,28 @@ class MedicationSystem:
             self.pending_weight_lock = False
 
     def _render_pending_monitoring_ui(self):
-        """Apply the latest monitoring progress to the display (main thread only)."""
         if not self.display or not self.pending_monitoring_ui:
             return
         elapsed, duration, message = self.pending_monitoring_ui
         self.display.show_monitoring_screen(elapsed, duration, message)
-        
+
     # ------------------------------------------------------------------
     # Reminder / missed-dose callbacks
     # ------------------------------------------------------------------
 
     def _on_medication_reminder(self, reminder_data: dict):
-        """
-        Entry point for a scheduled dose event.
-        Resolves medicine_id from the database, arms the weight sensor FSM,
-        transitions state, then notifies via display, audio, and Telegram.
-        """
         self.logger.info(f"Medication reminder triggered: {reminder_data}")
-
         self.current_medication = reminder_data
-
         station_id = reminder_data["station_id"]
 
-        medicine_id = self._resolve_medicine_id_for_station(station_id)
+        # Use medicine_id from reminder_data if already provided (e.g. test injection
+        # or manual trigger). Otherwise resolve by station + medicine name so that
+        # multiple medicines on the same station resolve correctly.
+        medicine_id = reminder_data.get("medicine_id") or \
+            self._resolve_medicine_id_for_station(
+                station_id, reminder_data.get("medicine_name")
+            )
+
         if medicine_id:
             self.current_medication["medicine_id"] = medicine_id
             self.logger.info(f"Resolved medicine_id={medicine_id} for {station_id}")
@@ -328,10 +298,7 @@ class MedicationSystem:
             )
 
         self.weight_manager.enable_event_detection(station_id)
-
-        self.state_machine.transition_to(
-            SystemState.REMINDER_ACTIVE, reminder_data
-        )
+        self.state_machine.transition_to(SystemState.REMINDER_ACTIVE, reminder_data)
 
         medicine_name = reminder_data["medicine_name"]
         dosage = reminder_data["dosage_pills"]
@@ -341,14 +308,9 @@ class MedicationSystem:
             self.display.show_reminder_screen(medicine_name, dosage, time_str)
         if self.audio:
             self.audio.announce_reminder(medicine_name, dosage)
-
         self.telegram.send_medication_reminder(medicine_name, dosage, time_str)
 
     def _on_missed_dose(self, missed_data: dict):
-        """
-        Called by the scheduler when the timeout window expires without a dose.
-        Sends alerts, logs NO_INTAKE, resets to IDLE.
-        """
         self.logger.warning(f"Missed dose: {missed_data}")
 
         self.telegram.send_missed_dose_alert(
@@ -382,41 +344,24 @@ class MedicationSystem:
             "scores": {}
         }
         self.database.log_medication_event(missed_event)
-
         self.state_machine.reset_to_idle()
 
         if self.current_medication:
             self.weight_manager.disable_event_detection(
                 self.current_medication["station_id"]
             )
-
         self.current_medication = None
         self.pending_monitoring_ui = None
 
         if self.display:
             self.display.show_idle_screen(self.scheduler.get_next_scheduled_time())
-            
+
     # ------------------------------------------------------------------
     # Verification pipeline
     # ------------------------------------------------------------------
 
     def _verify_medication_intake(self, weight_event: dict):
-        """
-        Full verification pipeline triggered after a pill removal is confirmed.
-
-        Steps:
-        1. Identity   integrated tag check (coincident scan near weight event)
-                       falls back to QR then OCR automatically
-        2. Weight     confirm correct pill count from weight delta
-        3. Monitoring confirm patient consumed pills (30 s camera window)
-        4. Decision   combine all results into a single outcome
-        5. Feedback   display, audio, Telegram, database
-
-        The weight_event dict carries the timestamp of the bottle-placement
-        moment, which is used as the anchor for the coincident tag window.
-        """
         self.logger.info("Starting medication verification...")
-
         if not self.running:
             return
 
@@ -425,16 +370,12 @@ class MedicationSystem:
         expected_medicine_id = self.current_medication.get("medicine_id")
         expected_station_id = self.current_medication["station_id"]
 
-        # ---- Step 1: Identity (integrated tag -> QR -> OCR) ----
         if self.display:
             self.display.show_monitoring_screen(
                 0, 5, "Verifying medicine identity..."
             )
 
-        # The weight_event timestamp is when the bottle was placed back and
-        # the weight stabilised. The tag scan arrived just before this.
         weight_event_ts = weight_event.get("timestamp", time.time())
-
         identity_cfg = self.config.get("identity", {})
         tag_cfg = identity_cfg.get("tag", {})
         integrated_mode = tag_cfg.get("integrated_mode", True)
@@ -445,7 +386,6 @@ class MedicationSystem:
             self.scanner.initialize_camera()
 
             if integrated_mode:
-                # Primary path: coincident tag scan (no patient action needed)
                 identity_result = self.identity_manager.verify_identity_integrated(
                     expected_medicine_id=expected_medicine_id,
                     expected_medicine_name=medicine_name,
@@ -454,7 +394,6 @@ class MedicationSystem:
                     coincident_window_seconds=coincident_window
                 )
             else:
-                # Legacy path: active-wait tag then QR then OCR
                 identity_result = self.identity_manager.verify_identity(
                     expected_medicine_id=expected_medicine_id,
                     expected_medicine_name=medicine_name,
@@ -466,9 +405,7 @@ class MedicationSystem:
             if identity_result.get("success"):
                 ocr_result = {
                     "success": True,
-                    "medicine_name": identity_result.get(
-                        "medicine_name", medicine_name
-                    ),
+                    "medicine_name": identity_result.get("medicine_name", medicine_name),
                     "confidence": identity_result.get("confidence", 1.0),
                     "verified": True,
                     "method": identity_result.get("method")
@@ -479,12 +416,10 @@ class MedicationSystem:
                     "medicine_name": None,
                     "confidence": 0.0,
                     "verified": False,
-                    "error": identity_result.get(
-                        "reason", "Identity verification failed"
-                    ),
+                    "error": identity_result.get("reason", "Identity verification failed"),
                     "method": identity_result.get("method", "none")
                 }
-                
+
         except Exception as e:
             self.logger.warning(f"Identity verification error: {e}")
             ocr_result = {
@@ -501,7 +436,6 @@ class MedicationSystem:
         if not self.running:
             return
 
-        # ---- Step 2: Weight verification ----
         weight_result = self.weight_manager.verify_dosage(
             expected_station_id, expected_dosage
         )
@@ -510,10 +444,8 @@ class MedicationSystem:
         if not self.running:
             return
 
-        # ---- Step 3: Patient monitoring (30 s) ----
         self.logger.info("Starting patient monitoring (30 seconds)...")
         self.state_machine.transition_to(SystemState.MONITORING_PATIENT)
-
         monitoring_result = None
         self.pending_monitoring_ui = (0, 30, "Monitoring intake...")
 
@@ -554,7 +486,6 @@ class MedicationSystem:
         if not self.running:
             return
 
-        # ---- Step 4: Decision ----
         self.logger.info("Making verification decision...")
         decision = self.decision_engine.verify_medication_intake(
             expected_medicine=medicine_name,
@@ -564,7 +495,6 @@ class MedicationSystem:
             monitoring_result=monitoring_result
         )
 
-        # ---- Step 5: Feedback ----
         self._handle_decision(decision)
 
         if decision["verified"]:
@@ -574,11 +504,10 @@ class MedicationSystem:
 
         time.sleep(3)
         self.state_machine.reset_to_idle()
-
         self.weight_manager.disable_event_detection(expected_station_id)
         self.current_medication = None
         self.pending_monitoring_ui = None
-        
+
         if self.display:
             self.display.show_idle_screen(self.scheduler.get_next_scheduled_time())
 
@@ -587,16 +516,11 @@ class MedicationSystem:
     # ------------------------------------------------------------------
 
     def _handle_decision(self, decision: dict):
-        """
-        Translate a decision engine result into user-facing output.
-        Each outcome triggers a different display/audio/Telegram combination.
-        """
         result = decision["result"]
         verified = decision["verified"]
         medicine_name = decision["expected_medicine"]
 
         self.logger.info(f"Decision: {result.value} (verified: {verified})")
-
         messages = self.decision_engine.get_alert_messages(decision)
 
         if verified and result == DecisionResult.SUCCESS:
@@ -620,9 +544,7 @@ class MedicationSystem:
                 )
             if self.audio:
                 self.audio.announce_warning(messages["patient_message"])
-            self.telegram.send_incorrect_dosage_alert(
-                medicine_name, expected, actual
-            )
+            self.telegram.send_incorrect_dosage_alert(medicine_name, expected, actual)
 
         elif result == DecisionResult.BEHAVIORAL_ISSUE:
             if self.display:
@@ -653,7 +575,7 @@ class MedicationSystem:
                     self.telegram.caregiver_chat_id,
                     messages["caregiver_message"]
                 )
-                
+
     # ------------------------------------------------------------------
     # Signal handler
     # ------------------------------------------------------------------
@@ -663,21 +585,113 @@ class MedicationSystem:
         self.stop()
 
     # ------------------------------------------------------------------
+    # Schedule helpers
+    # ------------------------------------------------------------------
+
+    def _load_schedule_from_database(self):
+        """
+        Load all registered medicines from the database into the live scheduler.
+        Called on every boot so the schedule is always populated regardless of
+        whether onboarding ran this session.
+        """
+        registered = self.database.list_registered_medicines()
+        if not registered:
+            self.logger.warning("No registered medicines found in database")
+            return
+
+        for record in registered:
+            medicine_name = record.get("medicine_name")
+            station_id    = record.get("station_id")
+            dosage        = record.get("dosage_amount", 1)
+            time_slots    = record.get("time_slots", "")
+
+            if not medicine_name or not time_slots:
+                self.logger.warning(
+                    f"Skipping incomplete record: {record.get('medicine_id')}"
+                )
+                continue
+
+            times = [t.strip() for t in time_slots.split(",") if t.strip()]
+            if not times:
+                continue
+
+            self.scheduler.add_medication(
+                medicine_name=medicine_name,
+                station_id=station_id,
+                dosage_pills=dosage,
+                times=times
+            )
+            self.logger.info(
+                f"Loaded from DB into scheduler: {medicine_name} "
+                f"at {times} on {station_id}"
+            )
+
+        self.logger.info(
+            f"Scheduler loaded "
+            f"{len(self.scheduler.get_scheduled_medicines())} "
+            f"medicine(s) from database"
+        )
+
+    def _build_schedule_summary(self, medicines: list) -> list:
+        """Build a human-readable sorted schedule list from registered medicines."""
+        entries = []
+        for m in medicines:
+            name   = m.get("medicine_name", "Unknown")
+            dosage = m.get("dosage_amount", "?")
+            time_slots = m.get("time_slots", "")
+            for t in time_slots.split(","):
+                t = t.strip()
+                if t:
+                    entries.append(f"{t} - {name} ({dosage} pill(s))")
+        entries.sort()
+        return entries
+
+    # ------------------------------------------------------------------
     # Start / stop
     # ------------------------------------------------------------------
 
     def start(self):
         """
         Start the system:
-        1. Run registration for any unregistered stations (blocking)
-        2. Start the scheduler
-        3. Enter the main event loop (main thread)
+        1. Run onboarding for any unregistered medicines
+        2. Load all registered medicines into the scheduler from DB
+        3. Start the scheduler
+        4. Send onboarding summary only when onboarding actually ran
+        5. Enter the main event loop
         """
         self.logger.info("Starting medication system...")
         self.running = True
 
-        # Registration must complete before scheduling begins
-        self.registration_manager.run_registration_if_needed()
+        EXPECTED_MEDICINE_COUNT = 3
+
+        # Capture state BEFORE onboarding so we can tell if it ran
+        registered_before = self.database.list_registered_medicines()
+        onboarding_was_needed = len(registered_before) < EXPECTED_MEDICINE_COUNT
+
+        all_registered = self.registration_manager.run_onboarding_if_needed(
+            station_id="station_1",
+            expected_medicine_count=EXPECTED_MEDICINE_COUNT,
+            scheduler=self.scheduler
+        )
+
+        if not all_registered:
+            self.logger.error(
+                "Onboarding did not complete. System may have partial setup."
+            )
+
+        # Load schedule from DB every boot (handles skip-onboarding case)
+        self._load_schedule_from_database()
+
+        # Only send the onboarding complete Telegram message when onboarding
+        # actually ran this session, not on every subsequent boot
+        if onboarding_was_needed and all_registered:
+            registered_medicines = self.database.list_registered_medicines()
+            if registered_medicines:
+                schedule_summary = self._build_schedule_summary(registered_medicines)
+                self.telegram.send_onboarding_complete(
+                    medicines=registered_medicines,
+                    schedule_summary=schedule_summary
+                )
 
         self.scheduler.start()
 
@@ -704,10 +718,7 @@ class MedicationSystem:
             self.stop()
 
     def stop(self):
-        """
-        Graceful shutdown: stop all background threads, flush the Telegram
-        queue to disk, and release hardware resources.
-        """
+        """Graceful shutdown: stop all background threads and release resources."""
         if self._stop_called:
             return
         self._stop_called = True
@@ -731,12 +742,11 @@ class MedicationSystem:
                 self.tag_runtime_service.stop()
             if hasattr(self, "database") and self.database:
                 self.database.cleanup()
-
             self.logger.info("System stopped gracefully")
-
         except Exception as e:
             self.logger.error(f"Error during shutdown: {e}")
-            
+
+
 def main():
     config_path = Path("config/config.yaml")
     if not config_path.exists():

@@ -70,84 +70,98 @@ class RegistrationManager:
                 unregistered.append(station_id)
         return unregistered
 
-    def run_registration_if_needed(self) -> bool:
+    def run_onboarding_if_needed(
+        self,
+        station_id: str,
+        expected_medicine_count: int,
+        scheduler=None
+    ) -> bool:
         """
-        Check every configured station and run registration for any that are
-        unregistered. Called once during system startup before the main loop.
-        Returns True if all stations are now registered and ready.
+        Sequential onboarding: register up to expected_medicine_count
+        medicines on a single station, one at a time.
+
+        After each successful registration, if a scheduler is provided,
+        the medicine is dynamically added to the live schedule.
+
+        Returns True when the target count is reached.
         """
         if not self.enabled:
-            self.logger.info("Registration disabled in config, skipping")
+            self.logger.info("Registration disabled, skipping onboarding")
             return True
 
-        unregistered = self.stations_needing_registration()
-        if not unregistered:
+        registered = self.database.list_registered_medicines()
+        registered_ids = {r["medicine_id"] for r in registered}
+        registered_count = len(registered)
+
+        if registered_count >= expected_medicine_count:
             self.logger.info(
-                f"All {len(self.weight_manager.station_configs)} station(s) "
-                f"already registered. Skipping registration."
+                f"All {expected_medicine_count} medicines already registered"
             )
             return True
 
-        self.logger.info(f"Stations needing registration: {unregistered}")
-        all_ok = True
-        for station_id in unregistered:
-            ok = self._register_station(station_id)
-            if not ok:
-                self.logger.error(f"Registration failed for {station_id}")
-                all_ok = False
+        remaining = expected_medicine_count - registered_count
+        self.logger.info(
+            f"Onboarding: {registered_count}/{expected_medicine_count} registered, "
+            f"need {remaining} more"
+        )
 
-        return all_ok
-
-    # ------------------------------------------------------------------
-    # Core registration flow
-    # ------------------------------------------------------------------
-
-    def _register_station(self, station_id: str) -> bool:
-        """
-        Registration flow for a single station.
-
-        Phase A - Wait for stable weight:
-            Poll until weight > min_bottle_weight_g AND stable.
-            Record bottle_detected_at the moment weight first exceeds threshold
-            (even before it stabilises) so we capture any tag scan that arrives
-            as soon as the bottle touches the reader.
-
-        Phase B - Find tag scan:
-            Accept any scan that arrived at or after bottle_detected_at.
-            Do NOT clear the scan buffer between phases.
-            If no scan found yet, wait up to tag_wait_seconds for a new one.
-
-        Phase C - Build record, save, capture baseline.
-        """
-        self.logger.info(f"Starting registration for {station_id}")
-        print(f"\n  [REGISTRATION] Station: {station_id}")
-        print(f"  [REG] Place the medicine bottle on the station.")
-        print(f"  [REG] The tag is read on contact; weight needs a few seconds to stabilise.")
-
-        if self.display:
-            self.display.show_registration_screen(
-                station_id, "Place medicine bottle on scale"
+        for slot in range(registered_count + 1, expected_medicine_count + 1):
+            success = self._onboard_one_medicine(
+                station_id=station_id,
+                slot_number=slot,
+                total=expected_medicine_count,
+                registered_ids=registered_ids,
+                scheduler=scheduler
             )
+            if not success:
+                self.logger.error(f"Onboarding failed at slot {slot}")
+                return False
+            # Refresh the set after each successful registration
+            registered = self.database.list_registered_medicines()
+            registered_ids = {r["medicine_id"] for r in registered}
+
+        return True
+
+    def _onboard_one_medicine(
+        self,
+        station_id: str,
+        slot_number: int,
+        total: int,
+        registered_ids: set,
+        scheduler=None
+    ) -> bool:
+        """
+        Register a single medicine interactively.
+        Waits for the user to place a bottle, reads the tag,
+        confirms it is a new medicine, saves it, and adds it
+        to the scheduler.
+        """
+        self.logger.info(
+            f"Onboarding slot {slot_number}/{total} on {station_id}"
+        )
+
+        # ---- Guide the user ----
+        msg = f"Medicine {slot_number} of {total} - Place bottle on station"
+        if self.display:
+            self.display.show_registration_screen(station_id, msg)
         if self.audio:
             self.audio.speak(
-                "Please place the medicine bottle on the scale to register."
+                f"Please place medicine {slot_number} of {total} "
+                f"onto the station now."
             )
 
         deadline = time.time() + self.timeout_seconds
 
         # ---- Phase A: wait for stable weight ----
-        print(f"  [REG] Phase A: waiting for stable bottle (>{self.min_bottle_weight_g}g)...")
         stable_weight = None
-        bottle_detected_at = None  # when weight first crossed threshold
+        bottle_detected_at = None
 
         while time.time() < deadline:
             if self.display:
                 self.display.update()
 
             status = self.weight_manager.get_station_status(station_id)
-
             if not status.get("connected"):
-                self._update_screen(station_id, "Waiting for scale connection...")
                 time.sleep(0.5)
                 continue
 
@@ -155,148 +169,174 @@ class RegistrationManager:
             is_stable = status.get("stable", False)
 
             if weight_g < self.min_bottle_weight_g:
-                if bottle_detected_at is not None:
-                    # Bottle was removed, reset
-                    bottle_detected_at = None
-                    print("  [REG] Bottle removed, waiting again...")
-                self._update_screen(station_id, "Place full bottle on scale...")
+                bottle_detected_at = None
                 time.sleep(0.3)
                 continue
 
-            # Bottle is present - record the moment it first appeared
             if bottle_detected_at is None:
                 bottle_detected_at = time.time()
-                print(f"  [REG] Bottle detected ({weight_g:.1f}g), waiting to stabilise...")
-                self._update_screen(station_id, f"Bottle detected ({weight_g:.1f}g), stabilising...")
+                self._update_screen(
+                    station_id,
+                    f"Bottle detected ({weight_g:.1f}g) - stabilising..."
+                )
 
             if not is_stable:
                 time.sleep(0.3)
                 continue
 
-            # Stable bottle confirmed
             stable_weight = weight_g
-            print(f"  [REG] Phase A done: stable at {stable_weight:.2f}g "
-                  f"(bottle appeared {time.time() - bottle_detected_at:.1f}s ago)")
             break
         else:
             self._timeout(station_id)
             return False
-            
+
         # ---- Phase B: find tag scan ----
-        # Accept any scan that arrived from the moment the bottle appeared.
-        # A small lookback buffer (2s before bottle_detected_at) handles the
-        # case where the reader fires a scan fractionally before the weight
-        # sensor reports above threshold.
         lookback_from = bottle_detected_at - 2.0
-
-        print(f"  [REG] Phase B: looking for tag scan since bottle appeared...")
-        self._update_screen(station_id, "Reading tag... (tag scanned on contact)")
-
+        self._update_screen(station_id, "Reading tag...")
+        if self.audio:
+            self.audio.speak("Reading tag.")
         scan_msg = None
         tag_deadline = time.time() + self.tag_wait_seconds
-        dots = 0
 
         while time.time() < tag_deadline and time.time() < deadline:
             if self.display:
                 self.display.update()
-
             latest = self.tag_runtime_service.get_latest_scan()
             if latest and latest.get("received_at", 0) >= lookback_from:
                 scan_msg = latest["scan_msg"]
-                tag_age = time.time() - latest["received_at"]
-                tag_uid = scan_msg.get("tag_uid", "?")
-                print(f"  [REG] Phase B done: tag UID={tag_uid} "
-                      f"(arrived {tag_age:.1f}s ago)")
                 break
-
-            dots += 1
-            if dots % 10 == 0:
-                elapsed_b = time.time() - (tag_deadline - self.tag_wait_seconds)
-                print(f"  [REG] Waiting for tag scan... ({elapsed_b:.0f}s). "
-                      "Hold bottle still on station.")
-                self._update_screen(
-                    station_id,
-                    f"Tag not yet detected - hold bottle still ({elapsed_b:.0f}s)"
-                )
             time.sleep(0.3)
         else:
-            remaining = deadline - time.time()
-            self.logger.warning(
-                f"[{station_id}] No tag scan within {self.tag_wait_seconds}s of "
-                "bottle placement. Is the sticker on the bottle bottom and the "
-                "bottle fully seated on the reader?"
-            )
-            print(f"\n  [REG] No tag scan received in {self.tag_wait_seconds}s.")
-            print("  Possible causes:")
-            print("  - RFID sticker is not on the bottle bottom")
-            print("  - Bottle not fully seated over the RC522 reader")
-            print("  - RC522 firmware not running / not publishing to MQTT")
-            self._update_screen(
-                station_id,
-                "No tag - check sticker on bottle bottom, re-seat bottle"
-            )
-            if remaining < 5:
-                self._timeout(station_id)
-                return False
-            # Give user a chance to re-seat without full restart
-            print(f"  Retrying... ({remaining:.0f}s remaining)")
-            # Reset bottle detection so Phase A runs again
-            return self._register_station_retry(station_id, deadline)
+            self.logger.warning("No tag scan received during onboarding window")
+            self._update_screen(station_id, "No tag - check sticker, re-seat bottle")
+            if self.audio:
+                self.audio.speak(
+                    "No tag detected. Please check the sticker and try again."
+                )
+            time.sleep(2.0)
+            return False
 
-        # ---- Phase C: build record, persist, capture baseline ----
+        # ---- Phase C: build and validate record ----
         record = self._build_registration_record(station_id, stable_weight, scan_msg)
-
         if record is None:
-            self.logger.warning(
-                f"[{station_id}] Tag payload unreadable. "
-                "Ensure sticker was written with medication_tag_write_read_test."
-            )
-            print("  [REG] Tag payload could not be parsed.")
-            print("  Check the sticker was written with medication_tag_write_read_test.ino")
-            self.tag_runtime_service.clear_latest_scan()
             self._update_screen(station_id, "Tag unreadable - check sticker content")
             if self.audio:
-                self.audio.speak("Tag unreadable. Please try again.")
+                self.audio.speak("Tag could not be read. Please check the sticker.")
             time.sleep(2.0)
-            return self._register_station_retry(station_id, deadline)
+            return False
 
+        medicine_id = record.get("medicine_id")
+        medicine_name = record.get("medicine_name", "Unknown")
+
+        # ---- Duplicate check ----
+        if medicine_id in registered_ids:
+            self.logger.warning(
+                f"Medicine {medicine_id} already registered "
+                f"asking user to place a different bottle"
+            )
+            self._update_screen(
+                station_id,
+                f"{medicine_name} already registered - place a different bottle"
+            )
+            if self.audio:
+                self.audio.speak(
+                    f"{medicine_name} is already registered. "
+                    f"Please place a different medicine bottle."
+                )
+            time.sleep(3.0)
+            # Retry this slot
+            return self._onboard_one_medicine(
+                station_id, slot_number, total, registered_ids, scheduler
+            )
+
+        # ---- Save to database ----
         ok = self.database.upsert_registered_medicine(record)
         if not ok:
-            self.logger.error(f"[{station_id}] Database write failed")
+            self.logger.error(f"Database write failed for {medicine_id}")
             return False
-            
-        # Capture baseline - use the stable weight reading from Phase A
+
+        # ---- Capture baseline ----
         self.weight_manager.baseline_weights[station_id] = stable_weight
         self.weight_manager.baseline_capture_required[station_id] = False
         self.weight_manager._save_persisted_baselines()
 
-        medicine_name = record.get("medicine_name", "Unknown")
+        # ---- Parse schedule from tag payload ----
         schedule_times = self._parse_schedule_times(record.get("time_slots", ""))
+        dosage = record.get("dosage_amount", 0)
 
+        # ---- Add to live scheduler ----
+        if scheduler and schedule_times:
+            scheduler.add_medication(
+                medicine_name=medicine_name,
+                station_id=station_id,
+                dosage_pills=dosage,
+                times=schedule_times
+            )
+            self.logger.info(
+                f"Added {medicine_name} to live scheduler: "
+                f"{schedule_times}"
+            )
+
+        # ---- Notify user ----
         self.logger.info(
-            f"[{station_id}] Registered: {medicine_name}  "
-            f"baseline={stable_weight:.2f}g  schedule={schedule_times}"
+            f"Registered: {medicine_name} ({medicine_id}) "
+            f"baseline={stable_weight:.2f}g schedule={schedule_times}"
         )
-        print(f"  [REG] SUCCESS: {medicine_name} registered on {station_id}")
-        print(f"  [REG] Baseline: {stable_weight:.2f}g  Schedule: {schedule_times}")
 
         if self.display:
             self.display.show_registration_success_screen(medicine_name, schedule_times)
-        if self.audio:
-            self.audio.speak(f"{medicine_name} registered successfully.")
 
+        if self.audio:
+            times_spoken = " and ".join(schedule_times) if schedule_times else "as scheduled"
+            self.audio.speak(
+                f"{medicine_name} registered successfully. "
+                f"You will be reminded at {times_spoken}."
+            )
+
+        # ---- Send Telegram confirmation ----
         self.telegram.send_registration_confirmation(
             medicine_name=medicine_name,
             station_id=station_id,
-            dosage=record.get("dosage_amount", 0),
+            dosage=dosage,
             schedule_times=schedule_times
         )
-
-        t_end = time.time() + 4.0
-        while time.time() < t_end:
+    
+        # ---- Hold success screen briefly ----
+        hold_until = time.time() + 4.0
+        while time.time() < hold_until:
             if self.display:
                 self.display.update()
             time.sleep(0.05)
+
+        # ---- Prompt for next bottle ----
+        if slot_number < total:
+            next_msg = (
+                f"Medicine {slot_number} done. "
+                f"Remove bottle and place medicine {slot_number + 1}."
+            )
+            self._update_screen(station_id, next_msg)
+            if self.audio:
+                self.audio.speak(
+                    f"Medicine {slot_number} registered. "
+                    f"Please remove the bottle and place the next medicine."
+                )
+
+            # Wait for bottle to be removed before returning
+            remove_deadline = time.time() + 30.0
+            while time.time() < remove_deadline:
+                if self.display:
+                    self.display.update()
+                status = self.weight_manager.get_station_status(station_id)
+                weight_g = float(status.get("weight_g") or 0.0)
+                if weight_g < self.min_bottle_weight_g:
+                    break
+                time.sleep(0.3)
+            else:
+                self.logger.warning("Bottle not removed after success - continuing anyway")
+
+            # Clear the tag scan buffer so the next bottle gets a fresh read
+            self.tag_runtime_service.clear_latest_scan()
+            time.sleep(1.0)
 
         return True
 

@@ -68,6 +68,49 @@ class MedicationScheduler:
             
             self.logger.info(f"Scheduled: {name} ({dosage} pills) at {scheduled_time} on {station_id}")
     
+    def add_medication(
+        self,
+        medicine_name: str,
+        station_id: str,
+        dosage_pills: int,
+        times: list
+    ):
+        """
+        Dynamically add a medication to the live scheduler.
+        Safe to call multiple times - duplicate names are ignored.
+        """
+        # Check against the medications list, not job objects
+        existing_names = [m["name"] for m in self.medications]
+        if medicine_name in existing_names:
+            self.logger.info(
+                f"Schedule for {medicine_name} already exists, skipping"
+            )
+            return
+
+        medication = {
+            "name":        medicine_name,
+            "station_id":  station_id,
+            "dosage_pills": dosage_pills,
+            "times":        times
+        }
+
+        self.medications.append(medication)
+
+        # Only schedule jobs if the scheduler loop is already running
+        # If not running yet, start() will call _schedule_medication for all
+        # entries in self.medications automatically
+        if self.running:
+            self._schedule_medication(medication)
+
+        self.logger.info(
+            f"Dynamically added schedule: {medicine_name} "
+            f"at {times} on {station_id}"
+        )
+
+    def get_scheduled_medicines(self) -> list:
+        """Return list of currently scheduled medicine names."""
+        return [m["name"] for m in self.medications]
+    
     def _trigger_reminder(self, medicine_name: str, dosage: int, station_id: str, scheduled_time: str):
         """
         Trigger medication reminder
@@ -215,22 +258,26 @@ class MedicationScheduler:
         self.logger.info("Scheduler loop stopped")
     
     def start(self):
-        """Start the medication scheduler"""
         if self.running:
             self.logger.warning("Scheduler already running")
             return
-        
-        # Schedule all medications
+
+        # Schedule all medications currently in self.medications list.
+        # This includes both config-based and dynamically added ones.
         for medication in self.medications:
             self._schedule_medication(medication)
-        
-        # Start scheduler thread
+
         self.running = True
         self.stop_event.clear()
-        self.scheduler_thread = Thread(target=self._scheduler_loop, daemon=True)
+        self.scheduler_thread = Thread(
+            target=self._scheduler_loop, daemon=True
+        )
         self.scheduler_thread.start()
-        
-        self.logger.info("Medication scheduler started")
+
+        self.logger.info(
+            f"Medication scheduler started with "
+            f"{len(self.medications)} medication(s)"
+        )
     
     def stop(self):
         """Stop the medication scheduler"""

@@ -336,6 +336,41 @@ class TelegramBot:
             message += f"\nBehavioral issues noted: {report_data['behavioral_issues']}"
 
         return self.send_message(self.caregiver_chat_id, message)
+        
+    def send_onboarding_complete(
+        self,
+        medicines: list,
+        schedule_summary: list
+    ) -> bool:
+        """
+        Send a summary of all registered medicines and their schedules
+        after onboarding completes. Sent to both patient and caregiver.
+
+        medicines: list of dicts with keys medicine_name, dosage_amount, time_slots
+        schedule_summary: list of strings like "08:00 - Aspirin 100mg (2 pills)"
+        """
+        lines = ["*MEDICATION SETUP COMPLETE*\n"]
+        lines.append("Your medicines have been registered:\n")
+
+        for m in medicines:
+            name = self._escape_md(m.get("medicine_name", "Unknown"))
+            dosage = m.get("dosage_amount", "?")
+            times = m.get("time_slots", "")
+            lines.append(f". *{name}* - {dosage} pill(s) at {times}")
+
+        lines.append("\n*Daily Schedule:*")
+        for entry in schedule_summary:
+            lines.append(f"  {self._escape_md(entry)}")
+
+        lines.append(
+            "\nYou will receive a reminder before each dose. "
+            "Place the correct bottle on the station when reminded."
+        )
+
+        message = "\n".join(lines)
+        patient_sent = self.send_message(self.patient_chat_id, message)
+        caregiver_sent = self.send_message(self.caregiver_chat_id, message)
+        return patient_sent and caregiver_sent
 
     def _process_queue(self):
         """
