@@ -14,12 +14,12 @@ hardware:
     device_id: 0  # /dev/video0
     resolution: [640, 480]
     fps: 30
-    
+
   display:
     width: 1024
     height: 600
-    fullscreen: false
-    
+    fullscreen: false  # set to true for production deployment
+
   audio:
     enabled: true
     volume: 0.8  # 0.0 to 1.0
@@ -30,7 +30,7 @@ mqtt:
   broker_port: 1883
   client_id: "medication_system_pi"
   topics:
-    weight_data: "medication/weight/+"  # + is wildcard for station_id
+    weight_data: "medication/weight/+"
     commands: "medication/command"
     status: "medication/status/+"
   qos: 1
@@ -40,24 +40,27 @@ mqtt:
 weight_sensors:
   station_1:
     id: "station_1"
-    medicine_name: "Aspirin 100mg"  # Set during setup
-    pill_weight_mg: 280  # Average pill weight in milligrams (mayb 330?)
-    threshold_stable_g: 0.05  # Stability threshold
-    threshold_delta_g: 0.22  # Minimum change to trigger event
-    event_settle_seconds: 1.5
-    event_cooldown_seconds: 2.0
-    min_delta_g: 0.20
+    medicine_name: "Aspirin 100mg"  # updated automatically on registration
+    pill_weight_mg: 290             # calibrated: 2 pills = ~0.58g delta -> 290mg each
+    threshold_stable_g: 0.05        # stability threshold
+    threshold_delta_g: 0.22         # minimum change to consider a delta
+    event_settle_seconds: 1.5       # how long weight must be stable before firing
+    event_cooldown_seconds: 2.0     # minimum gap between two events
+    min_delta_g: 0.20               # below this = scale noise, not a pill removal
 
-# OCR Configuration
+# OCR Configuration (fallback identity method)
 ocr:
   language: "eng"
-  config: "--psm 11"  # Tesseract config: Assume a single uniform block of text
+  config: "--psm 11"
   min_confidence: 0.75
   preprocessing:
     grayscale: true
     denoise: true
     threshold: true
 
+# Identity Verification Configuration
+# Primary: integrated RFID tag (bottle bottom tag, reader under scale)
+# Fallback: QR code scan, then OCR label scan
 identity:
   primary_method: "tag"
   fallback_methods: ["qr", "ocr"]
@@ -65,6 +68,15 @@ identity:
   tag:
     enabled: true
     mqtt_topic: "medication/tag/read/+"
+    # integrated_mode: tag reader is mounted under the scale platform.
+    # The bottle tag is read passively when the bottle is placed back,
+    # so we use coincident timing instead of active waiting.
+    integrated_mode: true
+    # How far back (seconds) from the weight event to accept a tag scan.
+    # Tag scan arrives when bottle touches reader (before weight settles),
+    # so the scan is typically 1-5s older than the weight event timestamp.
+    coincident_window_seconds: 15.0
+    # Legacy active-wait settings (used only if integrated_mode: false)
     max_attempts: 1
     attempt_timeout_seconds: 3
 
@@ -76,26 +88,34 @@ identity:
     enabled: true
     max_attempts: 1
 
+# Registration Configuration
+# Runs once at startup for each station with no registered medicine.
+# Detects a coincident stable weight + RFID tag scan to auto-register.
+registration:
+  enabled: true
+  timeout_seconds: 120           # how long to wait before giving up
+  coincident_window_seconds: 8.0 # tag scan must be within this many seconds of the stable weight reading
+  min_bottle_weight_g: 5.0       # minimum weight to consider a bottle as present
+
 # Patient Monitoring Configuration
 patient_monitoring:
   enabled: true
   duration_seconds: 30       # how long to watch after pill removal
   fps: 20                    # capture frame rate
-  device_id: 0
- 
+  device_id: 0               # camera device id (must match hardware.camera.device_id)
+
   # MediaPipe thresholds
   mediapipe:
     mouth_open_ratio: 0.04   # inner-lip gap / face height  (higher = harder to trigger)
-    proximity_ratio:  0.18   # fingertip–mouth dist / frame min dim (higher = wider zone)
-    cooldown_secs:    2.5    # min seconds between counted intakes (higher = less counting)
- 
+    proximity_ratio:  0.18   # fingertip-mouth dist / frame min dim (higher = wider zone)
+    cooldown_secs:    2.5    # min seconds between counted intakes
+
   detection:
     swallow:
       enabled: true
-      sensitivity: 0.85     
-      
+      sensitivity: 0.85
     cough:
-      enabled: false         
+      enabled: false
       sensitivity: 0.80
     hand_motion:
       enabled: true
@@ -103,35 +123,37 @@ patient_monitoring:
 # Telegram Bot Configuration
 telegram:
   enabled: true
-  bot_token: "YOUR_BOT_TOKEN_HERE"  # Get from @BotFather
-  patient_chat_id: "YOUR_PATIENT_CHAT_ID"  # Get using /start command
+  bot_token: "YOUR_BOT_TOKEN_HERE"       # Get from @BotFather
+  patient_chat_id: "YOUR_PATIENT_CHAT_ID"
   caregiver_chat_id: "YOUR_CAREGIVER_CHAT_ID"
   retry_attempts: 3
   retry_delay_seconds: 5
 
 # Medication Schedule
-# Format: time in 24-hour format, medicines as list
+# Note: medicine_id is resolved at runtime from the database (via registration).
+# The 'name' field here is only used for the Telegram reminder text and display.
+# It does NOT need to match the tag payload exactly.
 schedule:
   medications:
     - name: "Aspirin 100mg"
       station_id: "station_1"
       dosage_pills: 2
       times: ["08:00", "20:00"]
-  
+
   reminder:
-    advance_minutes: 5  # Remind 5 minutes before
-    timeout_minutes: 30  # Consider missed after 30 minutes
+    advance_minutes: 5   # remind 5 minutes before scheduled time
+    timeout_minutes: 30  # consider missed after 30 minutes
 
 # Decision Engine Rules
 decision_engine:
   tolerance:
-    pill_count: 0  # Allow plus minus 1 pill difference
-  
+    pill_count: 0  # 0 = exact match required; 1 = +-1 pill allowed
+
   verification:
-    require_ocr: false  # Set to true to require OCR match
-    require_weight: true
+    require_ocr: false      # identity failure alone does not fail verification
+    require_weight: true    # weight verification is mandatory
     require_monitoring: true
-  
+
   alerts:
     missed_dose: true
     incorrect_dosage: true
@@ -154,26 +176,25 @@ logging:
 # Performance Configuration
 performance:
   max_cpu_percent: 80
-  max_memory_mb: 3072  # Leave 1GB for OS on 4GB Pi
-  enable_throttling: true  # Reduce resolution/fps if overloaded
+  max_memory_mb: 3072  # leave 1 GB for OS on 4 GB Pi
+  enable_throttling: true
 
 # Network Configuration
 network:
-  offline_mode_enabled: true  # Continue operation without internet
-  queue_alerts: true  # Queue Telegram alerts when offline
+  offline_mode_enabled: true
+  queue_alerts: true
   check_interval_seconds: 60
 
 # Privacy Configuration
 privacy:
-  store_images: false  # Never store patient images
+  store_images: false
   store_video: false
   anonymize_logs: true
   data_retention_days: 30
 
-# Measurement & Profiling (for validation)
+# Measurement & Profiling (enable during validation phase)
 profiling:
-  enabled: false  # Enable during measurement phase
+  enabled: false
   latency_logging: true
   resource_logging: true
   log_interval_seconds: 1
-

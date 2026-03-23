@@ -1,13 +1,23 @@
 """
 Smart Medication System - Identity Manager
 
-Primary identity verification flow:
-1. Tag
-2. QR
-3. OCR
+Provides two verification modes:
+
+1. INTEGRATED (tag reader under scale default for this project):
+   verify_identity_integrated(...)
+   Checks for a coincident tag scan near the weight event timestamp.
+   The bottle tag is read passively when the bottle is placed back on the
+   station no patient action required. Falls back to QR then OCR
+   if no coincident tag is found within the window.
+
+2. LEGACY (separate tag reader):
+   verify_identity(...)
+   Original active wait: tag -> QR -> OCR in priority order.
+   Kept for backwards compatibility and for the QR/OCR fallback path.
 """
 
 from typing import Dict, Any, Optional
+import time
 
 from raspberry_pi.modules.qr_scanner import QRScanner
 
@@ -23,6 +33,88 @@ class IdentityManager:
         self.logger = logger
 
         self.qr_scanner = QRScanner(logger)
+        
+    # ------------------------------------------------------------------
+    # Integrated verification (tag under scale - primary path)
+    # ------------------------------------------------------------------
+
+    def verify_identity_integrated(
+        self,
+        expected_medicine_id: str,
+        expected_medicine_name: str,
+        expected_station_id: str,
+        weight_event_timestamp: float = None,
+        coincident_window_seconds: float = 15.0
+    ) -> Dict[str, Any]:
+        """
+        Integrated identity verification for the tag-under-scale setup.
+
+        Because the RFID tag is on the bottle bottom and the RC522 reader
+        is embedded under the scale platform, the tag is automatically read
+        the moment the bottle is placed back after pill removal. This scan
+        typically arrives 0-3 seconds BEFORE the weight event fires (the
+        scale needs a settle period before confirming the reading).
+
+        The coincident window is therefore:
+            [weight_event_timestamp - coincident_window_seconds,
+             weight_event_timestamp + 3.0]
+
+        If no coincident tag is found, falls back to QR then OCR via the
+        existing legacy path so the pipeline is never blocked entirely.
+
+        Args:
+            weight_event_timestamp: Unix timestamp from the weight event.
+                                    If None, falls back to legacy path immediately.
+            coincident_window_seconds: Overridden by config if set there.
+        """
+        identity_cfg = self.config.get("identity", {})
+        tag_cfg = identity_cfg.get("tag", {})
+
+        if tag_cfg.get("enabled", True) and weight_event_timestamp is not None:
+            # Config can override the window size
+            window = tag_cfg.get(
+                "coincident_window_seconds", coincident_window_seconds
+            )
+
+            tag_result = self.tag_runtime_service.verify_coincident_tag(
+                weight_event_timestamp=weight_event_timestamp,
+                expected_medicine_id=expected_medicine_id,
+                expected_station_id=expected_station_id,
+                window_seconds=window
+            )
+
+            if tag_result.get("success"):
+                record = tag_result["record"]
+                self.logger.info(
+                    f"Integrated tag identity verified: "
+                    f"{record.get('medicine_id')} / {record.get('medicine_name')}"
+                )
+                return {
+                    "success": True,
+                    "method": "tag_integrated",
+                    "medicine_id": record.get("medicine_id"),
+                    "medicine_name": record.get("medicine_name"),
+                    "station_id": record.get("station_id"),
+                    "verified": True,
+                    "confidence": 1.0,
+                    "raw_result": tag_result
+                }
+
+            self.logger.info(
+                f"Integrated tag check failed: {tag_result.get('reason')} "
+                f"- falling back to QR/OCR"
+            )
+            
+        # Fall through to legacy QR / OCR path
+        return self.verify_identity(
+            expected_medicine_id=expected_medicine_id,
+            expected_medicine_name=expected_medicine_name,
+            expected_station_id=expected_station_id
+        )
+
+    # ------------------------------------------------------------------
+    # Legacy active verification (original pipeline)
+    # ------------------------------------------------------------------
 
     def verify_identity(
         self,
@@ -31,12 +123,14 @@ class IdentityManager:
         expected_station_id: str
     ) -> Dict[str, Any]:
         """
-        Run identity verification in priority order:
-        tag -> qr -> ocr
+        Run identity verification in priority order: tag -> QR -> OCR.
+
+        This is the original active-wait path and is used as a fallback
+        from verify_identity_integrated, or directly in non-integrated setups.
         """
         identity_cfg = self.config.get("identity", {})
 
-        # 1. TAG FIRST
+        # 1. TAG
         tag_cfg = identity_cfg.get("tag", {})
         if tag_cfg.get("enabled", True):
             tag_result = self.tag_runtime_service.wait_for_matching_tag(
@@ -61,7 +155,7 @@ class IdentityManager:
 
             self.logger.warning(f"Tag verification failed: {tag_result.get('reason')}")
 
-        # 2. QR SECOND
+        # 2. QR
         qr_cfg = identity_cfg.get("qr", {})
         if qr_cfg.get("enabled", True):
             qr_result = self._try_qr(
@@ -72,8 +166,8 @@ class IdentityManager:
             )
             if qr_result.get("success"):
                 return qr_result
-
-        # 3. OCR LAST
+                
+        # 3. OCR
         ocr_cfg = identity_cfg.get("ocr", {})
         if ocr_cfg.get("enabled", True):
             ocr_result = self._try_ocr(
@@ -90,6 +184,10 @@ class IdentityManager:
             "reason": "All identity verification methods failed"
         }
 
+    # ------------------------------------------------------------------
+    # QR fallback
+    # ------------------------------------------------------------------
+
     def _try_qr(
         self,
         expected_medicine_id: str,
@@ -97,7 +195,6 @@ class IdentityManager:
         expected_station_id: str,
         max_attempts: int = 2
     ) -> Dict[str, Any]:
-        import time
         import cv2
 
         self.logger.info(f"Trying QR fallback ({max_attempts} attempts)")
@@ -111,32 +208,28 @@ class IdentityManager:
                     "reason": "Camera initialization failed for QR"
                 }
 
-        # Let webcam settle after opening
         time.sleep(2.0)
 
-        # Warm-up reads exactly like the working test
         last_frame = None
         for i in range(20):
             frame = self.scanner.capture_frame()
             if frame is not None:
                 last_frame = frame
-            self.logger.debug(
-                f"QR warm-up frame {i+1}/20: {'OK' if frame is not None else 'FAILED'}"
-            )
             time.sleep(0.1)
 
-        # Optional debug frame save
         if last_frame is not None:
             try:
                 cv2.imwrite("data/qr_fallback_debug_frame.jpg", last_frame)
-                self.logger.info("Saved QR fallback debug frame to data/qr_fallback_debug_frame.jpg")
+                self.logger.info(
+                    "Saved QR fallback debug frame to data/qr_fallback_debug_frame.jpg"
+                )
             except Exception as e:
-                self.logger.warning(f"Could not save QR fallback debug frame: {e}")
+                self.logger.warning(f"Could not save QR debug frame: {e}")
 
         for attempt in range(1, max_attempts + 1):
             self.logger.info(f"QR attempt {attempt}/{max_attempts}")
 
-            for frame_idx in range(15):
+            for _ in range(15):
                 frame = self.scanner.capture_frame()
                 if frame is None:
                     time.sleep(0.1)
@@ -153,9 +246,7 @@ class IdentityManager:
                 station_id = parsed.get("station_id", expected_station_id)
 
                 if medicine_id and medicine_id == expected_medicine_id:
-                    self.logger.info(
-                        f"QR verification succeeded on attempt {attempt}, frame {frame_idx + 1}"
-                    )
+                    self.logger.info(f"QR verification succeeded on attempt {attempt}")
                     return {
                         "success": True,
                         "method": "qr",
@@ -166,12 +257,14 @@ class IdentityManager:
                         "confidence": 1.0,
                         "raw_result": qr_scan
                     }
-
+                    
                 if medicine_name:
-                    qr_verify = self.qr_scanner.verify_medicine(parsed, expected_medicine_name)
+                    qr_verify = self.qr_scanner.verify_medicine(
+                        parsed, expected_medicine_name
+                    )
                     if qr_verify.get("match"):
                         self.logger.info(
-                            f"QR verification succeeded by name on attempt {attempt}, frame {frame_idx + 1}"
+                            f"QR verification succeeded by name on attempt {attempt}"
                         )
                         return {
                             "success": True,
@@ -193,14 +286,15 @@ class IdentityManager:
             "reason": "QR fallback failed"
         }
 
+    # ------------------------------------------------------------------
+    # OCR fallback
+    # ------------------------------------------------------------------
+
     def _try_ocr(
         self,
         expected_medicine_name: str,
         max_attempts: int = 2
     ) -> Dict[str, Any]:
-        """
-        OCR final fallback.
-        """
         self.logger.info(f"Trying OCR fallback ({max_attempts} attempts)")
 
         ocr_result = self.scanner.scan_label(num_attempts=max_attempts)
