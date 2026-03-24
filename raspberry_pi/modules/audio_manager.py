@@ -1,26 +1,22 @@
-"""Audio Manager - TTS and alerts"""
+"""Audio Manager - offline speech and alerts for Raspberry Pi"""
 
-
-import time
-from pathlib import Path
-from threading import Thread, Lock
-
-import pygame
-import pygame.mixer
-from gtts import gTTS
+import subprocess
+import threading
+import shlex
 
 
 class AudioManager:
     def __init__(self, config, logger):
         self.config = config
         self.logger = logger
-        self.enabled = config.get('enabled', True)
-        self.volume = config.get('volume', 0.8)
-        self.cache_dir = Path('data/audio_cache')
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.mixer_initialized = False
-        self.audio_lock = Lock()
-        self.cached_messages = {}
+
+        self.enabled = config.get("enabled", True)
+        self.device = config.get("device", "plughw:1,0")
+        self.voice = config.get("voice", "en-gb+f3")
+        self.speed = int(config.get("speed", 85))
+        self.pitch = int(config.get("pitch", 45))
+
+        self.initialized = False
 
     def initialize(self):
         if not self.enabled:
@@ -28,97 +24,92 @@ class AudioManager:
             return True
 
         try:
-            pygame.mixer.pre_init(frequency=22050, size=-16, channels=2, buffer=512)
-            pygame.mixer.init()
-            pygame.mixer.music.set_volume(self.volume)
-            self.mixer_initialized = True
-            self.logger.info("Audio mixer initialized successfully using ALSA")
+            for tool_name in ["espeak", "ffmpeg", "aplay"]:
+                result = subprocess.run(
+                    ["which", tool_name],
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                if result.returncode != 0:
+                    self.logger.error(f"Audio init failed: {tool_name} not found")
+                    self.initialized = False
+                    return False
+
+            self.initialized = True
+            self.logger.info(
+                "Audio manager initialized successfully using "
+                f"espeak -> ffmpeg -> aplay "
+                f"(device={self.device}, voice={self.voice}, speed={self.speed}, pitch={self.pitch})"
+            )
             return True
+
         except Exception as e:
-            self.mixer_initialized = False
             self.logger.error(f"Audio init failed: {e}")
+            self.initialized = False
             return False
 
-    def _get_audio_file(self, text, lang='en'):
-        key = f"{text}_{lang}"
-
-        if key in self.cached_messages:
-            return self.cached_messages[key]
-
-        filepath = self.cache_dir / f"{hash(key)}.mp3"
-        if filepath.exists():
-            self.cached_messages[key] = str(filepath)
-            return str(filepath)
+    def _speak_worker(self, text):
+        if not self.initialized or not self.enabled:
+            self.logger.warning("Audio speak skipped: audio not initialized")
+            return
 
         try:
-            tts = gTTS(text=text, lang=lang, slow=False)
-            tts.save(str(filepath))
-            self.cached_messages[key] = str(filepath)
-            return str(filepath)
+            safe_text = str(text).strip()
+            if not safe_text:
+                return
+
+            quoted_text = shlex.quote(safe_text)
+
+            cmd = (
+                f"espeak -v {self.voice} -s {self.speed} -p {self.pitch} --stdout {quoted_text} "
+                f"| ffmpeg -loglevel error -i pipe:0 -ar 48000 -ac 2 -f wav - "
+                f"| aplay -D {self.device}"
+            )
+
+            self.logger.info(f"SPEAKING: {safe_text}")
+            subprocess.run(cmd, shell=True, check=False)
+
         except Exception as e:
-            self.logger.error(f"TTS generation failed: {e}")
-            return None
+            self.logger.error(f"Speak error: {e}")
 
     def speak(self, text, wait=True):
-        if not self.enabled:
+        if not self.initialized or not self.enabled:
+            self.logger.warning("Audio speak skipped: audio not initialized")
             return
 
-        if not self.mixer_initialized or not pygame.mixer.get_init():
-            self.logger.warning("Audio speak skipped: mixer not initialized")
-            return
-
-        with self.audio_lock:
-            try:
-                audio_file = self._get_audio_file(text)
-                if audio_file:
-                    pygame.mixer.music.load(audio_file)
-                    pygame.mixer.music.play()
-
-                    if wait:
-                        while pygame.mixer.get_init() and pygame.mixer.music.get_busy():
-                            time.sleep(0.1)
-
-            except Exception as e:
-                self.logger.error(f"Speak error: {e}")
+        if wait:
+            self._speak_worker(text)
+        else:
+            threading.Thread(
+                target=self._speak_worker,
+                args=(text,),
+                daemon=True
+            ).start()
 
     def speak_async(self, text):
-        Thread(target=self.speak, args=(text, True), daemon=True).start()
+        self.speak(text, wait=False)
 
     def announce_reminder(self, medicine_name, dosage):
-        self.speak(f"Time to take your medication. {medicine_name}, {dosage} pills.")
+        self.speak_async(
+            f"Time to take your medication. {medicine_name}. {dosage} pills."
+        )
 
     def announce_success(self, medicine_name):
-        self.speak(f"Thank you. {medicine_name} taken successfully.")
+        self.speak_async(
+            f"Thank you. {medicine_name} taken successfully."
+        )
 
     def announce_warning(self, message):
-        self.speak(f"Warning. {message}")
+        self.speak_async(f"Warning. {message}")
 
     def set_volume(self, volume):
-        self.volume = max(0.0, min(1.0, volume))
-
-        try:
-            if self.mixer_initialized and pygame.mixer.get_init():
-                pygame.mixer.music.set_volume(self.volume)
-        except Exception as e:
-            self.logger.warning(f"Set volume warning: {e}")
+        # kept for compatibility with existing code
+        pass
 
     def stop(self):
-        try:
-            if self.mixer_initialized and pygame.mixer.get_init():
-                pygame.mixer.music.stop()
-        except Exception as e:
-            self.logger.warning(f"Audio stop warning: {e}")
+        # kept for compatibility
+        pass
 
     def cleanup(self):
-        try:
-            self.stop()
-
-            if self.mixer_initialized and pygame.mixer.get_init():
-                pygame.mixer.quit()
-
-        except Exception as e:
-            self.logger.warning(f"Audio cleanup warning: {e}")
-
-        finally:
-            self.mixer_initialized = False
-            self.logger.info("Audio manager cleanup complete")
+        self.logger.info("Audio manager cleanup complete")

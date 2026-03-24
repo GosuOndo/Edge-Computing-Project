@@ -12,7 +12,7 @@ import signal
 from pathlib import Path
 
 import os
-os.environ["SDL_AUDIODRIVER"] = "pulseaudio"
+# os.environ["SDL_AUDIODRIVER"] = "pulseaudio"
 os.environ["SDL_VIDEO_FBDEV"] = "/dev/fb0"
 
 # Add parent directory to path
@@ -371,8 +371,9 @@ class MedicationSystem:
         expected_station_id = self.current_medication["station_id"]
 
         if self.display:
-            self.display.show_monitoring_screen(
-                0, 5, "Verifying medicine identity..."
+            self.display.show_pipeline_screen(
+                "Identity Check",
+                f"Checking bottle identity for {medicine_name}"
             )
 
         weight_event_ts = weight_event.get("timestamp", time.time())
@@ -381,7 +382,9 @@ class MedicationSystem:
         integrated_mode = tag_cfg.get("integrated_mode", True)
         coincident_window = tag_cfg.get("coincident_window_seconds", 15.0)
 
+        identity_result = None
         ocr_result = None
+
         try:
             self.scanner.initialize_camera()
 
@@ -411,43 +414,93 @@ class MedicationSystem:
                     "method": identity_result.get("method")
                 }
             else:
-                ocr_result = {
-                    "success": False,
-                    "medicine_name": None,
-                    "confidence": 0.0,
-                    "verified": False,
-                    "error": identity_result.get("reason", "Identity verification failed"),
-                    "method": identity_result.get("method", "none")
-                }
+                ocr_result = None
 
         except Exception as e:
             self.logger.warning(f"Identity verification error: {e}")
-            ocr_result = {
+            identity_result = {
                 "success": False,
-                "medicine_name": None,
-                "confidence": 0.0,
+                "method": "none",
                 "verified": False,
-                "error": str(e),
-                "method": "none"
+                "reason": str(e)
             }
+            ocr_result = None
         finally:
             self.scanner.release_camera()
 
         if not self.running:
             return
 
+        if self.display:
+            self.display.show_pipeline_screen(
+                "Dosage Check",
+                f"Checking pill count for {medicine_name}"
+            )
+
         weight_result = self.weight_manager.verify_dosage(
             expected_station_id, expected_dosage
         )
         self.logger.info(f"Weight verification: {weight_result}")
+
+        # HARD STOP on identity failure
+        if identity_result and not identity_result.get("success", False):
+            self.logger.warning("Stopping pipeline early due to identity mismatch/failure")
+            decision = self.decision_engine.verify_medication_intake(
+                expected_medicine=medicine_name,
+                expected_dosage=expected_dosage,
+                identity_result=identity_result,
+                ocr_result=None,
+                weight_result=weight_result,
+                monitoring_result=None
+            )
+            self._handle_decision(decision)
+            self.database.log_medication_event(decision)
+
+            time.sleep(3)
+            self.state_machine.reset_to_idle()
+            self.weight_manager.disable_event_detection(expected_station_id)
+            self.current_medication = None
+            self.pending_monitoring_ui = None
+            if self.display:
+                self.display.show_idle_screen(self.scheduler.get_next_scheduled_time())
+            return
+
+        # HARD STOP on wrong dosage
+        if not weight_result.get("verified", False):
+            self.logger.warning("Stopping pipeline early due to incorrect dosage")
+            decision = self.decision_engine.verify_medication_intake(
+                expected_medicine=medicine_name,
+                expected_dosage=expected_dosage,
+                identity_result=identity_result,
+                ocr_result=ocr_result,
+                weight_result=weight_result,
+                monitoring_result=None
+            )
+            self._handle_decision(decision)
+            self.database.log_medication_event(decision)
+
+            time.sleep(3)
+            self.state_machine.reset_to_idle()
+            self.weight_manager.disable_event_detection(expected_station_id)
+            self.current_medication = None
+            self.pending_monitoring_ui = None
+            if self.display:
+                self.display.show_idle_screen(self.scheduler.get_next_scheduled_time())
+            return
 
         if not self.running:
             return
 
         self.logger.info("Starting patient monitoring (30 seconds)...")
         self.state_machine.transition_to(SystemState.MONITORING_PATIENT)
-        monitoring_result = None
         self.pending_monitoring_ui = (0, 30, "Monitoring intake...")
+        monitoring_result = None
+
+        if self.display:
+            self.display.show_pipeline_screen(
+                "Patient Monitoring",
+                "Please bring hand to mouth and swallow naturally"
+            )
 
         try:
             def progress_callback(detections, elapsed, duration):
@@ -482,14 +535,20 @@ class MedicationSystem:
 
         except Exception as e:
             self.logger.error(f"Patient monitoring failed: {e}")
+            monitoring_result = {
+                "compliance_status": "unclear",
+                "swallow_count": 0,
+                "cough_count": 0,
+                "hand_motion_count": 0
+            }
 
         if not self.running:
             return
 
-        self.logger.info("Making verification decision...")
         decision = self.decision_engine.verify_medication_intake(
             expected_medicine=medicine_name,
             expected_dosage=expected_dosage,
+            identity_result=identity_result,
             ocr_result=ocr_result,
             weight_result=weight_result,
             monitoring_result=monitoring_result
@@ -517,64 +576,52 @@ class MedicationSystem:
 
     def _handle_decision(self, decision: dict):
         result = decision["result"]
-        verified = decision["verified"]
-        medicine_name = decision["expected_medicine"]
-
-        self.logger.info(f"Decision: {result.value} (verified: {verified})")
         messages = self.decision_engine.get_alert_messages(decision)
 
-        if verified and result == DecisionResult.SUCCESS:
+        if result.value == "success":
             if self.display:
                 self.display.show_success_screen(
-                    medicine_name, "Medication taken successfully!"
+                    "Correct medicine and dosage",
+                    messages["patient_message"]
                 )
             if self.audio:
-                self.audio.announce_success(medicine_name)
-            self.telegram.send_dose_taken_confirmation(
-                medicine_name, decision["expected_dosage"]
-            )
+                self.audio.announce_success(decision.get("expected_medicine", "medication"))
 
-        elif result == DecisionResult.INCORRECT_DOSAGE:
-            expected = decision["expected_dosage"]
-            actual = decision["details"].get("weight_actual", 0)
+        elif result.value == "wrong_medicine":
             if self.display:
                 self.display.show_warning_screen(
-                    "Incorrect Dosage",
-                    f"Expected {expected} pills, detected {actual} pills"
+                    "Wrong medicine detected",
+                    messages["patient_message"]
                 )
             if self.audio:
                 self.audio.announce_warning(messages["patient_message"])
-            self.telegram.send_incorrect_dosage_alert(medicine_name, expected, actual)
 
-        elif result == DecisionResult.BEHAVIORAL_ISSUE:
+        elif result.value == "incorrect_dosage":
             if self.display:
                 self.display.show_warning_screen(
-                    "Monitoring Alert", messages["patient_message"]
+                    "Incorrect dosage detected",
+                    messages["patient_message"]
                 )
             if self.audio:
                 self.audio.announce_warning(messages["patient_message"])
-            self.telegram.send_behavioral_alert(
-                medicine_name, "concerning", decision["details"]
-            )
 
-        elif result == DecisionResult.NO_INTAKE:
+        elif result.value == "no_intake":
             if self.display:
                 self.display.show_warning_screen(
-                    "No Intake Detected", "Please take your medication"
+                    "No intake detected",
+                    messages["patient_message"]
                 )
             if self.audio:
-                self.audio.announce_warning("No medication intake detected")
+                self.audio.announce_warning(messages["patient_message"])
 
         else:
             if self.display:
                 self.display.show_warning_screen(
-                    "Verification Warning", messages["patient_message"]
+                    "Verification needs attention",
+                    messages["patient_message"]
                 )
-            if self.decision_engine.should_alert_caregiver(decision):
-                self.telegram.send_message(
-                    self.telegram.caregiver_chat_id,
-                    messages["caregiver_message"]
-                )
+            if self.audio:
+                self.audio.announce_warning(messages["patient_message"])
 
     # ------------------------------------------------------------------
     # Signal handler

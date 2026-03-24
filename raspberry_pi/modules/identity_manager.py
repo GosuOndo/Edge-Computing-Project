@@ -43,35 +43,21 @@ class IdentityManager:
         expected_medicine_id: str,
         expected_medicine_name: str,
         expected_station_id: str,
-        weight_event_timestamp: float = None,
+        weight_event_timestamp: float,
         coincident_window_seconds: float = 15.0
     ) -> Dict[str, Any]:
         """
-        Integrated identity verification for the tag-under-scale setup.
+        Integrated identity verification for under-scale RFID workflow.
 
-        Because the RFID tag is on the bottle bottom and the RC522 reader
-        is embedded under the scale platform, the tag is automatically read
-        the moment the bottle is placed back after pill removal. This scan
-        typically arrives 0-3 seconds BEFORE the weight event fires (the
-        scale needs a settle period before confirming the reading).
-
-        The coincident window is therefore:
-            [weight_event_timestamp - coincident_window_seconds,
-             weight_event_timestamp + 3.0]
-
-        If no coincident tag is found, falls back to QR then OCR via the
-        existing legacy path so the pipeline is never blocked entirely.
-
-        Args:
-            weight_event_timestamp: Unix timestamp from the weight event.
-                                    If None, falls back to legacy path immediately.
-            coincident_window_seconds: Overridden by config if set there.
+        Rules:
+        1. If a coincident tag is found and it MATCHES -> success.
+        2. If a coincident tag is found and it MISMATCHES -> hard fail, no fallback.
+        3. If no coincident tag is found -> fallback to active tag/QR/OCR.
         """
         identity_cfg = self.config.get("identity", {})
         tag_cfg = identity_cfg.get("tag", {})
 
         if tag_cfg.get("enabled", True) and weight_event_timestamp is not None:
-            # Config can override the window size
             window = tag_cfg.get(
                 "coincident_window_seconds", coincident_window_seconds
             )
@@ -100,12 +86,30 @@ class IdentityManager:
                     "raw_result": tag_result
                 }
 
+            reason = str(tag_result.get("reason", "") or "").lower()
+
+            # HARD FAIL on actual mismatch
+            if "mismatch" in reason:
+                self.logger.warning(
+                    f"Integrated tag mismatch detected. Hard failing without fallback: "
+                    f"{tag_result.get('reason')}"
+                )
+                return {
+                    "success": False,
+                    "method": "tag_integrated",
+                    "verified": False,
+                    "confidence": 0.0,
+                    "reason": tag_result.get("reason", "Integrated tag mismatch"),
+                    "hard_fail": True,
+                    "raw_result": tag_result
+                }
+
+            # Only fall back when there was simply no usable coincident tag
             self.logger.info(
-                f"Integrated tag check failed: {tag_result.get('reason')} "
-                f"- falling back to QR/OCR"
+                f"No valid coincident tag match ({tag_result.get('reason')}); "
+                f"falling back to QR/OCR"
             )
-            
-        # Fall through to legacy QR / OCR path
+
         return self.verify_identity(
             expected_medicine_id=expected_medicine_id,
             expected_medicine_name=expected_medicine_name,

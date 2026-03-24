@@ -351,49 +351,52 @@ class WeightManager:
 
     def _fire_removal_event(
         self,
-        station_id:        str,
-        delta_g:           float,
-        new_weight_g:      float,
-        baseline_g:        float,
-        received_at:       float,
+        station_id: str,
+        delta_g: float,
+        new_weight_g: float,
+        baseline_g: float,
+        received_at: float,
     ):
-        pill_weight   = self._get_pill_weight_g(station_id)
-        min_delta     = self._get_min_delta_g(station_id)
+        pill_weight = self._get_pill_weight_g(station_id)
+        min_delta = self._get_min_delta_g(station_id)
 
         if delta_g <= 0:
-            # Weight is the same or heavier no pills removed
             self.logger.info(
                 f"[{station_id}] Bottle replaced with no net removal "
-                f"(baseline={baseline_g:.2f}g  new={new_weight_g:.2f}g  "
-                f"delta={delta_g:.2f}g)"
+                f"(baseline={baseline_g:.2f}g  new={new_weight_g:.2f}g  delta={delta_g:.2f}g)"
             )
             return
 
         if delta_g < min_delta:
-            # Change is smaller than half a pill treat as scale noise
             self.logger.info(
                 f"[{station_id}] Delta {delta_g:.2f}g < min_delta {min_delta:.2f}g "
                 f"treated as noise, no event fired"
             )
             return
 
-        pills_removed = max(1, round(delta_g / pill_weight)) if pill_weight > 0 else 0
+        estimated_pills_float = (delta_g / pill_weight) if pill_weight > 0 else 0.0
+        pills_removed = max(1, int(round(estimated_pills_float))) if pill_weight > 0 else 0
+        nearest_delta_g = pills_removed * pill_weight
+        estimation_error_g = abs(delta_g - nearest_delta_g)
 
         self.logger.info(
             f"[{station_id}] PILLS REMOVED: {pills_removed} pill(s) "
             f"| baseline={baseline_g:.2f}g  new={new_weight_g:.2f}g  "
-            f"delta={delta_g:.2f}g"
+            f"delta={delta_g:.2f}g  est={estimated_pills_float:.2f}"
         )
 
         event_data = {
-            "event_type":          "removal",
-            "station_id":          station_id,
-            "pills_removed":       pills_removed,
-            "weight_change_g":     round(delta_g, 3),
-            "delta_g":             round(delta_g, 3),
+            "event_type": "removal",
+            "station_id": station_id,
+            "pills_removed": pills_removed,
+            "estimated_pills_float": round(estimated_pills_float, 3),
+            "estimation_error_g": round(estimation_error_g, 3),
+            "weight_change_g": round(delta_g, 3),
+            "delta_g": round(delta_g, 3),
             "previous_baseline_g": round(baseline_g, 3),
-            "current_weight_g":    round(new_weight_g, 3),
-            "timestamp":           time.time(),
+            "current_weight_g": round(new_weight_g, 3),
+            "pill_weight_g": round(pill_weight, 3),
+            "timestamp": time.time(),
         }
 
         self.last_event_data[station_id] = event_data
@@ -459,31 +462,42 @@ class WeightManager:
         if not event:
             return {
                 "verified": False,
-                "reason":   "No recent weight event available",
+                "reason": "No recent weight event available",
                 "expected": expected_pills,
-                "actual":   None,
+                "actual": None,
             }
 
         if event.get("event_type") != "removal":
             return {
                 "verified": False,
-                "reason":   "Last event was not a pill removal",
+                "reason": "Last event was not a pill removal",
                 "expected": expected_pills,
-                "actual":   0,
+                "actual": 0,
             }
 
-        actual     = int(event.get("pills_removed", 0))
+        actual = int(event.get("pills_removed", 0))
         difference = abs(actual - expected_pills)
-        verified   = difference <= tolerance
+
+        pill_weight_g = float(event.get("pill_weight_g", self._get_pill_weight_g(station_id)))
+        actual_delta_g = float(event.get("weight_change_g", 0.0))
+        expected_delta_g = expected_pills * pill_weight_g
+        delta_error_g = abs(actual_delta_g - expected_delta_g)
+
+        cfg = self.station_configs.get(station_id, {})
+        weight_error_g = float(cfg.get("dose_verification_tolerance_g", 0.12))
+
+        verified = (difference <= tolerance) and (delta_error_g <= weight_error_g)
 
         return {
-            "verified":        verified,
-            "expected":        expected_pills,
-            "actual":          actual,
-            "weight_change_g": event.get("weight_change_g", 0.0),
-            "difference":      difference,
+            "verified": verified,
+            "expected": expected_pills,
+            "actual": actual,
+            "weight_change_g": actual_delta_g,
+            "expected_delta_g": round(expected_delta_g, 3),
+            "delta_error_g": round(delta_error_g, 3),
+            "difference": difference,
             "within_tolerance": verified,
-            "status":          "correct" if verified else "incorrect",
+            "status": "correct" if verified else "incorrect",
         }
         
     def reset_station(self, station_id: str):
