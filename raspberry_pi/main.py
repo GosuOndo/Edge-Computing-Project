@@ -371,6 +371,74 @@ class MedicationSystem:
         if getattr(self, "audio", None):
             self.audio.speak_async(message)
 
+    def _verify_returned_bottle(self, secure_state: dict) -> bool:
+        """
+        Check that the bottle placed back after early removal is the correct one
+        by verifying a tag scan received since the removal alert was sent.
+        Returns True if the bottle is correct or cannot be verified, False if
+        a wrong bottle was positively identified.
+        """
+        station_id    = secure_state.get("station_id", "unknown")
+        alert_sent_at = secure_state.get("early_alert_sent_at", 0.0)
+
+        latest = self.tag_runtime_service.get_latest_scan()
+        if not latest or float(latest.get("received_at", 0.0)) <= alert_sent_at:
+            self.logger.warning(
+                f"Bottle returned to {station_id} but no new tag scan received - "
+                "cannot verify identity"
+            )
+            self.tag_runtime_service.stop_scanning()
+            return True  # cannot verify; accept gracefully
+
+        scan_msg = latest.get("scan_msg") or {}
+        record   = self._resolve_record_from_scan(scan_msg)
+
+        # Mark this scan as processed so _process_secured_bottle_placements
+        # does not treat it as a new onboarding placement.
+        self._processed_tag_scans[station_id] = float(latest.get("received_at", 0.0))
+
+        if not record:
+            self.logger.warning(
+                f"Bottle returned to {station_id} but tag scan could not be resolved"
+            )
+            self.tag_runtime_service.stop_scanning()
+            return True
+
+        expected_medicine_id = secure_state.get("medicine_id")
+        expected_tag_uid     = secure_state.get("tag_uid")
+        actual_medicine_id   = record.get("medicine_id")
+        actual_tag_uid       = record.get("tag_uid") or scan_msg.get("tag_uid")
+
+        correct = (
+            (expected_medicine_id and actual_medicine_id == expected_medicine_id)
+            or (expected_tag_uid and actual_tag_uid == expected_tag_uid)
+        )
+
+        if correct:
+            self.logger.info(
+                f"Correct bottle returned to {station_id}: "
+                f"{secure_state.get('medicine_name')}"
+            )
+        else:
+            self.logger.warning(
+                f"Wrong bottle returned to {station_id}! "
+                f"Expected {secure_state.get('medicine_name')} ({expected_medicine_id}), "
+                f"got {record.get('medicine_name')} ({actual_medicine_id})"
+            )
+            if self.display:
+                self.display.show_warning_screen(
+                    "Wrong bottle detected",
+                    f"Please replace with {secure_state.get('medicine_name', 'correct medication')}"
+                )
+            if self.audio:
+                self.audio.speak_async(
+                    f"Wrong bottle detected. Please replace with "
+                    f"{secure_state.get('medicine_name', 'the correct medication')}"
+                )
+
+        self.tag_runtime_service.stop_scanning()
+        return correct
+
     def _process_secured_bottle_movements(self):
         now_ts = time.time()
 
@@ -398,12 +466,16 @@ class MedicationSystem:
                 if (
                     not secure_state.get("present", False)
                     and secure_state.get("early_alert_sent", False)
-                    and getattr(self, "display", None)
                 ):
-                    next_scheduled = None
-                    if hasattr(self, "scheduler") and self.scheduler:
-                        next_scheduled = self.scheduler.get_next_scheduled_time()
-                    self.display.show_idle_screen(next_scheduled)
+                    # Bottle returned after early removal - verify it's the correct one
+                    correct = self._verify_returned_bottle(secure_state)
+                    # Reset so future removals trigger alerts and scanning again
+                    secure_state["early_alert_sent"] = False
+                    if correct and getattr(self, "display", None):
+                        next_scheduled = None
+                        if hasattr(self, "scheduler") and self.scheduler:
+                            next_scheduled = self.scheduler.get_next_scheduled_time()
+                        self.display.show_idle_screen(next_scheduled)
 
                 secure_state["present"] = True
                 if status.get("stable", False):
@@ -415,7 +487,9 @@ class MedicationSystem:
             ):
                 self._notify_unauthorized_bottle_movement(secure_state)
                 self._prompt_return_bottle_to_station()
-                secure_state["early_alert_sent"] = True
+                secure_state["early_alert_sent"]    = True
+                secure_state["early_alert_sent_at"] = time.time()
+                self.tag_runtime_service.start_scanning()
 
             secure_state["present"] = False
 
