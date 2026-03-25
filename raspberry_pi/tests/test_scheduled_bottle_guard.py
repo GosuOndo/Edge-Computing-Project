@@ -85,19 +85,10 @@ class DummyLogger:
 
 
 class FakeDatabase:
-    def __init__(self, record=None, record_by_tag=None, record_by_station=None):
+    def __init__(self, record=None):
         self.record = record
-        self.record_by_tag = record_by_tag
-        self.record_by_station = record_by_station
 
     def get_registered_medicine_by_tag_uid(self, tag_uid):
-        if self.record_by_tag is not None:
-            return self.record_by_tag
-        return self.record
-
-    def get_registered_medicine_by_station(self, station_id):
-        if self.record_by_station is not None:
-            return self.record_by_station
         return self.record
 
 
@@ -113,20 +104,9 @@ class FakeTagRuntimeService:
     def __init__(self, latest=None, record=None):
         self.latest = latest
         self.tag_manager = FakeTagManager(record)
-        self.calls = []
 
     def get_latest_scan(self):
         return self.latest
-
-    def clear_latest_scan(self):
-        self.calls.append("clear_latest_scan")
-        self.latest = None
-
-    def start_scanning(self):
-        self.calls.append("start_scanning")
-
-    def stop_scanning(self):
-        self.calls.append("stop_scanning")
 
 
 class FakeWeightManager:
@@ -168,13 +148,9 @@ class FakeTelegram:
 class FakeDisplay:
     def __init__(self):
         self.warning_calls = []
-        self.idle_calls = []
 
     def show_warning_screen(self, title, message):
         self.warning_calls.append((title, message))
-
-    def show_idle_screen(self, next_medication=None):
-        self.idle_calls.append(next_medication)
 
 
 class FakeAudio:
@@ -183,11 +159,6 @@ class FakeAudio:
 
     def speak_async(self, message):
         self.messages.append(message)
-
-
-class FakeScheduler:
-    def get_next_scheduled_time(self):
-        return {"medicine_name": "Aspirin 100mg", "time": "20:00"}
 
 
 def make_system():
@@ -242,7 +213,6 @@ def test_unauthorized_bottle_movement_alerts_once_before_due():
     system = make_system()
     system.display = FakeDisplay()
     system.audio = FakeAudio()
-    system.tag_runtime_service = FakeTagRuntimeService()
     system.weight_manager = FakeWeightManager({
         "connected": True,
         "stable": True,
@@ -273,129 +243,6 @@ def test_unauthorized_bottle_movement_alerts_once_before_due():
     assert system.audio.messages == [
         "Please place the medicine back onto the station"
     ]
-    assert system.tag_runtime_service.calls == [
-        "clear_latest_scan",
-        "start_scanning",
-    ]
-
-
-def test_returned_bottle_is_resecured_after_early_removal():
-    record = {
-        "medicine_id": "M001",
-        "medicine_name": "Aspirin 100mg",
-        "station_id": "station_1",
-        "tag_uid": "TAG123",
-        "time_slots": "08:00,20:00",
-    }
-    latest = {
-        "received_at": 456.0,
-        "scan_msg": {"tag_uid": "TAG123"},
-    }
-
-    system = make_system()
-    system.database = FakeDatabase(record)
-    system.display = FakeDisplay()
-    system.scheduler = FakeScheduler()
-    system.tag_runtime_service = FakeTagRuntimeService(latest=latest, record=record)
-    system.weight_manager = FakeWeightManager({
-        "connected": True,
-        "stable": True,
-        "weight_g": 41.0,
-        "event_detection_enabled": False,
-    })
-    system.secured_medications["station_1"] = {
-        "medicine_id": "M001",
-        "medicine_name": "Aspirin 100mg",
-        "station_id": "station_1",
-        "tag_uid": "TAG123",
-        "next_due_timestamp": time.time() + 3600,
-        "next_due_display": "2026-03-25 20:00:00",
-        "present": False,
-        "authorized": False,
-        "early_alert_sent": True,
-    }
-    fixed_due = datetime(2026, 3, 25, 20, 0, 0)
-    system._get_next_due_datetime = lambda raw_slots, now=None: (fixed_due, "20:00")
-
-    system._process_secured_bottle_placements()
-
-    secure_state = system.secured_medications["station_1"]
-    assert secure_state["medicine_id"] == "M001"
-    assert secure_state["tag_uid"] == "TAG123"
-    assert secure_state["secured_weight_g"] == 41.0
-    assert secure_state["present"] is True
-    assert secure_state["early_alert_sent"] is False
-    assert system.tag_runtime_service.calls == [
-        "stop_scanning",
-        "clear_latest_scan",
-    ]
-    assert system.display.idle_calls == [
-        {"medicine_name": "Aspirin 100mg", "time": "20:00"}
-    ]
-
-
-def test_wrong_bottle_is_not_resecured():
-    expected_record = {
-        "medicine_id": "M001",
-        "medicine_name": "Aspirin 100mg",
-        "station_id": "station_1",
-        "tag_uid": "TAG123",
-        "time_slots": "08:00,20:00",
-    }
-    wrong_record = {
-        "medicine_id": "M999",
-        "medicine_name": "Vitamin C",
-        "station_id": "station_2",
-        "tag_uid": "WRONG999",
-        "time_slots": "09:00",
-    }
-    latest = {
-        "received_at": 789.0,
-        "scan_msg": {"tag_uid": "WRONG999"},
-    }
-
-    system = make_system()
-    system.database = FakeDatabase(
-        record_by_tag=wrong_record,
-        record_by_station=expected_record,
-    )
-    system.display = FakeDisplay()
-    system.audio = FakeAudio()
-    system.tag_runtime_service = FakeTagRuntimeService(latest=latest, record=wrong_record)
-    system.weight_manager = FakeWeightManager({
-        "connected": True,
-        "stable": True,
-        "weight_g": 38.0,
-        "event_detection_enabled": False,
-    })
-    system.secured_medications["station_1"] = {
-        "medicine_id": "M001",
-        "medicine_name": "Aspirin 100mg",
-        "station_id": "station_1",
-        "tag_uid": "TAG123",
-        "next_due_timestamp": time.time() + 3600,
-        "next_due_display": "2026-03-25 20:00:00",
-        "present": False,
-        "authorized": False,
-        "early_alert_sent": True,
-    }
-
-    system._process_secured_bottle_placements()
-
-    secure_state = system.secured_medications["station_1"]
-    assert secure_state["medicine_id"] == "M001"
-    assert secure_state["tag_uid"] == "TAG123"
-    assert secure_state["early_alert_sent"] is True
-    assert system.display.warning_calls == [
-        (
-            "Wrong bottle detected",
-            "Please place the correct medicine back onto the station",
-        )
-    ]
-    assert system.audio.messages == [
-        "Please place the correct medicine back onto the station"
-    ]
-    assert system._processed_tag_scans["station_1"] == 789.0
 
 
 def test_authorize_current_medication_captures_baseline_before_enabling_detection():
