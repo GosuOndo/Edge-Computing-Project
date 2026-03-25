@@ -145,6 +145,22 @@ class FakeTelegram:
         return True
 
 
+class FakeDisplay:
+    def __init__(self):
+        self.warning_calls = []
+
+    def show_warning_screen(self, title, message):
+        self.warning_calls.append((title, message))
+
+
+class FakeAudio:
+    def __init__(self):
+        self.messages = []
+
+    def speak_async(self, message):
+        self.messages.append(message)
+
+
 def make_system():
     system = MedicationSystem.__new__(MedicationSystem)
     system.logger = DummyLogger()
@@ -153,6 +169,8 @@ def make_system():
     system._processed_tag_scans = {}
     system.min_secured_bottle_weight_g = 5.0
     system.telegram = FakeTelegram()
+    system.display = None
+    system.audio = None
     return system
 
 
@@ -193,6 +211,8 @@ def test_process_secured_bottle_placement_tracks_next_due():
 
 def test_unauthorized_bottle_movement_alerts_once_before_due():
     system = make_system()
+    system.display = FakeDisplay()
+    system.audio = FakeAudio()
     system.weight_manager = FakeWeightManager({
         "connected": True,
         "stable": True,
@@ -214,6 +234,15 @@ def test_unauthorized_bottle_movement_alerts_once_before_due():
 
     assert len(system.telegram.alerts) == 1
     assert system.secured_medications["station_1"]["early_alert_sent"] is True
+    assert system.display.warning_calls == [
+        (
+            "Bottle removed too early",
+            "Please place the medicine back onto the station",
+        )
+    ]
+    assert system.audio.messages == [
+        "Please place the medicine back onto the station"
+    ]
 
 
 def test_authorize_current_medication_captures_baseline_before_enabling_detection():

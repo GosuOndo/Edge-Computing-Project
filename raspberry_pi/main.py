@@ -357,6 +357,20 @@ class MedicationSystem:
             detected_time=detected_time,
         )
 
+    def _prompt_return_bottle_to_station(self):
+        message = "Please place the medicine back onto the station"
+
+        self.logger.info("Prompting patient to return the bottle to the station")
+
+        if getattr(self, "display", None):
+            self.display.show_warning_screen(
+                "Bottle removed too early",
+                message
+            )
+
+        if getattr(self, "audio", None):
+            self.audio.speak_async(message)
+
     def _process_secured_bottle_movements(self):
         now_ts = time.time()
 
@@ -381,6 +395,16 @@ class MedicationSystem:
             )
 
             if bottle_present:
+                if (
+                    not secure_state.get("present", False)
+                    and secure_state.get("early_alert_sent", False)
+                    and getattr(self, "display", None)
+                ):
+                    next_scheduled = None
+                    if hasattr(self, "scheduler") and self.scheduler:
+                        next_scheduled = self.scheduler.get_next_scheduled_time()
+                    self.display.show_idle_screen(next_scheduled)
+
                 secure_state["present"] = True
                 if status.get("stable", False):
                     secure_state["current_weight_g"] = weight_g
@@ -390,6 +414,7 @@ class MedicationSystem:
                 "early_alert_sent", False
             ):
                 self._notify_unauthorized_bottle_movement(secure_state)
+                self._prompt_return_bottle_to_station()
                 secure_state["early_alert_sent"] = True
 
             secure_state["present"] = False
