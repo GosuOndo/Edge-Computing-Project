@@ -327,74 +327,71 @@ class MedicationSystem:
         )
 
     def _process_secured_bottle_placements(self):
-        latest = self.tag_runtime_service.get_latest_scan()
-        if not latest:
-            return
+        for station_id in self.weight_manager.station_configs:
+            latest = self.tag_runtime_service.get_latest_scan(station_id)
+            if not latest:
+                continue
 
-        scan_received_at = float(latest.get("received_at", 0.0))
-        scan_msg         = latest.get("scan_msg") or {}
-        record           = self._resolve_record_from_scan(scan_msg)
-        if not record:
-            return
+            scan_received_at = float(latest.get("received_at", 0.0))
+            if scan_received_at <= self._processed_tag_scans.get(station_id, 0.0):
+                continue
 
-        station_id = record.get("station_id")
-        if not station_id:
-            return
+            if (
+                self.current_medication
+                and self.current_medication.get("station_id") == station_id
+            ):
+                continue
 
-        if scan_received_at <= self._processed_tag_scans.get(station_id, 0.0):
-            return
+            scan_msg = latest.get("scan_msg") or {}
+            record   = self._resolve_record_from_scan(scan_msg)
+            if not record or record.get("station_id") != station_id:
+                continue
 
-        if (
-            self.current_medication
-            and self.current_medication.get("station_id") == station_id
-        ):
-            return
-
-        # Only accept the medicine that is registered to this station.
-        # If a different bottle is placed (e.g. aspirin on a paracetamol
-        # station), reject it immediately so it cannot overwrite the
-        # secured state.
-        registered = self.database.get_registered_medicine_by_station(station_id)
-        if registered:
-            registered_medicine_id = registered.get("medicine_id")
-            registered_tag_uid     = registered.get("tag_uid")
-            scanned_medicine_id    = record.get("medicine_id")
-            scanned_tag_uid        = record.get("tag_uid") or scan_msg.get("tag_uid")
-            match = (
-                (registered_medicine_id and scanned_medicine_id == registered_medicine_id)
-                or (registered_tag_uid and scanned_tag_uid == registered_tag_uid)
-            )
-            if not match:
-                self.logger.warning(
-                    f"Wrong medicine placed on {station_id}: "
-                    f"expected {registered.get('medicine_name')} ({registered_medicine_id}), "
-                    f"got {record.get('medicine_name')} ({scanned_medicine_id})"
+            # Only accept the medicine that is registered to this station.
+            # If a different bottle is placed (e.g. aspirin on a paracetamol
+            # station), reject it immediately so it cannot overwrite the
+            # secured state.
+            registered = self.database.get_registered_medicine_by_station(station_id)
+            if registered:
+                registered_medicine_id = registered.get("medicine_id")
+                registered_tag_uid     = registered.get("tag_uid")
+                scanned_medicine_id    = record.get("medicine_id")
+                scanned_tag_uid        = record.get("tag_uid") or scan_msg.get("tag_uid")
+                match = (
+                    (registered_medicine_id and scanned_medicine_id == registered_medicine_id)
+                    or (registered_tag_uid and scanned_tag_uid == registered_tag_uid)
                 )
-                if self.display:
-                    self.display.show_warning_screen(
-                        "Wrong medicine detected",
-                        f"Please place {registered.get('medicine_name', 'the correct medicine')} "
-                        f"on {station_id}"
+                if not match:
+                    self.logger.warning(
+                        f"Wrong medicine placed on {station_id}: "
+                        f"expected {registered.get('medicine_name')} ({registered_medicine_id}), "
+                        f"got {record.get('medicine_name')} ({scanned_medicine_id})"
                     )
-                if self.audio:
-                    self.audio.speak_async(
-                        f"Wrong medicine detected. Please place "
-                        f"{registered.get('medicine_name', 'the correct medicine')} "
-                        f"on {station_id}"
-                    )
-                return
+                    if self.display:
+                        self.display.show_warning_screen(
+                            "Wrong medicine detected",
+                            f"Please place {registered.get('medicine_name', 'the correct medicine')} "
+                            f"on {station_id}"
+                        )
+                    if self.audio:
+                        self.audio.speak_async(
+                            f"Wrong medicine detected. Please place "
+                            f"{registered.get('medicine_name', 'the correct medicine')} "
+                            f"on {station_id}"
+                        )
+                    continue
 
-        status = self.weight_manager.get_station_status(station_id)
-        if not status.get("connected"):
-            return
+            status = self.weight_manager.get_station_status(station_id)
+            if not status.get("connected"):
+                continue
 
-        weight_g = float(status.get("weight_g") or 0.0)
-        if not status.get("stable", False):
-            return
-        if weight_g < self.min_secured_bottle_weight_g:
-            return
+            weight_g = float(status.get("weight_g") or 0.0)
+            if not status.get("stable", False):
+                continue
+            if weight_g < self.min_secured_bottle_weight_g:
+                continue
 
-        self._secure_bottle_until_due(record, scan_received_at, weight_g)
+            self._secure_bottle_until_due(record, scan_received_at, weight_g)
 
     def _notify_unauthorized_bottle_movement(self, secure_state: dict):
         medicine_name = secure_state.get("medicine_name", "medication")
@@ -413,38 +410,60 @@ class MedicationSystem:
             detected_time=detected_time,
         )
 
-    def _prompt_return_bottle_to_station(self):
-        message = "Please place the medicine back onto the station"
+    def _has_pending_security_violation(self) -> bool:
+        now_ts = time.time()
+
+        for station_id, secure_state in self.secured_medications.items():
+            if now_ts >= secure_state.get("next_due_timestamp", 0):
+                continue
+            if secure_state.get("authorized", False):
+                continue
+            if (
+                self.current_medication
+                and self.current_medication.get("station_id") == station_id
+            ):
+                continue
+            if secure_state.get("early_alert_sent", False):
+                return True
+            if secure_state.get("wrong_bottle_on_station", False):
+                return True
+
+        return False
+
+    def _prompt_return_bottle_to_station(self, secure_state: dict):
+        station_id    = secure_state.get("station_id", "station")
+        medicine_name = secure_state.get("medicine_name", "medication")
+        message = (
+            f"{medicine_name} removed from {station_id}. "
+            f"Place it back on the correct station."
+        )
 
         self.logger.info("Prompting patient to return the bottle to the station")
 
         if getattr(self, "display", None):
-            self.display.show_warning_screen(
-                "Bottle removed too early",
-                message
-            )
+            self.display.show_error_screen(message)
 
         if getattr(self, "audio", None):
             self.audio.speak_async(message)
 
-    def _verify_returned_bottle(self, secure_state: dict) -> bool:
+    def _verify_returned_bottle(self, secure_state: dict):
         """
         Check that the bottle placed back after early removal is the correct one
         by verifying a tag scan received since the removal alert was sent.
-        Returns True if the bottle is correct or cannot be verified, False if
-        a wrong bottle was positively identified.
+        Returns True when the correct bottle is confirmed, False when a wrong
+        bottle is confirmed, or None when the system is still waiting for a
+        fresh readable tag from that same station.
         """
         station_id    = secure_state.get("station_id", "unknown")
         alert_sent_at = secure_state.get("early_alert_sent_at", 0.0)
 
         latest = self.tag_runtime_service.get_latest_scan(station_id)
         if not latest or float(latest.get("received_at", 0.0)) <= alert_sent_at:
-            self.logger.warning(
-                f"Bottle returned to {station_id} but no new tag scan received - "
-                "cannot verify identity"
+            self.logger.info(
+                f"Bottle returned to {station_id} but no fresh station-specific "
+                "tag scan is available yet"
             )
-            self.tag_runtime_service.stop_scanning()
-            return True  # cannot verify; accept gracefully
+            return None
 
         scan_msg = latest.get("scan_msg") or {}
         record   = self._resolve_record_from_scan(scan_msg)
@@ -457,8 +476,8 @@ class MedicationSystem:
             self.logger.warning(
                 f"Bottle returned to {station_id} but tag scan could not be resolved"
             )
-            self.tag_runtime_service.stop_scanning()
-            return True
+            self.tag_runtime_service.clear_latest_scan(station_id)
+            return None
 
         expected_medicine_id = secure_state.get("medicine_id")
         expected_tag_uid     = secure_state.get("tag_uid")
@@ -482,9 +501,9 @@ class MedicationSystem:
                 f"got {record.get('medicine_name')} ({actual_medicine_id})"
             )
             if self.display:
-                self.display.show_warning_screen(
-                    "Wrong bottle detected",
-                    f"Please replace with {secure_state.get('medicine_name', 'correct medication')}"
+                self.display.show_error_screen(
+                    f"Wrong bottle on {station_id}. Please replace with "
+                    f"{secure_state.get('medicine_name', 'the correct medication')}."
                 )
             if self.audio:
                 self.audio.speak_async(
@@ -535,17 +554,24 @@ class MedicationSystem:
                     if time.time() - secure_state["bottle_returned_at"] < 2.0:
                         continue   # still waiting for RFID scan to arrive
 
-                    secure_state.pop("bottle_returned_at", None)
-
                     # Bottle returned after early removal - verify it's the correct one
                     correct = self._verify_returned_bottle(secure_state)
+                    if correct is None:
+                        continue
+
+                    secure_state.pop("bottle_returned_at", None)
+
                     if correct:
                         # Reset so future removals trigger alerts and scanning again
                         secure_state["early_alert_sent"] = False
                         secure_state["present"] = True
+                        secure_state["wrong_bottle_on_station"] = False
                         if status.get("stable", False):
                             secure_state["current_weight_g"] = weight_g
-                        if getattr(self, "display", None):
+                        if (
+                            getattr(self, "display", None)
+                            and not self._has_pending_security_violation()
+                        ):
                             next_scheduled = None
                             if hasattr(self, "scheduler") and self.scheduler:
                                 next_scheduled = self.scheduler.get_next_scheduled_time()
@@ -573,7 +599,7 @@ class MedicationSystem:
                 "early_alert_sent", False
             ):
                 self._notify_unauthorized_bottle_movement(secure_state)
-                self._prompt_return_bottle_to_station()
+                self._prompt_return_bottle_to_station(secure_state)
                 secure_state["early_alert_sent"]    = True
                 secure_state["early_alert_sent_at"] = time.time()
                 self.tag_runtime_service.start_scanning(station_id)

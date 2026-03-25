@@ -85,10 +85,17 @@ class DummyLogger:
 
 
 class FakeDatabase:
-    def __init__(self, record=None):
+    def __init__(self, record=None, records_by_tag=None, records_by_station=None):
         self.record = record
+        self.records_by_tag = records_by_tag or {}
+        self.records_by_station = records_by_station or {}
 
     def get_registered_medicine_by_tag_uid(self, tag_uid):
+        return self.records_by_tag.get(tag_uid, self.record)
+
+    def get_registered_medicine_by_station(self, station_id):
+        if self.records_by_station:
+            return self.records_by_station.get(station_id)
         return self.record
 
 
@@ -101,31 +108,81 @@ class FakeTagManager:
 
 
 class FakeTagRuntimeService:
-    def __init__(self, latest=None, record=None):
+    def __init__(self, latest=None, latest_by_station=None, record=None):
         self.latest = latest
+        self.latest_by_station = latest_by_station or {}
         self.tag_manager = FakeTagManager(record)
+        self.scan_commands = []
+        self.cleared_stations = []
 
-    def get_latest_scan(self):
+    def get_latest_scan(self, station_id=None):
+        if station_id is None:
+            if self.latest is not None:
+                return self.latest
+            if not self.latest_by_station:
+                return None
+            return max(
+                self.latest_by_station.values(),
+                key=lambda entry: entry.get("received_at", 0.0),
+            )
+        if self.latest_by_station:
+            return self.latest_by_station.get(station_id)
         return self.latest
+
+    def start_scanning(self, station_id=None):
+        self.scan_commands.append(("start", station_id))
+
+    def stop_scanning(self, station_id=None):
+        self.scan_commands.append(("stop", station_id))
+
+    def clear_latest_scan(self, station_id=None):
+        self.cleared_stations.append(station_id)
+        if station_id is None:
+            self.latest = None
+            self.latest_by_station.clear()
+        else:
+            self.latest_by_station.pop(station_id, None)
+            if self.latest == self.latest_by_station.get(station_id):
+                self.latest = None
 
 
 class FakeWeightManager:
     def __init__(self, status):
-        self.status = status
+        if (
+            isinstance(status, dict)
+            and status
+            and all(isinstance(value, dict) for value in status.values())
+        ):
+            self.status_by_station = {
+                station_id: dict(station_status)
+                for station_id, station_status in status.items()
+            }
+        else:
+            self.status_by_station = {"station_1": dict(status)}
+
         self.calls = []
-        self.baseline_weights = {"station_1": status.get("weight_g", 0.0)}
+        self.baseline_weights = {
+            station_id: station_status.get("weight_g", 0.0)
+            for station_id, station_status in self.status_by_station.items()
+        }
+        self.station_configs = {
+            station_id: {"id": station_id}
+            for station_id in self.status_by_station
+        }
 
     def get_station_status(self, station_id):
-        return dict(self.status)
+        return dict(self.status_by_station[station_id])
 
     def capture_current_baseline(self, station_id):
         self.calls.append(("capture", station_id))
-        self.baseline_weights[station_id] = self.status.get("weight_g", 0.0)
+        self.baseline_weights[station_id] = self.status_by_station[station_id].get(
+            "weight_g", 0.0
+        )
         return True
 
     def enable_event_detection(self, station_id):
         self.calls.append(("enable", station_id))
-        self.status["event_detection_enabled"] = True
+        self.status_by_station[station_id]["event_detection_enabled"] = True
 
 
 class FakeStateMachine:
@@ -148,9 +205,17 @@ class FakeTelegram:
 class FakeDisplay:
     def __init__(self):
         self.warning_calls = []
+        self.error_calls = []
+        self.idle_calls = []
 
     def show_warning_screen(self, title, message):
         self.warning_calls.append((title, message))
+
+    def show_error_screen(self, message):
+        self.error_calls.append(message)
+
+    def show_idle_screen(self, next_scheduled=None):
+        self.idle_calls.append(next_scheduled)
 
 
 class FakeAudio:
@@ -171,6 +236,7 @@ def make_system():
     system.telegram = FakeTelegram()
     system.display = None
     system.audio = None
+    system.tag_runtime_service = FakeTagRuntimeService()
     return system
 
 
@@ -209,6 +275,66 @@ def test_process_secured_bottle_placement_tracks_next_due():
     assert secure_state["secured_weight_g"] == 42.5
 
 
+def test_process_secured_bottle_placements_secures_both_registered_stations():
+    record_1 = {
+        "medicine_id": "M001",
+        "medicine_name": "Aspirin 100mg",
+        "station_id": "station_1",
+        "tag_uid": "TAG123",
+        "time_slots": "08:00,20:00",
+    }
+    record_2 = {
+        "medicine_id": "M002",
+        "medicine_name": "Metformin 500mg",
+        "station_id": "station_2",
+        "tag_uid": "TAG456",
+        "time_slots": "09:00,21:00",
+    }
+
+    system = make_system()
+    system.database = FakeDatabase(
+        records_by_tag={"TAG123": record_1, "TAG456": record_2},
+        records_by_station={"station_1": record_1, "station_2": record_2},
+    )
+    system.tag_runtime_service = FakeTagRuntimeService(
+        latest_by_station={
+            "station_1": {
+                "received_at": 123.0,
+                "scan_msg": {"tag_uid": "TAG123"},
+            },
+            "station_2": {
+                "received_at": 456.0,
+                "scan_msg": {"tag_uid": "TAG456"},
+            },
+        }
+    )
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 42.5,
+            "event_detection_enabled": False,
+        },
+        "station_2": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 51.0,
+            "event_detection_enabled": False,
+        },
+    })
+    system._get_next_due_datetime = (
+        lambda raw_slots, now=None: (datetime(2026, 3, 25, 20, 0, 0), "20:00")
+    )
+
+    system._process_secured_bottle_placements()
+
+    assert set(system.secured_medications) == {"station_1", "station_2"}
+    assert system.secured_medications["station_1"]["medicine_id"] == "M001"
+    assert system.secured_medications["station_2"]["medicine_id"] == "M002"
+    assert system.secured_medications["station_1"]["secured_weight_g"] == 42.5
+    assert system.secured_medications["station_2"]["secured_weight_g"] == 51.0
+
+
 def test_unauthorized_bottle_movement_alerts_once_before_due():
     system = make_system()
     system.display = FakeDisplay()
@@ -234,14 +360,11 @@ def test_unauthorized_bottle_movement_alerts_once_before_due():
 
     assert len(system.telegram.alerts) == 1
     assert system.secured_medications["station_1"]["early_alert_sent"] is True
-    assert system.display.warning_calls == [
-        (
-            "Bottle removed too early",
-            "Please place the medicine back onto the station",
-        )
+    assert system.display.error_calls == [
+        "Aspirin 100mg removed from station_1. Place it back on the correct station."
     ]
     assert system.audio.messages == [
-        "Please place the medicine back onto the station"
+        "Aspirin 100mg removed from station_1. Place it back on the correct station."
     ]
 
 
@@ -272,6 +395,158 @@ def test_authorize_current_medication_captures_baseline_before_enabling_detectio
     ]
     assert system.secured_medications["station_1"]["authorized"] is True
     assert system.secured_medications["station_1"]["authorized_baseline_g"] == 55.0
+
+
+def test_returned_bottle_waits_for_fresh_station_scan():
+    system = make_system()
+    system.display = FakeDisplay()
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 55.0,
+            "event_detection_enabled": False,
+        }
+    })
+    system.tag_runtime_service = FakeTagRuntimeService(
+        latest_by_station={
+            "station_1": {
+                "received_at": 100.0,
+                "scan_msg": {"tag_uid": "OLD"},
+            }
+        }
+    )
+    now_ts = time.time()
+    system.secured_medications["station_1"] = {
+        "medicine_id": "M001",
+        "medicine_name": "Aspirin 100mg",
+        "station_id": "station_1",
+        "tag_uid": "TAG123",
+        "next_due_timestamp": now_ts + 3600,
+        "next_due_display": "2026-03-25 20:00:00",
+        "present": False,
+        "authorized": False,
+        "early_alert_sent": True,
+        "early_alert_sent_at": now_ts - 5,
+        "bottle_returned_at": now_ts - 3,
+    }
+
+    system._process_secured_bottle_movements()
+
+    secure_state = system.secured_medications["station_1"]
+    assert secure_state["early_alert_sent"] is True
+    assert secure_state["present"] is False
+    assert secure_state["bottle_returned_at"] <= now_ts - 3
+    assert system.tag_runtime_service.scan_commands == []
+
+
+def test_simultaneous_returns_are_verified_per_station():
+    record_1 = {
+        "medicine_id": "M001",
+        "medicine_name": "Aspirin 100mg",
+        "station_id": "station_1",
+        "tag_uid": "TAG123",
+        "time_slots": "08:00,20:00",
+    }
+    record_2 = {
+        "medicine_id": "M002",
+        "medicine_name": "Metformin 500mg",
+        "station_id": "station_2",
+        "tag_uid": "TAG456",
+        "time_slots": "09:00,21:00",
+    }
+    wrong_record = {
+        "medicine_id": "M999",
+        "medicine_name": "Vitamin C",
+        "station_id": "station_2",
+        "tag_uid": "WRONG999",
+        "time_slots": "09:00",
+    }
+
+    system = make_system()
+    system.display = FakeDisplay()
+    system.audio = FakeAudio()
+    system.database = FakeDatabase(
+        records_by_tag={
+            "TAG123": record_1,
+            "TAG456": record_2,
+            "WRONG999": wrong_record,
+        },
+        records_by_station={"station_1": record_1, "station_2": record_2},
+    )
+    now_ts = time.time()
+    system.tag_runtime_service = FakeTagRuntimeService(
+        latest_by_station={
+            "station_1": {
+                "received_at": now_ts - 1.0,
+                "scan_msg": {"tag_uid": "TAG123"},
+            },
+            "station_2": {
+                "received_at": now_ts - 0.5,
+                "scan_msg": {"tag_uid": "WRONG999"},
+            },
+        }
+    )
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 43.0,
+            "event_detection_enabled": False,
+        },
+        "station_2": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 48.0,
+            "event_detection_enabled": False,
+        },
+    })
+    system.secured_medications = {
+        "station_1": {
+            "medicine_id": "M001",
+            "medicine_name": "Aspirin 100mg",
+            "station_id": "station_1",
+            "tag_uid": "TAG123",
+            "next_due_timestamp": now_ts + 3600,
+            "next_due_display": "2026-03-25 20:00:00",
+            "present": False,
+            "authorized": False,
+            "early_alert_sent": True,
+            "early_alert_sent_at": now_ts - 10,
+            "bottle_returned_at": now_ts - 3,
+        },
+        "station_2": {
+            "medicine_id": "M002",
+            "medicine_name": "Metformin 500mg",
+            "station_id": "station_2",
+            "tag_uid": "TAG456",
+            "next_due_timestamp": now_ts + 3600,
+            "next_due_display": "2026-03-25 21:00:00",
+            "present": False,
+            "authorized": False,
+            "early_alert_sent": True,
+            "early_alert_sent_at": now_ts - 10,
+            "bottle_returned_at": now_ts - 3,
+        },
+    }
+
+    system._process_secured_bottle_movements()
+
+    station_1 = system.secured_medications["station_1"]
+    station_2 = system.secured_medications["station_2"]
+
+    assert station_1["present"] is True
+    assert station_1["early_alert_sent"] is False
+    assert station_2["present"] is False
+    assert station_2["early_alert_sent"] is True
+    assert station_2["wrong_bottle_on_station"] is True
+    assert system.display.idle_calls == []
+    assert system.display.error_calls[-1] == (
+        "Wrong bottle on station_2. Please replace with Metformin 500mg."
+    )
+    assert ("stop", "station_1") in system.tag_runtime_service.scan_commands
+    assert ("start", "station_2") in system.tag_runtime_service.scan_commands
+    assert "station_2" in system.tag_runtime_service.cleared_stations
 
 
 def test_weight_manager_rolls_baseline_to_returned_weight(tmp_path):
