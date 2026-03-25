@@ -9,6 +9,7 @@ Orchestrates all modules and handles the complete medication intake workflow.
 import sys
 import time
 import signal
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import os
@@ -69,6 +70,11 @@ class MedicationSystem:
         self.pending_manual_reminder = None
         self.pending_manual_reminder_lock = False
         self.pending_monitoring_ui = None
+        self.secured_medications = {}
+        self._processed_tag_scans = {}
+        self.min_secured_bottle_weight_g = float(
+            self.config.get("registration", {}).get("min_bottle_weight_g", 5.0)
+        )
 
         self._initialize_modules()
 
@@ -201,6 +207,228 @@ class MedicationSystem:
             return registered.get("medicine_id")
         return None
 
+    def _resolve_record_from_scan(self, scan_msg: dict):
+        """Resolve a live tag scan into a registered medicine record."""
+        if not scan_msg:
+            return None
+
+        tag_uid = scan_msg.get("tag_uid")
+        record = None
+        if tag_uid:
+            record = self.database.get_registered_medicine_by_tag_uid(tag_uid)
+
+        if record is None:
+            record = self.tag_runtime_service.tag_manager.build_record_from_scan(
+                scan_msg
+            )
+        return record
+
+    def _parse_time_slots(self, raw_slots):
+        if isinstance(raw_slots, str):
+            return [slot.strip() for slot in raw_slots.split(",") if slot.strip()]
+        if isinstance(raw_slots, (list, tuple)):
+            return [str(slot).strip() for slot in raw_slots if str(slot).strip()]
+        return []
+
+    def _get_next_due_datetime(self, raw_slots, now=None):
+        """Return the next future schedule datetime and original slot string."""
+        now = now or datetime.now()
+        candidates = []
+
+        for slot in self._parse_time_slots(raw_slots):
+            try:
+                hour_str, minute_str = slot.split(":", 1)
+                hour = int(hour_str)
+                minute = int(minute_str)
+            except ValueError:
+                self.logger.warning(f"Invalid schedule slot skipped: {slot}")
+                continue
+
+            candidate = now.replace(
+                hour=hour, minute=minute, second=0, microsecond=0
+            )
+            if candidate <= now:
+                candidate += timedelta(days=1)
+            candidates.append((candidate, slot))
+
+        if not candidates:
+            return None, None
+
+        return min(candidates, key=lambda item: item[0])
+
+    def _secure_bottle_until_due(
+        self, record: dict, scan_received_at: float, current_weight_g: float
+    ):
+        station_id = record.get("station_id")
+        medicine_name = record.get("medicine_name") or "Unknown"
+        next_due_at, scheduled_time = self._get_next_due_datetime(
+            record.get("time_slots", "")
+        )
+
+        if not station_id or not next_due_at:
+            self.logger.warning(
+                f"Could not secure bottle for {medicine_name}: missing station or schedule"
+            )
+            return
+
+        self.secured_medications[station_id] = {
+            "medicine_id": record.get("medicine_id"),
+            "medicine_name": medicine_name,
+            "station_id": station_id,
+            "tag_uid": record.get("tag_uid"),
+            "secured_at": scan_received_at,
+            "secured_weight_g": current_weight_g,
+            "current_weight_g": current_weight_g,
+            "next_due_timestamp": next_due_at.timestamp(),
+            "next_due_display": next_due_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "scheduled_time": scheduled_time,
+            "authorized": False,
+            "present": True,
+            "early_alert_sent": False,
+        }
+        self._processed_tag_scans[station_id] = scan_received_at
+
+        self.logger.info(
+            f"Secured {medicine_name} on {station_id} until "
+            f"{next_due_at.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+    def _process_secured_bottle_placements(self):
+        """Convert fresh tag+weight placement events into secured bottle state."""
+        latest = self.tag_runtime_service.get_latest_scan()
+        if not latest:
+            return
+
+        scan_received_at = float(latest.get("received_at", 0.0))
+        scan_msg = latest.get("scan_msg") or {}
+        record = self._resolve_record_from_scan(scan_msg)
+        if not record:
+            return
+
+        station_id = record.get("station_id")
+        if not station_id:
+            return
+
+        if scan_received_at <= self._processed_tag_scans.get(station_id, 0.0):
+            return
+
+        if (
+            self.current_medication
+            and self.current_medication.get("station_id") == station_id
+        ):
+            return
+
+        status = self.weight_manager.get_station_status(station_id)
+        if not status.get("connected"):
+            return
+
+        weight_g = float(status.get("weight_g") or 0.0)
+        if not status.get("stable", False):
+            return
+        if weight_g < self.min_secured_bottle_weight_g:
+            return
+
+        self._secure_bottle_until_due(record, scan_received_at, weight_g)
+
+    def _notify_unauthorized_bottle_movement(self, secure_state: dict):
+        medicine_name = secure_state.get("medicine_name", "medication")
+        station_id = secure_state.get("station_id", "unknown station")
+        allowed_time = secure_state.get("next_due_display", "scheduled time")
+        detected_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        self.logger.warning(
+            f"Unauthorized bottle movement detected for {medicine_name} on "
+            f"{station_id} before {allowed_time}"
+        )
+        self.telegram.send_unauthorized_bottle_movement_alert(
+            medicine_name=medicine_name,
+            station_id=station_id,
+            allowed_time=allowed_time,
+            detected_time=detected_time,
+        )
+
+    def _process_secured_bottle_movements(self):
+        """Alert if a secured bottle is removed before its next due time."""
+        now_ts = time.time()
+
+        for station_id, secure_state in self.secured_medications.items():
+            if now_ts >= secure_state.get("next_due_timestamp", 0):
+                continue
+
+            if secure_state.get("authorized", False):
+                continue
+
+            if (
+                self.current_medication
+                and self.current_medication.get("station_id") == station_id
+            ):
+                continue
+
+            status = self.weight_manager.get_station_status(station_id)
+            weight_g = float(status.get("weight_g") or 0.0)
+            bottle_present = (
+                bool(status.get("connected"))
+                and weight_g >= self.min_secured_bottle_weight_g
+            )
+
+            if bottle_present:
+                secure_state["present"] = True
+                if status.get("stable", False):
+                    secure_state["current_weight_g"] = weight_g
+                continue
+
+            if secure_state.get("present", False) and not secure_state.get(
+                "early_alert_sent", False
+            ):
+                self._notify_unauthorized_bottle_movement(secure_state)
+                secure_state["early_alert_sent"] = True
+
+            secure_state["present"] = False
+
+    def _authorize_current_medication_if_ready(self):
+        """
+        At the reminder time, capture the bottle's current stable weight and arm
+        removal detection. This makes the dosage delta compare before-vs-after
+        the scheduled consumption window instead of against an old baseline.
+        """
+        if not self.current_medication:
+            return False
+
+        if self.state_machine.get_state() != SystemState.REMINDER_ACTIVE:
+            return False
+
+        station_id = self.current_medication["station_id"]
+        status = self.weight_manager.get_station_status(station_id)
+        if status.get("event_detection_enabled"):
+            return True
+        if not status.get("connected"):
+            return False
+
+        weight_g = float(status.get("weight_g") or 0.0)
+        if weight_g < self.min_secured_bottle_weight_g:
+            return False
+        if not status.get("stable", False):
+            return False
+
+        if not self.weight_manager.capture_current_baseline(station_id):
+            return False
+
+        self.weight_manager.enable_event_detection(station_id)
+
+        secure_state = self.secured_medications.get(station_id)
+        if secure_state:
+            secure_state["authorized"] = True
+            secure_state["authorized_at"] = time.time()
+            secure_state["authorized_baseline_g"] = (
+                self.weight_manager.baseline_weights.get(station_id)
+            )
+
+        self.logger.info(
+            f"Authorized bottle removal for {station_id} at scheduled time "
+            f"with baseline={self.weight_manager.baseline_weights.get(station_id):.2f}g"
+        )
+        return True
+
     # ------------------------------------------------------------------
     # Manual reminder injection (test scripts)
     # ------------------------------------------------------------------
@@ -297,7 +525,6 @@ class MedicationSystem:
                 "Identity will fall back to QR/OCR."
             )
 
-        self.weight_manager.enable_event_detection(station_id)
         self.state_machine.transition_to(SystemState.REMINDER_ACTIVE, reminder_data)
 
         medicine_name = reminder_data["medicine_name"]
@@ -309,6 +536,7 @@ class MedicationSystem:
         if self.audio:
             self.audio.announce_reminder(medicine_name, dosage)
         self.telegram.send_medication_reminder(medicine_name, dosage, time_str)
+        self._authorize_current_medication_if_ready()
 
     def _on_missed_dose(self, missed_data: dict):
         self.logger.warning(f"Missed dose: {missed_data}")
@@ -347,9 +575,9 @@ class MedicationSystem:
         self.state_machine.reset_to_idle()
 
         if self.current_medication:
-            self.weight_manager.disable_event_detection(
-                self.current_medication["station_id"]
-            )
+            station_id = self.current_medication["station_id"]
+            self.weight_manager.disable_event_detection(station_id)
+            self.secured_medications.pop(station_id, None)
         self.current_medication = None
         self.pending_monitoring_ui = None
 
@@ -459,6 +687,7 @@ class MedicationSystem:
             time.sleep(3)
             self.state_machine.reset_to_idle()
             self.weight_manager.disable_event_detection(expected_station_id)
+            self.secured_medications.pop(expected_station_id, None)
             self.current_medication = None
             self.pending_monitoring_ui = None
             if self.display:
@@ -482,6 +711,7 @@ class MedicationSystem:
             time.sleep(3)
             self.state_machine.reset_to_idle()
             self.weight_manager.disable_event_detection(expected_station_id)
+            self.secured_medications.pop(expected_station_id, None)
             self.current_medication = None
             self.pending_monitoring_ui = None
             if self.display:
@@ -564,6 +794,7 @@ class MedicationSystem:
         time.sleep(3)
         self.state_machine.reset_to_idle()
         self.weight_manager.disable_event_detection(expected_station_id)
+        self.secured_medications.pop(expected_station_id, None)
         self.current_medication = None
         self.pending_monitoring_ui = None
 
@@ -749,7 +980,10 @@ class MedicationSystem:
 
         try:
             while self.running:
+                self._process_secured_bottle_placements()
+                self._process_secured_bottle_movements()
                 self._process_pending_manual_reminder()
+                self._authorize_current_medication_if_ready()
                 self._process_pending_weight_event()
                 if self.display:
                     self.display.update()

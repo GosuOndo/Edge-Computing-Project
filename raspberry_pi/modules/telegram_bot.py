@@ -285,6 +285,28 @@ class TelegramBot:
 
         return self.send_message(self.caregiver_chat_id, message)
 
+    def send_unauthorized_bottle_movement_alert(
+        self,
+        medicine_name: str,
+        station_id: str,
+        allowed_time: str,
+        detected_time: str
+    ) -> bool:
+        name = self._escape_md(medicine_name)
+        sid = self._escape_md(station_id)
+        allowed = self._escape_md(allowed_time)
+        detected = self._escape_md(detected_time)
+
+        message = (
+            f"*ALERT - Early Bottle Movement*\n\n"
+            f"Medicine: {name}\n"
+            f"Station: {sid}\n"
+            f"Allowed removal time: {allowed}\n"
+            f"Detected movement: {detected}\n\n"
+            f"The bottle was moved before the next scheduled dose window."
+        )
+        return self.send_message(self.caregiver_chat_id, message)
+
     def send_registration_confirmation(
         self,
         medicine_name: str,

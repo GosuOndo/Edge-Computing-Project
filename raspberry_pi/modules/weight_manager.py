@@ -8,13 +8,13 @@ Two-phase detection:
 
   Phase 2 WAITING_FOR_REPLACEMENT:
       Bottle is off the scale. Wait until it is placed back and the
-      reading is stable again.  Then compute:
+      reading is stable again. Then compute:
           delta = baseline_weight - new_stable_weight
       and fire the pill-removal callback with the estimated pill count.
 
-Baseline is NOT updated after an event so that repeated
-remove-and-replace cycles always compare against the original full-
-bottle weight (until a new baseline is explicitly captured).
+The baseline represents the last authorised stable on-scale weight.
+After a confirmed event, the returned bottle weight becomes the new
+baseline so later scheduled doses compare against the latest bottle state.
 """
 
 import json
@@ -406,6 +406,14 @@ class WeightManager:
                 self.pill_removal_callback(event_data)
             except Exception as e:
                 self.logger.error(f"Error in pill removal callback: {e}")
+
+        self.baseline_weights[station_id] = new_weight_g
+        self.baseline_capture_required[station_id] = False
+        self._save_persisted_baselines()
+        self.logger.info(
+            f"[{station_id}] Baseline updated to returned bottle weight "
+            f"{new_weight_g:.2f}g"
+        )
 
     # --------------------------------------------------------------------------
     # Public query API  (unchanged from original)
