@@ -271,11 +271,6 @@ class MedicationSystem:
     ):
         station_id    = record.get("station_id")
         medicine_name = record.get("medicine_name") or "Unknown"
-        previous_secure_state = self.secured_medications.get(station_id)
-        was_waiting_for_return = bool(
-            previous_secure_state
-            and previous_secure_state.get("early_alert_sent", False)
-        )
         next_due_at, scheduled_time = self._get_next_due_datetime(
             record.get("time_slots", "")
         )
@@ -309,16 +304,6 @@ class MedicationSystem:
             f"{next_due_at.strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
-        if was_waiting_for_return and getattr(self, "tag_runtime_service", None):
-            self.tag_runtime_service.stop_scanning()
-            self.tag_runtime_service.clear_latest_scan()
-
-        if was_waiting_for_return and getattr(self, "display", None):
-            next_scheduled = None
-            if hasattr(self, "scheduler") and self.scheduler:
-                next_scheduled = self.scheduler.get_next_scheduled_time()
-            self.display.show_idle_screen(next_scheduled)
-
     def _process_secured_bottle_placements(self):
         latest = self.tag_runtime_service.get_latest_scan()
         if not latest:
@@ -330,7 +315,7 @@ class MedicationSystem:
         if not record:
             return
 
-        station_id = self._get_station_waiting_for_return() or record.get("station_id")
+        station_id = record.get("station_id")
         if not station_id:
             return
 
@@ -343,14 +328,6 @@ class MedicationSystem:
         ):
             return
 
-        if not self._is_expected_bottle_for_station(station_id, record):
-            self._processed_tag_scans[station_id] = scan_received_at
-            self.logger.warning(
-                f"Rejected bottle placement for {station_id}: "
-                f"scan does not match the registered medicine"
-            )
-            return
-
         status = self.weight_manager.get_station_status(station_id)
         if not status.get("connected"):
             return
@@ -361,9 +338,7 @@ class MedicationSystem:
         if weight_g < self.min_secured_bottle_weight_g:
             return
 
-        secure_record = dict(record)
-        secure_record["station_id"] = station_id
-        self._secure_bottle_until_due(secure_record, scan_received_at, weight_g)
+        self._secure_bottle_until_due(record, scan_received_at, weight_g)
 
     def _notify_unauthorized_bottle_movement(self, secure_state: dict):
         medicine_name = secure_state.get("medicine_name", "medication")
@@ -396,52 +371,6 @@ class MedicationSystem:
         if getattr(self, "audio", None):
             self.audio.speak_async(message)
 
-    def _get_station_waiting_for_return(self):
-        for station_id, secure_state in self.secured_medications.items():
-            if secure_state.get("authorized", False):
-                continue
-            if not secure_state.get("early_alert_sent", False):
-                continue
-            if (
-                self.current_medication
-                and self.current_medication.get("station_id") == station_id
-            ):
-                continue
-            return station_id
-        return None
-
-    def _is_expected_bottle_for_station(self, station_id: str, record: dict) -> bool:
-        expected = self.database.get_registered_medicine_by_station(station_id)
-        if not expected:
-            expected = self.secured_medications.get(station_id, {})
-
-        comparisons = (
-            "tag_uid",
-            "medicine_id",
-            "medicine_name",
-        )
-
-        for field in comparisons:
-            expected_value = expected.get(field)
-            actual_value   = record.get(field)
-            if not expected_value or not actual_value:
-                continue
-
-            if field == "medicine_name":
-                expected_value = str(expected_value).strip().upper()
-                actual_value   = str(actual_value).strip().upper()
-
-            if expected_value != actual_value:
-                return False
-
-        return True
-
-    def _start_waiting_for_return_scan(self):
-        if not getattr(self, "tag_runtime_service", None):
-            return
-        self.tag_runtime_service.clear_latest_scan()
-        self.tag_runtime_service.start_scanning()
-
     def _process_secured_bottle_movements(self):
         now_ts = time.time()
 
@@ -466,6 +395,16 @@ class MedicationSystem:
             )
 
             if bottle_present:
+                if (
+                    not secure_state.get("present", False)
+                    and secure_state.get("early_alert_sent", False)
+                    and getattr(self, "display", None)
+                ):
+                    next_scheduled = None
+                    if hasattr(self, "scheduler") and self.scheduler:
+                        next_scheduled = self.scheduler.get_next_scheduled_time()
+                    self.display.show_idle_screen(next_scheduled)
+
                 secure_state["present"] = True
                 if status.get("stable", False):
                     secure_state["current_weight_g"] = weight_g
@@ -476,7 +415,6 @@ class MedicationSystem:
             ):
                 self._notify_unauthorized_bottle_movement(secure_state)
                 self._prompt_return_bottle_to_station()
-                self._start_waiting_for_return_scan()
                 secure_state["early_alert_sent"] = True
 
             secure_state["present"] = False
