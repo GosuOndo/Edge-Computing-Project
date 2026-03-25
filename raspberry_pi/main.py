@@ -1214,7 +1214,10 @@ class MedicationSystem:
 
         if hasattr(self, "scheduler") and self.scheduler:
             next_medication = self.scheduler.get_next_scheduled_time()
-            today_schedule = self.scheduler.get_todays_schedule()
+        if hasattr(self, "database") and self.database:
+            today_schedule = self._build_schedule_summary(
+                self.database.list_registered_medicines()
+            )
 
         return {
             "next_medication": next_medication,

@@ -400,7 +400,7 @@ class DisplayManager:
             self._draw_rect('white', panel_x, panel_y, panel_w, panel_h, radius=20)
             self._draw_rect('primary', panel_x, panel_y, panel_w, 10, radius=20)
             self._draw_text(
-                "Today's Timetable",
+                "Daily Schedule",
                 'normal',
                 'primary',
                 panel_x + 28,
@@ -422,25 +422,34 @@ class DisplayManager:
                             1
                         )
 
-                    station_label = str(item.get('station_id', '')).replace('_', ' ').title()
-                    details = item.get('medicine_name', 'Unknown')
-                    if station_label:
-                        details = f"{details}  ({station_label})"
+                    if isinstance(item, str):
+                        self._draw_text(
+                            item,
+                            'normal',
+                            'text_dark',
+                            panel_x + 28,
+                            row_y
+                        )
+                    else:
+                        station_label = str(item.get('station_id', '')).replace('_', ' ').title()
+                        details = item.get('medicine_name', 'Unknown')
+                        if station_label:
+                            details = f"{details}  ({station_label})"
 
-                    self._draw_text(
-                        item.get('time', '--:--'),
-                        'normal',
-                        'secondary',
-                        panel_x + 28,
-                        row_y
-                    )
-                    self._draw_text(
-                        details,
-                        'normal',
-                        'text_dark',
-                        panel_x + 150,
-                        row_y
-                    )
+                        self._draw_text(
+                            item.get('time', '--:--'),
+                            'normal',
+                            'secondary',
+                            panel_x + 28,
+                            row_y
+                        )
+                        self._draw_text(
+                            details,
+                            'normal',
+                            'text_dark',
+                            panel_x + 150,
+                            row_y
+                        )
                     row_y += row_h
 
                 if len(today_schedule) > max_rows:
