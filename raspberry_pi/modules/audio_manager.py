@@ -2,7 +2,6 @@
 
 import subprocess
 import threading
-import shlex
 
 
 class AudioManager:
@@ -16,30 +15,34 @@ class AudioManager:
         self.pitch = int(config.get("pitch", 45))
 
         self.initialized = False
+        self.mixer_initialized = False
         self._audio_lock = threading.Lock()
 
     def initialize(self):
         if not self.enabled:
             self.logger.info("Audio manager disabled")
+            self.initialized = False
+            self.mixer_initialized = False
             return True
 
         try:
-            for tool_name in ["espeak", "ffmpeg", "aplay"]:
-                result = subprocess.run(
-                    ["which", tool_name],
-                    capture_output=True,
-                    text=True,
-                    check=False
-                )
-                if result.returncode != 0:
-                    self.logger.error(f"Audio init failed: {tool_name} not found")
-                    self.initialized = False
-                    return False
+            result = subprocess.run(
+                ["which", "espeak"],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if result.returncode != 0:
+                self.logger.error("Audio init failed: espeak not found")
+                self.initialized = False
+                self.mixer_initialized = False
+                return False
 
             self.initialized = True
+            self.mixer_initialized = True
             self.logger.info(
                 "Audio manager initialized successfully using "
-                f"espeak -> ffmpeg -> aplay "
+                f"direct espeak playback "
                 f"(voice={self.voice}, speed={self.speed}, pitch={self.pitch})"
             )
             return True
@@ -47,6 +50,7 @@ class AudioManager:
         except Exception as e:
             self.logger.error(f"Audio init failed: {e}")
             self.initialized = False
+            self.mixer_initialized = False
             return False
 
     def _speak_worker(self, text):
@@ -63,16 +67,24 @@ class AudioManager:
             if not safe_text:
                 return
 
-            quoted_text = shlex.quote(safe_text)
-
-            cmd = (
-                f"espeak -v {self.voice} -s {self.speed} -p {self.pitch} --stdout {quoted_text} "
-                f"| ffmpeg -loglevel error -i pipe:0 -ar 48000 -ac 2 -f wav - "
-                f"| aplay"
-            )
-
             self.logger.info(f"SPEAKING: {safe_text}")
-            subprocess.run(cmd, shell=True, check=False)
+            result = subprocess.run(
+                [
+                    "espeak",
+                    "-v", str(self.voice),
+                    "-s", str(self.speed),
+                    "-p", str(self.pitch),
+                    safe_text,
+                ],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if result.returncode != 0:
+                error_message = result.stderr.strip() or "unknown audio backend error"
+                self.logger.error(f"Unable to play audio: {error_message}")
+                self.initialized = False
+                self.mixer_initialized = False
 
         except Exception as e:
             self.logger.error(f"Speak error: {e}")
@@ -116,4 +128,5 @@ class AudioManager:
         pass
 
     def cleanup(self):
+        self.mixer_initialized = False
         self.logger.info("Audio manager cleanup complete")
