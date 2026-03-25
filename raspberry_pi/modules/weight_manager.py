@@ -5,6 +5,7 @@ Two-phase detection:
   Phase 1 WAITING_FOR_REMOVAL:
       Armed with a baseline. Wait until the bottle is lifted off
       (weight drops below EMPTY_SCALE_THRESHOLD_G).
+      Fires bottle_lifted_callback when transition to REMOVED occurs.
 
   Phase 2 WAITING_FOR_REPLACEMENT:
       Bottle is off the scale. Wait until it is placed back and the
@@ -13,7 +14,7 @@ Two-phase detection:
       and fire the pill-removal callback with the estimated pill count.
 
 The baseline represents the last authorised stable on-scale weight.
-After a confirmed event, the returned bottle weight becomes the new
+After a confirmed event the returned bottle weight becomes the new
 baseline so later scheduled doses compare against the latest bottle state.
 """
 
@@ -37,6 +38,7 @@ class _DetectionState(Enum):
 
 # Weight below this value (grams) is treated as "nothing on scale"
 EMPTY_SCALE_THRESHOLD_G = 5.0
+
 
 class WeightManager:
     """Manages weight sensor data and two-phase bottle event detection."""
@@ -67,15 +69,21 @@ class WeightManager:
         self.pill_removal_callback: Optional[Callable] = None
         self.pill_addition_callback: Optional[Callable] = None  # kept for compat
 
+        # NEW: fired when a bottle is lifted off an armed station.
+        # Signature: callback({"station_id": str, "timestamp": float})
+        # Used by main.py to tell the tag reader to start scanning so it
+        # is ready to capture the tag when the bottle is placed back.
+        self.bottle_lifted_callback: Optional[Callable] = None
+
         # Build per-station dicts
         self.station_configs: Dict[str, dict] = {}
         for _, station_cfg in config.items():
             if isinstance(station_cfg, dict) and "id" in station_cfg:
                 sid = station_cfg["id"]
                 self.station_configs[sid] = station_cfg
-                self._detection_state[sid]       = _DetectionState.DISABLED
-                self._stable_candidate_start[sid] = None
-                self._last_event_time[sid]        = 0.0
+                self._detection_state[sid]        = _DetectionState.DISABLED
+                self._stable_candidate_start[sid]  = None
+                self._last_event_time[sid]         = 0.0
                 self.baseline_capture_required[sid] = True
 
         # Persistence
@@ -98,7 +106,7 @@ class WeightManager:
     def _get_settle_time(self, station_id: str) -> float:
         cfg = self.station_configs.get(station_id, {})
         return float(cfg.get("event_settle_seconds", 1.5))
-        
+
     def _get_cooldown(self, station_id: str) -> float:
         cfg = self.station_configs.get(station_id, {})
         return float(cfg.get("event_cooldown_seconds", 2.0))
@@ -114,6 +122,20 @@ class WeightManager:
     def set_pill_addition_callback(self, callback: Callable):
         self.pill_addition_callback = callback
         self.logger.info("Pill addition callback registered (compat only)")
+
+    def set_bottle_lifted_callback(self, callback: Callable):
+        """
+        Register a callback fired the moment a bottle is lifted off an armed
+        station (WAITING_FOR_REMOVAL ? REMOVED transition).
+
+        Signature: callback({"station_id": str, "timestamp": float})
+
+        main.py uses this to call tag_runtime_service.start_scanning() so
+        the reader is active and ready to capture the tag when the bottle
+        is placed back on the scale.
+        """
+        self.bottle_lifted_callback = callback
+        self.logger.info("Bottle lifted callback registered")
 
     # --------------------------------------------------------------------------
     # Baseline persistence
@@ -139,7 +161,7 @@ class WeightManager:
                 json.dump(self.baseline_weights, f, indent=2)
         except Exception as e:
             self.logger.error(f"Failed to save persisted baselines: {e}")
-            
+
     # --------------------------------------------------------------------------
     # Arm / disarm event detection
     # --------------------------------------------------------------------------
@@ -200,7 +222,7 @@ class WeightManager:
 
         self.logger.info(f"Baseline captured for {station_id}: {weight_g:.2f} g")
         return True
-        
+
     def require_new_baseline(self, station_id: str):
         self.baseline_capture_required[station_id] = True
         self._detection_state[station_id]          = _DetectionState.DISABLED
@@ -215,11 +237,11 @@ class WeightManager:
 
     def process_weight_data(self, data: Dict[str, Any]):
         try:
-            station_id  = data.get("station_id")
+            station_id = data.get("station_id")
             if not station_id or station_id not in self.station_configs:
                 return
 
-            raw_weight  = data.get("weight_g")
+            raw_weight = data.get("weight_g")
             if raw_weight is None:
                 return
 
@@ -239,17 +261,12 @@ class WeightManager:
             if state == _DetectionState.DISABLED:
                 return
 
-            # -- PHASE 1: waiting for the bottle to be lifted ------------------
             if state == _DetectionState.WAITING_FOR_REMOVAL:
                 self._handle_waiting_for_removal(
                     station_id, weight_g, stable, received_at
                 )
-
-            # -- PHASE 2: bottle is off waiting for it to come back ----------
             elif state == _DetectionState.REMOVED:
                 self._handle_removed(station_id, weight_g, stable, received_at)
-
-            # -- PHASE 3: bottle back on waiting for a stable reading --------
             elif state == _DetectionState.WAITING_FOR_STABLE:
                 self._handle_waiting_for_stable(
                     station_id, weight_g, stable, received_at
@@ -257,7 +274,7 @@ class WeightManager:
 
         except Exception as e:
             self.logger.error(f"Error processing weight data: {e}")
-            
+
     # --------------------------------------------------------------------------
     # FSM handlers
     # --------------------------------------------------------------------------
@@ -265,19 +282,30 @@ class WeightManager:
     def _handle_waiting_for_removal(
         self, station_id: str, weight_g: float, stable: bool, received_at: float
     ):
-        """Phase 1 detect that the bottle has been removed."""
+        """Phase 1: detect that the bottle has been removed."""
         if weight_g <= EMPTY_SCALE_THRESHOLD_G:
             self.logger.info(
                 f"[{station_id}] Bottle REMOVED "
-                f"(weight={weight_g:.2f}g = threshold={EMPTY_SCALE_THRESHOLD_G}g)"
+                f"(weight={weight_g:.2f}g <= threshold={EMPTY_SCALE_THRESHOLD_G}g)"
             )
-            self._detection_state[station_id]       = _DetectionState.REMOVED
-            self._stable_candidate_start[station_id] = None
+            self._detection_state[station_id]        = _DetectionState.REMOVED
+            self._stable_candidate_start[station_id]  = None
+
+            # NEW: notify listeners (e.g. main.py ? tag_runtime_service.start_scanning)
+            # so the tag reader is active and ready before the bottle is placed back.
+            if self.bottle_lifted_callback:
+                try:
+                    self.bottle_lifted_callback({
+                        "station_id": station_id,
+                        "timestamp":  received_at,
+                    })
+                except Exception as e:
+                    self.logger.error(f"Error in bottle_lifted_callback: {e}")
 
     def _handle_removed(
         self, station_id: str, weight_g: float, stable: bool, received_at: float
     ):
-        """Phase 2 detect that the bottle has been placed back."""
+        """Phase 2: detect that the bottle has been placed back."""
         if weight_g > EMPTY_SCALE_THRESHOLD_G:
             self.logger.info(
                 f"[{station_id}] Bottle RETURNED to scale "
@@ -289,44 +317,39 @@ class WeightManager:
     def _handle_waiting_for_stable(
         self, station_id: str, weight_g: float, stable: bool, received_at: float
     ):
-        """Phase 3 wait for a stable reading, then compute delta."""
+        """Phase 3: wait for a stable reading, then compute delta."""
         settle_time = self._get_settle_time(station_id)
 
-        # If reading becomes unstable again, reset the candidate timer
         if not stable:
             if self._stable_candidate_start[station_id] is not None:
                 self.logger.debug(
-                    f"[{station_id}] Reading became unstable resetting settle timer"
+                    f"[{station_id}] Reading became unstable - resetting settle timer"
                 )
             self._stable_candidate_start[station_id] = None
             return
 
-        # First stable sample after return
         if self._stable_candidate_start[station_id] is None:
             self._stable_candidate_start[station_id] = received_at
             return
 
-        # Not enough settle time yet
         if (received_at - self._stable_candidate_start[station_id]) < settle_time:
             return
 
-        # -- Stable long enough ? fire the event ------------------------------
         cooldown = self._get_cooldown(station_id)
         if (received_at - self._last_event_time[station_id]) < cooldown:
             return
 
         baseline = self.baseline_weights.get(station_id)
         if baseline is None:
-            self.logger.warning(f"[{station_id}] No baseline cannot compute delta")
+            self.logger.warning(f"[{station_id}] No baseline - cannot compute delta")
             self._reset_to_waiting(station_id)
             return
 
-        delta_g = baseline - weight_g  # positive ? pills removed
+        delta_g = baseline - weight_g   # positive = pills removed
 
         self._fire_removal_event(station_id, delta_g, weight_g, baseline, received_at)
 
-        self._last_event_time[station_id]            = received_at
-        # Return to WAITING_FOR_REMOVAL so another cycle can happen
+        self._last_event_time[station_id] = received_at
         self._reset_to_waiting(station_id)
 
     def _reset_to_waiting(self, station_id: str):
@@ -337,13 +360,8 @@ class WeightManager:
     # --------------------------------------------------------------------------
     # Event firing
     # --------------------------------------------------------------------------
-    
+
     def _get_min_delta_g(self, station_id: str) -> float:
-        """
-        Minimum weight change (grams) that counts as a real pill removal.
-        Defaults to half a pill weight so scale drift never triggers a false event.
-        Override with min_delta_g in config if needed.
-        """
         cfg = self.station_configs.get(station_id, {})
         if "min_delta_g" in cfg:
             return float(cfg["min_delta_g"])
@@ -358,7 +376,7 @@ class WeightManager:
         received_at: float,
     ):
         pill_weight = self._get_pill_weight_g(station_id)
-        min_delta = self._get_min_delta_g(station_id)
+        min_delta   = self._get_min_delta_g(station_id)
 
         if delta_g <= 0:
             self.logger.info(
@@ -370,14 +388,14 @@ class WeightManager:
         if delta_g < min_delta:
             self.logger.info(
                 f"[{station_id}] Delta {delta_g:.2f}g < min_delta {min_delta:.2f}g "
-                f"treated as noise, no event fired"
+                f"- treated as noise, no event fired"
             )
             return
 
         estimated_pills_float = (delta_g / pill_weight) if pill_weight > 0 else 0.0
-        pills_removed = max(1, int(round(estimated_pills_float))) if pill_weight > 0 else 0
-        nearest_delta_g = pills_removed * pill_weight
-        estimation_error_g = abs(delta_g - nearest_delta_g)
+        pills_removed         = max(1, int(round(estimated_pills_float))) if pill_weight > 0 else 0
+        nearest_delta_g       = pills_removed * pill_weight
+        estimation_error_g    = abs(delta_g - nearest_delta_g)
 
         self.logger.info(
             f"[{station_id}] PILLS REMOVED: {pills_removed} pill(s) "
@@ -386,17 +404,17 @@ class WeightManager:
         )
 
         event_data = {
-            "event_type": "removal",
-            "station_id": station_id,
-            "pills_removed": pills_removed,
+            "event_type":            "removal",
+            "station_id":            station_id,
+            "pills_removed":         pills_removed,
             "estimated_pills_float": round(estimated_pills_float, 3),
-            "estimation_error_g": round(estimation_error_g, 3),
-            "weight_change_g": round(delta_g, 3),
-            "delta_g": round(delta_g, 3),
-            "previous_baseline_g": round(baseline_g, 3),
-            "current_weight_g": round(new_weight_g, 3),
-            "pill_weight_g": round(pill_weight, 3),
-            "timestamp": time.time(),
+            "estimation_error_g":    round(estimation_error_g, 3),
+            "weight_change_g":       round(delta_g, 3),
+            "delta_g":               round(delta_g, 3),
+            "previous_baseline_g":   round(baseline_g, 3),
+            "current_weight_g":      round(new_weight_g, 3),
+            "pill_weight_g":         round(pill_weight, 3),
+            "timestamp":             time.time(),
         }
 
         self.last_event_data[station_id] = event_data
@@ -407,7 +425,7 @@ class WeightManager:
             except Exception as e:
                 self.logger.error(f"Error in pill removal callback: {e}")
 
-        self.baseline_weights[station_id] = new_weight_g
+        self.baseline_weights[station_id]          = new_weight_g
         self.baseline_capture_required[station_id] = False
         self._save_persisted_baselines()
         self.logger.info(
@@ -416,9 +434,9 @@ class WeightManager:
         )
 
     # --------------------------------------------------------------------------
-    # Public query API  (unchanged from original)
+    # Public query API
     # --------------------------------------------------------------------------
-    
+
     def get_current_weight(self, station_id: str) -> Optional[float]:
         data = self.weight_data.get(station_id)
         return data.get("weight_g") if data else None
@@ -444,9 +462,9 @@ class WeightManager:
                 "detection_phase":         det_state.name,
             }
 
-        last_seen          = data.get("received_at", 0)
-        time_since_update  = time.time() - last_seen
-        connected          = time_since_update < 30
+        last_seen         = data.get("received_at", 0)
+        time_since_update = time.time() - last_seen
+        connected         = time_since_update < 30
 
         return {
             "station_id":              station_id,
@@ -470,44 +488,44 @@ class WeightManager:
         if not event:
             return {
                 "verified": False,
-                "reason": "No recent weight event available",
+                "reason":   "No recent weight event available",
                 "expected": expected_pills,
-                "actual": None,
+                "actual":   None,
             }
 
         if event.get("event_type") != "removal":
             return {
                 "verified": False,
-                "reason": "Last event was not a pill removal",
+                "reason":   "Last event was not a pill removal",
                 "expected": expected_pills,
-                "actual": 0,
+                "actual":   0,
             }
 
-        actual = int(event.get("pills_removed", 0))
-        difference = abs(actual - expected_pills)
+        actual         = int(event.get("pills_removed", 0))
+        difference     = abs(actual - expected_pills)
 
-        pill_weight_g = float(event.get("pill_weight_g", self._get_pill_weight_g(station_id)))
+        pill_weight_g  = float(event.get("pill_weight_g", self._get_pill_weight_g(station_id)))
         actual_delta_g = float(event.get("weight_change_g", 0.0))
         expected_delta_g = expected_pills * pill_weight_g
-        delta_error_g = abs(actual_delta_g - expected_delta_g)
+        delta_error_g  = abs(actual_delta_g - expected_delta_g)
 
-        cfg = self.station_configs.get(station_id, {})
+        cfg            = self.station_configs.get(station_id, {})
         weight_error_g = float(cfg.get("dose_verification_tolerance_g", 0.12))
 
         verified = (difference <= tolerance) and (delta_error_g <= weight_error_g)
 
         return {
-            "verified": verified,
-            "expected": expected_pills,
-            "actual": actual,
+            "verified":        verified,
+            "expected":        expected_pills,
+            "actual":          actual,
             "weight_change_g": actual_delta_g,
             "expected_delta_g": round(expected_delta_g, 3),
-            "delta_error_g": round(delta_error_g, 3),
-            "difference": difference,
+            "delta_error_g":   round(delta_error_g, 3),
+            "difference":      difference,
             "within_tolerance": verified,
-            "status": "correct" if verified else "incorrect",
+            "status":          "correct" if verified else "incorrect",
         }
-        
+
     def reset_station(self, station_id: str):
         self.weight_data.pop(station_id, None)
         self.baseline_weights.pop(station_id, None)

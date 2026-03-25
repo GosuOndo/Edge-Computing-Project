@@ -4,6 +4,20 @@ Smart Medication System - Main Application
 
 Edge-based medication verification system with real-time monitoring.
 Orchestrates all modules and handles the complete medication intake workflow.
+
+Tag scan control
+-----------------
+Scanning is gated by the firmware.  The Pi controls the gate via MQTT:
+
+  start_scanning()  - sent when the bottle is lifted (bottle_lifted_callback)
+                      so the reader is active and ready to capture the tag
+                      as the bottle is placed back on the scale.
+
+  stop_scanning()   - sent after every verification cycle (success, failure,
+                      or missed dose) so stale scans do not accumulate
+                      between dose windows.
+
+Onboarding scanning is controlled entirely by RegistrationManager.
 """
 
 import sys
@@ -13,22 +27,17 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import os
-# os.environ["SDL_AUDIODRIVER"] = "pulseaudio"
 os.environ["SDL_VIDEO_FBDEV"] = "/dev/fb0"
 
-# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-# Import utilities
 from utils.logger import get_logger
 from utils.config_loader import get_config
 
-# Import services
 from services.mqtt_client import MQTTClient
 from services.scheduler import MedicationScheduler
 from services.state_machine import StateMachine, SystemState
 
-# Import modules
 from modules.weight_manager import WeightManager
 from modules.medicine_scanner import MedicineScanner
 from modules.patient_monitor import PatientMonitor
@@ -58,33 +67,33 @@ class MedicationSystem:
         self.logger.info("Smart Medication Verification System starting")
 
         self.enable_display = enable_display
-        self.enable_audio = enable_audio
-        self.running = False
-        self._stop_called = False
+        self.enable_audio   = enable_audio
+        self.running        = False
+        self._stop_called   = False
 
-        self.state_machine = StateMachine(self.logger)
+        self.state_machine    = StateMachine(self.logger)
         self.current_medication = None
 
-        self.pending_weight_event = None
-        self.pending_weight_lock = False
-        self.pending_manual_reminder = None
+        self.pending_weight_event        = None
+        self.pending_weight_lock         = False
+        self.pending_manual_reminder     = None
         self.pending_manual_reminder_lock = False
-        self.pending_monitoring_ui = None
-        self.secured_medications = {}
-        self._processed_tag_scans = {}
+        self.pending_monitoring_ui       = None
+        self.secured_medications         = {}
+        self._processed_tag_scans        = {}
         self.min_secured_bottle_weight_g = float(
             self.config.get("registration", {}).get("min_bottle_weight_g", 5.0)
         )
-
+        
         self._initialize_modules()
 
-        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGINT,  self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
     # ------------------------------------------------------------------
     # Module initialisation
     # ------------------------------------------------------------------
-    
+
     def _initialize_modules(self):
         self.logger.info("Initializing modules...")
         try:
@@ -99,6 +108,9 @@ class MedicationSystem:
                 self.config["weight_sensors"], self.logger
             )
             self.weight_manager.set_pill_removal_callback(self._on_pill_removal)
+            # NEW: start scanning when the bottle is lifted so the reader
+            # is ready to capture the tag when the bottle is placed back.
+            self.weight_manager.set_bottle_lifted_callback(self._on_bottle_lifted)
 
             scanner_config = dict(self.config["ocr"])
             scanner_config.update(self.config["hardware"].get("camera", {}))
@@ -139,14 +151,21 @@ class MedicationSystem:
             )
 
             identity_cfg = self.config.get("identity", {})
-            tag_topic = identity_cfg.get("tag", {}).get(
-                "mqtt_topic", "medication/tag/read/+"
+            tag_cfg      = identity_cfg.get("tag", {})
+            tag_topic    = tag_cfg.get("mqtt_topic", "medication/tag/read/+")
+            # NEW: command_topic tells the firmware to start/stop scanning.
+            # Defaults to tag_reader_1; override in config.yaml if needed:
+            #   identity.tag.command_topic: "medication/tag/command/tag_reader_1"
+            command_topic = tag_cfg.get(
+                "command_topic", "medication/tag/command/tag_reader_1"
             )
+
             self.tag_runtime_service = TagRuntimeService(
                 mqtt_config=self.config["mqtt"],
                 database=self.database,
                 logger=self.logger,
-                topic=tag_topic
+                topic=tag_topic,
+                command_topic=command_topic,   # NEW
             )
             self.tag_runtime_service.start()
 
@@ -157,7 +176,7 @@ class MedicationSystem:
                 tag_runtime_service=self.tag_runtime_service,
                 logger=self.logger
             )
-
+            
             self.registration_manager = RegistrationManager(
                 config=self.config.config,
                 weight_manager=self.weight_manager,
@@ -184,16 +203,10 @@ class MedicationSystem:
     # ------------------------------------------------------------------
     # Medicine ID resolution
     # ------------------------------------------------------------------
-    
+
     def _resolve_medicine_id_for_station(
         self, station_id: str, medicine_name: str = None
     ):
-        """
-        Look up medicine_id for a station.
-        If medicine_name is provided, matches by both station_id AND name
-        so that multiple medicines on one station resolve correctly.
-        Falls back to the first registered medicine for the station.
-        """
         if medicine_name:
             all_registered = self.database.list_registered_medicines()
             for r in all_registered:
@@ -201,19 +214,17 @@ class MedicationSystem:
                         r.get("medicine_name", "").upper() == medicine_name.upper()):
                     return r.get("medicine_id")
 
-        # Fallback: first medicine registered for this station
         registered = self.database.get_registered_medicine_by_station(station_id)
         if registered:
             return registered.get("medicine_id")
         return None
 
     def _resolve_record_from_scan(self, scan_msg: dict):
-        """Resolve a live tag scan into a registered medicine record."""
         if not scan_msg:
             return None
 
         tag_uid = scan_msg.get("tag_uid")
-        record = None
+        record  = None
         if tag_uid:
             record = self.database.get_registered_medicine_by_tag_uid(tag_uid)
 
@@ -231,14 +242,13 @@ class MedicationSystem:
         return []
 
     def _get_next_due_datetime(self, raw_slots, now=None):
-        """Return the next future schedule datetime and original slot string."""
-        now = now or datetime.now()
+        now        = now or datetime.now()
         candidates = []
 
         for slot in self._parse_time_slots(raw_slots):
             try:
                 hour_str, minute_str = slot.split(":", 1)
-                hour = int(hour_str)
+                hour   = int(hour_str)
                 minute = int(minute_str)
             except ValueError:
                 self.logger.warning(f"Invalid schedule slot skipped: {slot}")
@@ -259,7 +269,7 @@ class MedicationSystem:
     def _secure_bottle_until_due(
         self, record: dict, scan_received_at: float, current_weight_g: float
     ):
-        station_id = record.get("station_id")
+        station_id    = record.get("station_id")
         medicine_name = record.get("medicine_name") or "Unknown"
         next_due_at, scheduled_time = self._get_next_due_datetime(
             record.get("time_slots", "")
@@ -267,24 +277,25 @@ class MedicationSystem:
 
         if not station_id or not next_due_at:
             self.logger.warning(
-                f"Could not secure bottle for {medicine_name}: missing station or schedule"
+                f"Could not secure bottle for {medicine_name}: "
+                "missing station or schedule"
             )
             return
 
         self.secured_medications[station_id] = {
-            "medicine_id": record.get("medicine_id"),
-            "medicine_name": medicine_name,
-            "station_id": station_id,
-            "tag_uid": record.get("tag_uid"),
-            "secured_at": scan_received_at,
-            "secured_weight_g": current_weight_g,
-            "current_weight_g": current_weight_g,
-            "next_due_timestamp": next_due_at.timestamp(),
-            "next_due_display": next_due_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "scheduled_time": scheduled_time,
-            "authorized": False,
-            "present": True,
-            "early_alert_sent": False,
+            "medicine_id":         record.get("medicine_id"),
+            "medicine_name":       medicine_name,
+            "station_id":          station_id,
+            "tag_uid":             record.get("tag_uid"),
+            "secured_at":          scan_received_at,
+            "secured_weight_g":    current_weight_g,
+            "current_weight_g":    current_weight_g,
+            "next_due_timestamp":  next_due_at.timestamp(),
+            "next_due_display":    next_due_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "scheduled_time":      scheduled_time,
+            "authorized":          False,
+            "present":             True,
+            "early_alert_sent":    False,
         }
         self._processed_tag_scans[station_id] = scan_received_at
 
@@ -294,14 +305,13 @@ class MedicationSystem:
         )
 
     def _process_secured_bottle_placements(self):
-        """Convert fresh tag+weight placement events into secured bottle state."""
         latest = self.tag_runtime_service.get_latest_scan()
         if not latest:
             return
 
         scan_received_at = float(latest.get("received_at", 0.0))
-        scan_msg = latest.get("scan_msg") or {}
-        record = self._resolve_record_from_scan(scan_msg)
+        scan_msg         = latest.get("scan_msg") or {}
+        record           = self._resolve_record_from_scan(scan_msg)
         if not record:
             return
 
@@ -332,8 +342,8 @@ class MedicationSystem:
 
     def _notify_unauthorized_bottle_movement(self, secure_state: dict):
         medicine_name = secure_state.get("medicine_name", "medication")
-        station_id = secure_state.get("station_id", "unknown station")
-        allowed_time = secure_state.get("next_due_display", "scheduled time")
+        station_id    = secure_state.get("station_id", "unknown station")
+        allowed_time  = secure_state.get("next_due_display", "scheduled time")
         detected_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         self.logger.warning(
@@ -348,7 +358,6 @@ class MedicationSystem:
         )
 
     def _process_secured_bottle_movements(self):
-        """Alert if a secured bottle is removed before its next due time."""
         now_ts = time.time()
 
         for station_id, secure_state in self.secured_medications.items():
@@ -364,7 +373,7 @@ class MedicationSystem:
             ):
                 continue
 
-            status = self.weight_manager.get_station_status(station_id)
+            status   = self.weight_manager.get_station_status(station_id)
             weight_g = float(status.get("weight_g") or 0.0)
             bottle_present = (
                 bool(status.get("connected"))
@@ -386,11 +395,6 @@ class MedicationSystem:
             secure_state["present"] = False
 
     def _authorize_current_medication_if_ready(self):
-        """
-        At the reminder time, capture the bottle's current stable weight and arm
-        removal detection. This makes the dosage delta compare before-vs-after
-        the scheduled consumption window instead of against an old baseline.
-        """
         if not self.current_medication:
             return False
 
@@ -398,7 +402,7 @@ class MedicationSystem:
             return False
 
         station_id = self.current_medication["station_id"]
-        status = self.weight_manager.get_station_status(station_id)
+        status     = self.weight_manager.get_station_status(station_id)
         if status.get("event_detection_enabled"):
             return True
         if not status.get("connected"):
@@ -417,9 +421,9 @@ class MedicationSystem:
 
         secure_state = self.secured_medications.get(station_id)
         if secure_state:
-            secure_state["authorized"] = True
-            secure_state["authorized_at"] = time.time()
-            secure_state["authorized_baseline_g"] = (
+            secure_state["authorized"]             = True
+            secure_state["authorized_at"]          = time.time()
+            secure_state["authorized_baseline_g"]  = (
                 self.weight_manager.baseline_weights.get(station_id)
             )
 
@@ -428,21 +432,19 @@ class MedicationSystem:
             f"with baseline={self.weight_manager.baseline_weights.get(station_id):.2f}g"
         )
         return True
-
+        
     # ------------------------------------------------------------------
     # Manual reminder injection (test scripts)
     # ------------------------------------------------------------------
 
     def queue_manual_reminder(self, reminder_data: dict):
-        """Used by test scripts to inject a reminder without the scheduler."""
         self.pending_manual_reminder = reminder_data
         self.logger.info(f"Manual reminder queued: {reminder_data}")
 
     def _process_pending_manual_reminder(self):
-        """Drain a queued manual reminder on the main thread."""
         if self.pending_manual_reminder_lock or not self.pending_manual_reminder:
             return
-        reminder_data = self.pending_manual_reminder
+        reminder_data                = self.pending_manual_reminder
         self.pending_manual_reminder = None
         self.pending_manual_reminder_lock = True
         try:
@@ -473,18 +475,32 @@ class MedicationSystem:
         ):
             self.pending_weight_event = event_data
             self.logger.info("Weight event queued for main-thread processing")
-            
+
+    def _on_bottle_lifted(self, event_data: dict):
+        """
+        Fired by WeightManager when the bottle is lifted off an armed station
+        (WAITING_FOR_REMOVAL ? REMOVED transition).
+
+        We start scanning immediately so the reader is active and ready to
+        capture the tag the moment the bottle is placed back on the scale.
+        This is the only time scanning is enabled outside of onboarding.
+        """
+        station_id = event_data.get("station_id", "unknown")
+        self.logger.info(
+            f"Bottle lifted from {station_id} - starting tag scanning"
+        )
+        self.tag_runtime_service.start_scanning()
+
     # ------------------------------------------------------------------
     # Main-thread event processing
     # ------------------------------------------------------------------
 
     def _process_pending_weight_event(self):
-        """Drain a pending weight event on the main thread."""
         if self.pending_weight_lock or not self.pending_weight_event:
             return
-        event_data = self.pending_weight_event
+        event_data                = self.pending_weight_event
         self.pending_weight_event = None
-        self.pending_weight_lock = True
+        self.pending_weight_lock  = True
         try:
             self.state_machine.transition_to(
                 SystemState.VERIFYING, {"event_data": event_data}
@@ -508,9 +524,6 @@ class MedicationSystem:
         self.current_medication = reminder_data
         station_id = reminder_data["station_id"]
 
-        # Use medicine_id from reminder_data if already provided (e.g. test injection
-        # or manual trigger). Otherwise resolve by station + medicine name so that
-        # multiple medicines on the same station resolve correctly.
         medicine_id = reminder_data.get("medicine_id") or \
             self._resolve_medicine_id_for_station(
                 station_id, reminder_data.get("medicine_name")
@@ -528,8 +541,8 @@ class MedicationSystem:
         self.state_machine.transition_to(SystemState.REMINDER_ACTIVE, reminder_data)
 
         medicine_name = reminder_data["medicine_name"]
-        dosage = reminder_data["dosage_pills"]
-        time_str = reminder_data["scheduled_time"]
+        dosage        = reminder_data["dosage_pills"]
+        time_str      = reminder_data["scheduled_time"]
 
         if self.display:
             self.display.show_reminder_screen(medicine_name, dosage, time_str)
@@ -556,20 +569,20 @@ class MedicationSystem:
             self.audio.announce_warning("Medication dose was missed")
 
         missed_event = {
-            "timestamp": time.time(),
+            "timestamp":        time.time(),
             "expected_medicine": missed_data["medicine_name"],
-            "expected_dosage": 0,
-            "result": DecisionResult.NO_INTAKE,
-            "verified": False,
+            "expected_dosage":   0,
+            "result":            DecisionResult.NO_INTAKE,
+            "verified":          False,
             "alerts": [
                 {
-                    "type": "missed_dose",
+                    "type":     "missed_dose",
                     "severity": "critical",
-                    "message": "Dose not taken"
+                    "message":  "Dose not taken"
                 }
             ],
             "details": {},
-            "scores": {}
+            "scores":  {}
         }
         self.database.log_medication_event(missed_event)
         self.state_machine.reset_to_idle()
@@ -578,7 +591,14 @@ class MedicationSystem:
             station_id = self.current_medication["station_id"]
             self.weight_manager.disable_event_detection(station_id)
             self.secured_medications.pop(station_id, None)
-        self.current_medication = None
+
+            # Stop scanning - no verification will happen for this dose window
+            self.tag_runtime_service.stop_scanning()
+            self.logger.info(
+                f"Tag scanning STOPPED after missed dose on {station_id}"
+            )
+
+        self.current_medication    = None
         self.pending_monitoring_ui = None
 
         if self.display:
@@ -593,10 +613,10 @@ class MedicationSystem:
         if not self.running:
             return
 
-        medicine_name = self.current_medication["medicine_name"]
-        expected_dosage = self.current_medication["dosage_pills"]
+        medicine_name       = self.current_medication["medicine_name"]
+        expected_dosage     = self.current_medication["dosage_pills"]
         expected_medicine_id = self.current_medication.get("medicine_id")
-        expected_station_id = self.current_medication["station_id"]
+        expected_station_id  = self.current_medication["station_id"]
 
         if self.display:
             self.display.show_pipeline_screen(
@@ -604,14 +624,14 @@ class MedicationSystem:
                 f"Checking bottle identity for {medicine_name}"
             )
 
-        weight_event_ts = weight_event.get("timestamp", time.time())
-        identity_cfg = self.config.get("identity", {})
-        tag_cfg = identity_cfg.get("tag", {})
-        integrated_mode = tag_cfg.get("integrated_mode", True)
+        weight_event_ts  = weight_event.get("timestamp", time.time())
+        identity_cfg     = self.config.get("identity", {})
+        tag_cfg          = identity_cfg.get("tag", {})
+        integrated_mode  = tag_cfg.get("integrated_mode", True)
         coincident_window = tag_cfg.get("coincident_window_seconds", 15.0)
 
         identity_result = None
-        ocr_result = None
+        ocr_result      = None
 
         try:
             self.scanner.initialize_camera()
@@ -635,11 +655,11 @@ class MedicationSystem:
 
             if identity_result.get("success"):
                 ocr_result = {
-                    "success": True,
+                    "success":       True,
                     "medicine_name": identity_result.get("medicine_name", medicine_name),
-                    "confidence": identity_result.get("confidence", 1.0),
-                    "verified": True,
-                    "method": identity_result.get("method")
+                    "confidence":    identity_result.get("confidence", 1.0),
+                    "verified":      True,
+                    "method":        identity_result.get("method")
                 }
             else:
                 ocr_result = None
@@ -647,10 +667,10 @@ class MedicationSystem:
         except Exception as e:
             self.logger.warning(f"Identity verification error: {e}")
             identity_result = {
-                "success": False,
-                "method": "none",
+                "success":  False,
+                "method":   "none",
                 "verified": False,
-                "reason": str(e)
+                "reason":   str(e)
             }
             ocr_result = None
         finally:
@@ -672,7 +692,9 @@ class MedicationSystem:
 
         # HARD STOP on identity failure
         if identity_result and not identity_result.get("success", False):
-            self.logger.warning("Stopping pipeline early due to identity mismatch/failure")
+            self.logger.warning(
+                "Stopping pipeline early due to identity mismatch/failure"
+            )
             decision = self.decision_engine.verify_medication_intake(
                 expected_medicine=medicine_name,
                 expected_dosage=expected_dosage,
@@ -685,18 +707,14 @@ class MedicationSystem:
             self.database.log_medication_event(decision)
 
             time.sleep(3)
-            self.state_machine.reset_to_idle()
-            self.weight_manager.disable_event_detection(expected_station_id)
-            self.secured_medications.pop(expected_station_id, None)
-            self.current_medication = None
-            self.pending_monitoring_ui = None
-            if self.display:
-                self.display.show_idle_screen(self.scheduler.get_next_scheduled_time())
+            self._end_verification_cycle(expected_station_id)
             return
 
         # HARD STOP on wrong dosage
         if not weight_result.get("verified", False):
-            self.logger.warning("Stopping pipeline early due to incorrect dosage")
+            self.logger.warning(
+                "Stopping pipeline early due to incorrect dosage"
+            )
             decision = self.decision_engine.verify_medication_intake(
                 expected_medicine=medicine_name,
                 expected_dosage=expected_dosage,
@@ -709,13 +727,7 @@ class MedicationSystem:
             self.database.log_medication_event(decision)
 
             time.sleep(3)
-            self.state_machine.reset_to_idle()
-            self.weight_manager.disable_event_detection(expected_station_id)
-            self.secured_medications.pop(expected_station_id, None)
-            self.current_medication = None
-            self.pending_monitoring_ui = None
-            if self.display:
-                self.display.show_idle_screen(self.scheduler.get_next_scheduled_time())
+            self._end_verification_cycle(expected_station_id)
             return
 
         if not self.running:
@@ -744,8 +756,8 @@ class MedicationSystem:
                 self.logger.warning("Patient monitoring could not start")
                 monitoring_result = {
                     "compliance_status": "no_intake",
-                    "swallow_count": 0,
-                    "cough_count": 0,
+                    "swallow_count":     0,
+                    "cough_count":       0,
                     "hand_motion_count": 0
                 }
             else:
@@ -767,8 +779,8 @@ class MedicationSystem:
             self.logger.error(f"Patient monitoring failed: {e}")
             monitoring_result = {
                 "compliance_status": "unclear",
-                "swallow_count": 0,
-                "cough_count": 0,
+                "swallow_count":     0,
+                "cough_count":       0,
                 "hand_motion_count": 0
             }
 
@@ -792,11 +804,26 @@ class MedicationSystem:
         self.database.log_medication_event(decision)
 
         time.sleep(3)
+        self._end_verification_cycle(expected_station_id)
+
+    def _end_verification_cycle(self, station_id: str):
+        """
+        Common teardown after every verification path (success, early-exit,
+        missed dose).  Disarms the weight sensor, clears medication state,
+        and STOPS tag scanning so stale scans do not linger until the next
+        dose window.
+        """
         self.state_machine.reset_to_idle()
-        self.weight_manager.disable_event_detection(expected_station_id)
-        self.secured_medications.pop(expected_station_id, None)
-        self.current_medication = None
+        self.weight_manager.disable_event_detection(station_id)
+        self.secured_medications.pop(station_id, None)
+        self.current_medication    = None
         self.pending_monitoring_ui = None
+
+        # Stop scanning - scanning resumes the next time the bottle is lifted
+        self.tag_runtime_service.stop_scanning()
+        self.logger.info(
+            f"Tag scanning STOPPED after verification cycle on {station_id}"
+        )
 
         if self.display:
             self.display.show_idle_screen(self.scheduler.get_next_scheduled_time())
@@ -806,7 +833,7 @@ class MedicationSystem:
     # ------------------------------------------------------------------
 
     def _handle_decision(self, decision: dict):
-        result = decision["result"]
+        result   = decision["result"]
         messages = self.decision_engine.get_alert_messages(decision)
 
         if result.value == "success":
@@ -867,11 +894,6 @@ class MedicationSystem:
     # ------------------------------------------------------------------
 
     def _load_schedule_from_database(self):
-        """
-        Load all registered medicines from the database into the live scheduler.
-        Called on every boot so the schedule is always populated regardless of
-        whether onboarding ran this session.
-        """
         registered = self.database.list_registered_medicines()
         if not registered:
             self.logger.warning("No registered medicines found in database")
@@ -911,11 +933,10 @@ class MedicationSystem:
         )
 
     def _build_schedule_summary(self, medicines: list) -> list:
-        """Build a human-readable sorted schedule list from registered medicines."""
         entries = []
         for m in medicines:
-            name   = m.get("medicine_name", "Unknown")
-            dosage = m.get("dosage_amount", "?")
+            name       = m.get("medicine_name", "Unknown")
+            dosage     = m.get("dosage_amount", "?")
             time_slots = m.get("time_slots", "")
             for t in time_slots.split(","):
                 t = t.strip()
@@ -929,21 +950,12 @@ class MedicationSystem:
     # ------------------------------------------------------------------
 
     def start(self):
-        """
-        Start the system:
-        1. Run onboarding for any unregistered medicines
-        2. Load all registered medicines into the scheduler from DB
-        3. Start the scheduler
-        4. Send onboarding summary only when onboarding actually ran
-        5. Enter the main event loop
-        """
         self.logger.info("Starting medication system...")
         self.running = True
 
         EXPECTED_MEDICINE_COUNT = 3
 
-        # Capture state BEFORE onboarding so we can tell if it ran
-        registered_before = self.database.list_registered_medicines()
+        registered_before    = self.database.list_registered_medicines()
         onboarding_was_needed = len(registered_before) < EXPECTED_MEDICINE_COUNT
 
         all_registered = self.registration_manager.run_onboarding_if_needed(
@@ -951,17 +963,16 @@ class MedicationSystem:
             expected_medicine_count=EXPECTED_MEDICINE_COUNT,
             scheduler=self.scheduler
         )
+        # run_onboarding_if_needed calls stop_scanning() when done,
+        # so the reader is idle when we enter the main loop.
 
         if not all_registered:
             self.logger.error(
                 "Onboarding did not complete. System may have partial setup."
             )
 
-        # Load schedule from DB every boot (handles skip-onboarding case)
         self._load_schedule_from_database()
 
-        # Only send the onboarding complete Telegram message when onboarding
-        # actually ran this session, not on every subsequent boot
         if onboarding_was_needed and all_registered:
             registered_medicines = self.database.list_registered_medicines()
             if registered_medicines:
@@ -999,7 +1010,6 @@ class MedicationSystem:
             self.stop()
 
     def stop(self):
-        """Graceful shutdown: stop all background threads and release resources."""
         if self._stop_called:
             return
         self._stop_called = True
@@ -1020,6 +1030,8 @@ class MedicationSystem:
             if self.audio:
                 self.audio.cleanup()
             if hasattr(self, "tag_runtime_service") and self.tag_runtime_service:
+                # Ensure scanner is stopped cleanly on shutdown
+                self.tag_runtime_service.stop_scanning()
                 self.tag_runtime_service.stop()
             if hasattr(self, "database") and self.database:
                 self.database.cleanup()

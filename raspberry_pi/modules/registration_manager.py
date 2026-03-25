@@ -3,21 +3,17 @@ Smart Medication System - Registration Manager
 
 Handles the one-time medicine registration flow for each station.
 
-Since the RC522 tag reader is physically mounted under the scale platform,
-registration is triggered by simply placing the medicine bottle on the station.
-The bottle bottom carries an RFID sticker. When the bottle is placed:
-  - The tag reader reads the sticker immediately on contact
-  - The scale reads the weight (takes a few more seconds to stabilise)
-
-The correct placement sequence is therefore:
-  1. Patient places bottle on station
-  2. Tag is scanned immediately (Phase A has not finished yet)
-  3. Weight stabilises a few seconds later (Phase A completes)
-  4. Phase B checks: was there a tag scan since the bottle appeared? YES -> done
-
-This means clear_latest_scan() must NOT be called between Phase A and Phase B.
-Instead we record the time when the bottle weight first appeared above threshold
-and accept any scan that arrived from that moment onward.
+Scan control during onboarding
+--------------------------------
+* start_scanning() is called at the TOP of each slot so the reader is
+  active while the patient places the bottle and the tag settles.
+* stop_scanning() is called as soon as a slot is SUCCESSFULLY registered
+  and BEFORE the patient is asked to swap the bottle - preventing the
+  reader from capturing the outgoing bottle's tag as a false "next" scan.
+* stop_scanning() is also called on every failure / timeout exit path so
+  the reader is never left running unexpectedly.
+* run_onboarding_if_needed() calls stop_scanning() once after the final
+  slot is confirmed, as the belt-and-suspenders final stop.
 
 Tag payload format (written via medication_tag_write_read_test.ino):
     ID=M001;P=P001;N=ASPIRIN100;D=2;T=08,20;M=AF;S=1
@@ -51,16 +47,15 @@ class RegistrationManager:
         self.logger = logger
 
         reg_cfg = config.get("registration", {})
-        self.enabled = reg_cfg.get("enabled", True)
-        self.timeout_seconds = reg_cfg.get("timeout_seconds", 120)
+        self.enabled             = reg_cfg.get("enabled", True)
+        self.timeout_seconds     = reg_cfg.get("timeout_seconds", 120)
         self.min_bottle_weight_g = reg_cfg.get("min_bottle_weight_g", 5.0)
-        # After bottle is detected on scale, how long to wait for tag scan
-        self.tag_wait_seconds = reg_cfg.get("tag_wait_seconds", 30.0)
+        self.tag_wait_seconds    = reg_cfg.get("tag_wait_seconds", 30.0)
 
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
-    
+
     def stations_needing_registration(self) -> List[str]:
         """Return list of station_ids that have no active registered medicine."""
         unregistered = []
@@ -80,8 +75,9 @@ class RegistrationManager:
         Sequential onboarding: register up to expected_medicine_count
         medicines on a single station, one at a time.
 
-        After each successful registration, if a scheduler is provided,
-        the medicine is dynamically added to the live schedule.
+        Scanning is controlled per-slot inside _onboard_one_medicine.
+        After the final slot succeeds this method sends one last
+        stop_scan to guarantee the reader is idle.
 
         Returns True when the target count is reached.
         """
@@ -89,14 +85,16 @@ class RegistrationManager:
             self.logger.info("Registration disabled, skipping onboarding")
             return True
 
-        registered = self.database.list_registered_medicines()
-        registered_ids = {r["medicine_id"] for r in registered}
+        registered       = self.database.list_registered_medicines()
+        registered_ids   = {r["medicine_id"] for r in registered}
         registered_count = len(registered)
 
         if registered_count >= expected_medicine_count:
             self.logger.info(
                 f"All {expected_medicine_count} medicines already registered"
             )
+            # Ensure scanner is off if we skip onboarding entirely
+            self.tag_runtime_service.stop_scanning()
             return True
 
         remaining = expected_medicine_count - registered_count
@@ -115,12 +113,21 @@ class RegistrationManager:
             )
             if not success:
                 self.logger.error(f"Onboarding failed at slot {slot}")
+                # _onboard_one_medicine already called stop_scanning on failure
                 return False
+
             # Refresh the set after each successful registration
-            registered = self.database.list_registered_medicines()
+            registered     = self.database.list_registered_medicines()
             registered_ids = {r["medicine_id"] for r in registered}
 
+        # All slots done - belt-and-suspenders final stop
+        self.tag_runtime_service.stop_scanning()
+        self.logger.info("Onboarding complete. Tag scanning stopped.")
         return True
+
+    # ------------------------------------------------------------------
+    # Single-slot onboarding
+    # ------------------------------------------------------------------
 
     def _onboard_one_medicine(
         self,
@@ -132,13 +139,25 @@ class RegistrationManager:
     ) -> bool:
         """
         Register a single medicine interactively.
-        Waits for the user to place a bottle, reads the tag,
-        confirms it is a new medicine, saves it, and adds it
-        to the scheduler.
+
+        Scan control:
+          START  - at the very top so the reader captures the tag the
+                   moment the bottle touches the reader coil.
+          STOP   - immediately after a successful registration and before
+                   asking the patient to swap bottles, so the outgoing
+                   bottle's tag is not captured as the next slot's scan.
+          STOP   - on every early-exit (timeout, bad tag, etc.) so the
+                   reader is never left running unintentionally.
         """
         self.logger.info(
             f"Onboarding slot {slot_number}/{total} on {station_id}"
         )
+
+        # ----------------------------------------------------------------
+        # START scanning for this slot
+        # ----------------------------------------------------------------
+        self.tag_runtime_service.start_scanning()
+        self.logger.info(f"Tag scanning STARTED for onboarding slot {slot_number}")
 
         # ---- Guide the user ----
         msg = f"Medicine {slot_number} of {total} - Place bottle on station"
@@ -153,19 +172,19 @@ class RegistrationManager:
         deadline = time.time() + self.timeout_seconds
 
         # ---- Phase A: wait for stable weight ----
-        stable_weight = None
-        bottle_detected_at = None
+        stable_weight        = None
+        bottle_detected_at   = None
 
         while time.time() < deadline:
             if self.display:
                 self.display.update()
 
-            status = self.weight_manager.get_station_status(station_id)
+            status   = self.weight_manager.get_station_status(station_id)
             if not status.get("connected"):
                 time.sleep(0.5)
                 continue
 
-            weight_g = float(status.get("weight_g") or 0.0)
+            weight_g  = float(status.get("weight_g") or 0.0)
             is_stable = status.get("stable", False)
 
             if weight_g < self.min_bottle_weight_g:
@@ -188,24 +207,55 @@ class RegistrationManager:
             break
         else:
             self._timeout(station_id)
+            self.tag_runtime_service.stop_scanning()   # stop on timeout
             return False
 
         # ---- Phase B: find tag scan ----
+        # The tag is read the moment the bottle touches the reader coil,
+        # which typically happens before or during weight stabilisation.
+        # We accept any scan received since bottle_detected_at - 2 s.
         lookback_from = bottle_detected_at - 2.0
         self._update_screen(station_id, "Reading tag...")
         if self.audio:
             self.audio.speak("Reading tag.")
-        scan_msg = None
+
+        scan_msg    = None
         tag_deadline = time.time() + self.tag_wait_seconds
 
         while time.time() < tag_deadline and time.time() < deadline:
             if self.display:
                 self.display.update()
+
             latest = self.tag_runtime_service.get_latest_scan()
-            if latest and latest.get("received_at", 0) >= lookback_from:
-                scan_msg = latest["scan_msg"]
-                break
-            time.sleep(0.3)
+
+            if not latest or latest.get("received_at", 0) < lookback_from:
+                time.sleep(0.3)
+                continue
+
+            candidate_scan = latest["scan_msg"]
+
+            # Validate the payload before accepting - an empty payload_raw
+            # means the firmware read failed.  Discard it and keep waiting
+            # for the firmware's retry scan.
+            from raspberry_pi.modules.tag_manager import TagManager as _TM
+            probe = _TM(self.logger).build_record_from_scan(candidate_scan)
+            if probe is None:
+                self.logger.warning(
+                    "Tag scan received but payload could not be parsed "
+                    f"(payload_raw={candidate_scan.get('payload_raw', '')!r}). "
+                    "Waiting for valid retry scan..."
+                )
+                self._update_screen(
+                    station_id,
+                    "Tag detected but unreadable - keep bottle still..."
+                )
+                self.tag_runtime_service.clear_latest_scan()
+                time.sleep(0.5)
+                continue
+
+            # Good scan with parseable payload
+            scan_msg = candidate_scan
+            break
         else:
             self.logger.warning("No tag scan received during onboarding window")
             self._update_screen(station_id, "No tag - check sticker, re-seat bottle")
@@ -213,6 +263,7 @@ class RegistrationManager:
                 self.audio.speak(
                     "No tag detected. Please check the sticker and try again."
                 )
+            self.tag_runtime_service.stop_scanning()   # stop on no-tag failure
             time.sleep(2.0)
             return False
 
@@ -222,16 +273,17 @@ class RegistrationManager:
             self._update_screen(station_id, "Tag unreadable - check sticker content")
             if self.audio:
                 self.audio.speak("Tag could not be read. Please check the sticker.")
+            self.tag_runtime_service.stop_scanning()   # stop on bad record
             time.sleep(2.0)
             return False
 
-        medicine_id = record.get("medicine_id")
+        medicine_id   = record.get("medicine_id")
         medicine_name = record.get("medicine_name", "Unknown")
 
         # ---- Duplicate check ----
         if medicine_id in registered_ids:
             self.logger.warning(
-                f"Medicine {medicine_id} already registered "
+                f"Medicine {medicine_id} already registered - "
                 f"asking user to place a different bottle"
             )
             self._update_screen(
@@ -243,8 +295,9 @@ class RegistrationManager:
                     f"{medicine_name} is already registered. "
                     f"Please place a different medicine bottle."
                 )
+            # Stop scanning while the patient swaps bottles, then retry
+            self.tag_runtime_service.stop_scanning()
             time.sleep(3.0)
-            # Retry this slot
             return self._onboard_one_medicine(
                 station_id, slot_number, total, registered_ids, scheduler
             )
@@ -253,16 +306,17 @@ class RegistrationManager:
         ok = self.database.upsert_registered_medicine(record)
         if not ok:
             self.logger.error(f"Database write failed for {medicine_id}")
+            self.tag_runtime_service.stop_scanning()   # stop on DB failure
             return False
 
         # ---- Capture baseline ----
-        self.weight_manager.baseline_weights[station_id] = stable_weight
+        self.weight_manager.baseline_weights[station_id]          = stable_weight
         self.weight_manager.baseline_capture_required[station_id] = False
         self.weight_manager._save_persisted_baselines()
 
         # ---- Parse schedule from tag payload ----
         schedule_times = self._parse_schedule_times(record.get("time_slots", ""))
-        dosage = record.get("dosage_amount", 0)
+        dosage         = record.get("dosage_amount", 0)
 
         # ---- Add to live scheduler ----
         if scheduler and schedule_times:
@@ -273,8 +327,7 @@ class RegistrationManager:
                 times=schedule_times
             )
             self.logger.info(
-                f"Added {medicine_name} to live scheduler: "
-                f"{schedule_times}"
+                f"Added {medicine_name} to live scheduler: {schedule_times}"
             )
 
         # ---- Notify user ----
@@ -300,7 +353,7 @@ class RegistrationManager:
             dosage=dosage,
             schedule_times=schedule_times
         )
-    
+
         # ---- Hold success screen briefly ----
         hold_until = time.time() + 4.0
         while time.time() < hold_until:
@@ -308,8 +361,16 @@ class RegistrationManager:
                 self.display.update()
             time.sleep(0.05)
 
-        # ---- Prompt for next bottle ----
+        # ---- Prompt for next bottle (if more slots remain) ----
         if slot_number < total:
+            # STOP scanning BEFORE asking the patient to remove the current
+            # bottle so we do not capture its tag as the next slot's scan.
+            self.tag_runtime_service.stop_scanning()
+            self.logger.info(
+                f"Tag scanning STOPPED after slot {slot_number} "
+                f"- waiting for bottle swap"
+            )
+
             next_msg = (
                 f"Medicine {slot_number} done. "
                 f"Remove bottle and place medicine {slot_number + 1}."
@@ -326,35 +387,33 @@ class RegistrationManager:
             while time.time() < remove_deadline:
                 if self.display:
                     self.display.update()
-                status = self.weight_manager.get_station_status(station_id)
+                status   = self.weight_manager.get_station_status(station_id)
                 weight_g = float(status.get("weight_g") or 0.0)
                 if weight_g < self.min_bottle_weight_g:
                     break
                 time.sleep(0.3)
             else:
-                self.logger.warning("Bottle not removed after success - continuing anyway")
+                self.logger.warning(
+                    "Bottle not removed after success - continuing anyway"
+                )
 
-            # Clear the tag scan buffer so the next bottle gets a fresh read
+            # Clear stale scan buffer before the next slot's start_scanning()
             self.tag_runtime_service.clear_latest_scan()
             time.sleep(1.0)
 
+        # For the FINAL slot, stop_scanning() is called by
+        # run_onboarding_if_needed() after the loop completes.
+
         return True
 
-    def _register_station_retry(self, station_id: str, deadline: float) -> bool:
-        """Re-enter the registration flow within the remaining deadline window."""
-        remaining = deadline - time.time()
-        if remaining < 5:
-            self._timeout(station_id)
-            return False
-        print(f"  [REG] Retrying registration ({remaining:.0f}s remaining)...")
-        self.timeout_seconds = remaining
-        return self._register_station(station_id)
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _timeout(self, station_id: str):
         self.logger.error(
             f"Registration timed out for {station_id} after {self.timeout_seconds}s"
         )
-        print(f"  [REG] TIMEOUT: registration failed for {station_id}")
         if self.display:
             self.display.show_error_screen(
                 f"Registration timed out for {station_id}.\n"
@@ -364,10 +423,6 @@ class RegistrationManager:
     def _update_screen(self, station_id: str, message: str):
         if self.display:
             self.display.show_registration_screen(station_id, message)
-            
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def _build_registration_record(
         self,

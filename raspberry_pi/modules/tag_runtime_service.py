@@ -5,19 +5,18 @@ Listens for live tag scan MQTT messages and provides two query modes:
 
 1. PASSIVE (integrated mode - tag reader under scale):
    - get_tag_within_window(window_seconds)
-       Returns the most recent scan if it arrived in the last N seconds.
-       No blocking. Used by RegistrationManager and the integrated identity check.
-
    - verify_coincident_tag(weight_event_timestamp, ...)
-       Checks whether a tag scan arrived near a weight event timestamp.
-       The tag on the bottle bottom is read the moment the bottle touches
-       the scale, so the scan typically arrives 0-3 seconds before the
-       weight stabilises and fires the event.
 
 2. ACTIVE (legacy / non-integrated mode):
    - wait_for_matching_tag(...)
-       Blocks until a matching tag scan is received.
-       Kept for backwards compatibility and non-integrated setups.
+
+Scan control:
+   - start_scanning()  - sends {"command": "start_scan"} to the firmware.
+                         Call at the start of each onboarding slot and when
+                         the bottle is lifted during daily use.
+   - stop_scanning()   - sends {"command": "stop_scan"} to the firmware.
+                         Call after onboarding completes and after each
+                         identity verification cycle.
 """
 
 import json
@@ -33,11 +32,19 @@ from raspberry_pi.modules.tag_manager import TagManager
 class TagRuntimeService:
     """Waits for live tag scans over MQTT and resolves them against the database."""
 
-    def __init__(self, mqtt_config: dict, database, logger, topic: str):
+    def __init__(
+        self,
+        mqtt_config: dict,
+        database,
+        logger,
+        topic: str,
+        command_topic: str = "medication/tag/command/tag_reader_1",
+    ):
         self.mqtt_config = mqtt_config
         self.database = database
         self.logger = logger
         self.topic = topic
+        self.command_topic = command_topic   # NEW: where scan commands are published
 
         self.tag_manager = TagManager(logger)
 
@@ -46,7 +53,7 @@ class TagRuntimeService:
 
         self.latest_scan: Optional[Dict[str, Any]] = None
         self.latest_scan_lock = Lock()
-        
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -118,9 +125,56 @@ class TagRuntimeService:
                 f"Live tag scan received: UID={scan_msg.get('tag_uid')} "
                 f"reader={scan_msg.get('reader_id')}"
             )
-            
+
         except Exception as e:
             self.logger.error(f"Failed to process live tag scan: {e}")
+
+    # ------------------------------------------------------------------
+    # Scan control  (NEW)
+    # ------------------------------------------------------------------
+
+    def _send_scan_command(self, command: str):
+        """
+        Publish a scan control command to the firmware.
+
+        Args:
+            command: "start_scan" or "stop_scan"
+        """
+        if not self.client or not self.connected:
+            self.logger.warning(
+                f"Cannot send {command}: tag runtime service not connected"
+            )
+            return
+
+        payload = json.dumps({"command": command})
+        result = self.client.publish(self.command_topic, payload, qos=1)
+
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            self.logger.info(f"Tag scan command sent: {command}")
+        else:
+            self.logger.error(
+                f"Failed to send tag scan command {command} (rc={result.rc})"
+            )
+
+    def start_scanning(self):
+        """
+        Enable RF polling on the tag reader firmware.
+
+        Call at the start of each onboarding slot and when the bottle is
+        lifted during daily use so the reader is ready to capture the tag
+        when the bottle is placed back.
+        """
+        self._send_scan_command("start_scan")
+
+    def stop_scanning(self):
+        """
+        Disable RF polling on the tag reader firmware.
+
+        Call after onboarding completes, between onboarding slots (while the
+        patient swaps bottles), and after each identity verification cycle so
+        the reader does not accumulate stale scans.
+        """
+        self._send_scan_command("stop_scan")
 
     # ------------------------------------------------------------------
     # Scan buffer access
@@ -145,11 +199,7 @@ class TagRuntimeService:
     ) -> Optional[Dict[str, Any]]:
         """
         Return the most recent scan if it arrived within the last
-        window_seconds. Returns None if no scan or if the scan is older.
-
-        Used by RegistrationManager to detect a bottle placement:
-        the tag is read the moment the bottle touches the reader,
-        so a fresh scan is always present when the bottle is down.
+        window_seconds. Returns None if no scan or scan is older.
         """
         with self.latest_scan_lock:
             if not self.latest_scan:
@@ -168,26 +218,10 @@ class TagRuntimeService:
     ) -> Dict[str, Any]:
         """
         Verify that a tag scan arrived near a specific weight event.
-        
-        Used during daily runtime verification. Since the tag is on the
-        bottle bottom and the reader is under the scale, the scan arrives
-        when the bottle is placed back (0-3 s before the weight stabilises).
 
-        The acceptance window:
+        Acceptance window:
             [weight_event_timestamp - window_seconds,
              weight_event_timestamp + 3.0]
-
-        Args:
-            weight_event_timestamp: Unix timestamp from the weight event dict.
-            expected_medicine_id:   Medicine ID to verify against (or None to skip).
-            expected_station_id:    Station ID to verify against (or None to skip).
-            window_seconds:         How far back to search for a coincident scan.
-
-        Returns a dict with:
-            success   (bool)
-            reason    (str, on failure)
-            record    (dict, on success)
-            tag_uid   (str, on success)
         """
         with self.latest_scan_lock:
             if not self.latest_scan:
@@ -196,9 +230,9 @@ class TagRuntimeService:
                     "reason": "No tag scan on record"
                 }
 
-            scan_time = self.latest_scan.get("received_at", 0)
+            scan_time    = self.latest_scan.get("received_at", 0)
             window_start = weight_event_timestamp - window_seconds
-            window_end = weight_event_timestamp + 3.0
+            window_end   = weight_event_timestamp + 3.0
 
             if not (window_start <= scan_time <= window_end):
                 age = time.time() - scan_time
@@ -211,7 +245,7 @@ class TagRuntimeService:
                 }
 
             scan_msg = self.latest_scan["scan_msg"]
-            tag_uid = scan_msg.get("tag_uid")
+            tag_uid  = scan_msg.get("tag_uid")
 
         # Resolve medicine record: database first, tag payload fallback
         db_record = None
@@ -227,7 +261,6 @@ class TagRuntimeService:
                 "reason": "Could not parse tag payload into a medicine record"
             }
 
-        # Verify the record matches what we expect
         verify_result = self.tag_manager.verify_scan_against_expected(
             db_record,
             expected_medicine_id=expected_medicine_id,
@@ -253,7 +286,7 @@ class TagRuntimeService:
             "record": db_record,
             "verification": verify_result
         }
-        
+
     # ------------------------------------------------------------------
     # Active (blocking) method - legacy / non-integrated fallback
     # ------------------------------------------------------------------
@@ -267,12 +300,9 @@ class TagRuntimeService:
     ) -> Dict[str, Any]:
         """
         Block until a matching live tag scan is received.
-
-        Used as a fallback when integrated mode is not available.
         Clears the scan buffer at the start so stale scans are ignored.
         """
         self.clear_latest_scan()
-
         seen_uids: set = set()
 
         for attempt in range(1, max_attempts + 1):
@@ -290,7 +320,7 @@ class TagRuntimeService:
                     continue
 
                 scan_msg = latest["scan_msg"]
-                tag_uid = scan_msg.get("tag_uid")
+                tag_uid  = scan_msg.get("tag_uid")
 
                 if tag_uid and tag_uid in seen_uids:
                     time.sleep(0.1)
@@ -311,7 +341,7 @@ class TagRuntimeService:
                     expected_medicine_id=expected_medicine_id,
                     expected_station_id=expected_station_id
                 )
-                
+
                 if verify_result["match"]:
                     return {
                         "success": True,

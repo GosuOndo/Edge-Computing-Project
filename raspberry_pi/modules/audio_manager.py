@@ -1,7 +1,8 @@
-"""Audio Manager - speech and alerts for Raspberry Pi"""
+"""Audio Manager - offline speech and alerts for Raspberry Pi"""
 
 import subprocess
 import threading
+import shlex
 
 
 class AudioManager:
@@ -15,85 +16,61 @@ class AudioManager:
         self.pitch = int(config.get("pitch", 45))
 
         self.initialized = False
-        # Kept for compatibility with older tests/scripts.
-        self.mixer_initialized = False
 
     def initialize(self):
         if not self.enabled:
             self.logger.info("Audio manager disabled")
-            self.initialized = False
-            self.mixer_initialized = False
             return True
 
         try:
-            result = subprocess.run(
-                ["which", "espeak"],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            if result.returncode != 0:
-                self.logger.error("Audio init failed: espeak not found")
-                self.initialized = False
-                self.mixer_initialized = False
-                return False
+            for tool_name in ["espeak", "ffmpeg", "aplay"]:
+                result = subprocess.run(
+                    ["which", tool_name],
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                if result.returncode != 0:
+                    self.logger.error(f"Audio init failed: {tool_name} not found")
+                    self.initialized = False
+                    return False
 
             self.initialized = True
-            self.mixer_initialized = True
             self.logger.info(
                 "Audio manager initialized successfully using "
-                f"espeak (voice={self.voice}, speed={self.speed}, pitch={self.pitch})"
+                f"espeak -> ffmpeg -> aplay "
+                f"(voice={self.voice}, speed={self.speed}, pitch={self.pitch})"
             )
             return True
 
         except Exception as e:
             self.logger.error(f"Audio init failed: {e}")
             self.initialized = False
-            self.mixer_initialized = False
             return False
-
-    def _build_espeak_command(self, text):
-        return [
-            "espeak",
-            "-v", self.voice,
-            "-s", str(self.speed),
-            "-p", str(self.pitch),
-            str(text).strip(),
-        ]
 
     def _speak_worker(self, text):
         if not self.initialized or not self.enabled:
             self.logger.warning("Audio speak skipped: audio not initialized")
             return
 
-        safe_text = str(text).strip()
-        if not safe_text:
-            return
-
         try:
-            cmd = self._build_espeak_command(safe_text)
-            self.logger.info(f"SPEAKING: {safe_text}")
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=False
+            safe_text = str(text).strip()
+            if not safe_text:
+                return
+
+            quoted_text = shlex.quote(safe_text)
+
+            cmd = (
+                f"espeak -v {self.voice} -s {self.speed} -p {self.pitch} --stdout {quoted_text} "
+                f"| ffmpeg -loglevel error -i pipe:0 -ar 48000 -ac 2 -f wav - "
+                f"| aplay"
             )
-            if result.returncode != 0:
-                stderr = (result.stderr or "").strip()
-                if stderr:
-                    self.logger.error(f"Unable to play audio: {stderr}")
-                else:
-                    self.logger.error(
-                        f"Unable to play audio: espeak exited with code {result.returncode}"
-                    )
-                self.initialized = False
-                self.mixer_initialized = False
+
+            self.logger.info(f"SPEAKING: {safe_text}")
+            subprocess.run(cmd, shell=True, check=False)
 
         except Exception as e:
             self.logger.error(f"Speak error: {e}")
-            self.initialized = False
-            self.mixer_initialized = False
 
     def speak(self, text, wait=True):
         if not self.initialized or not self.enabled:
@@ -126,11 +103,9 @@ class AudioManager:
         self.speak_async(f"Warning. {message}")
 
     def set_volume(self, volume):
-        # kept for compatibility with existing code
         pass
 
     def stop(self):
-        # kept for compatibility
         pass
 
     def cleanup(self):
