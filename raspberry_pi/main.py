@@ -328,6 +328,31 @@ class MedicationSystem:
         ):
             return
 
+        # Reject any medicine that does not match what is registered for this station
+        registered = self.database.get_registered_medicine_by_station(station_id)
+        if registered:
+            registered_medicine_id = registered.get("medicine_id")
+            scanned_medicine_id    = record.get("medicine_id")
+            if registered_medicine_id and scanned_medicine_id != registered_medicine_id:
+                self.logger.warning(
+                    f"Wrong medicine placed on {station_id}: "
+                    f"expected {registered.get('medicine_name')} ({registered_medicine_id}), "
+                    f"got {record.get('medicine_name')} ({scanned_medicine_id})"
+                )
+                if self.display:
+                    self.display.show_warning_screen(
+                        "Wrong medicine detected",
+                        f"Please place {registered.get('medicine_name', 'the correct medicine')} "
+                        f"on {station_id}"
+                    )
+                if self.audio:
+                    self.audio.speak_async(
+                        f"Wrong medicine detected. Please place "
+                        f"{registered.get('medicine_name', 'the correct medicine')} "
+                        f"on {station_id}"
+                    )
+                return
+
         status = self.weight_manager.get_station_status(station_id)
         if not status.get("connected"):
             return
