@@ -22,7 +22,11 @@ hardware:
 
   audio:
     enabled: true
+    backend: "sounddevice"
     volume: 0.8  # 0.0 to 1.0
+    sample_rate: 16000
+    base_frequency_hz: 523.25
+    cue_gap_seconds: 0.04
 
 # MQTT Configuration
 mqtt:
