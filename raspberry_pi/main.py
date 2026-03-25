@@ -84,6 +84,7 @@ class MedicationSystem:
         self.min_secured_bottle_weight_g = float(
             self.config.get("registration", {}).get("min_bottle_weight_g", 5.0)
         )
+        self._last_idle_minute           = None
         
         self._initialize_modules()
 
@@ -191,7 +192,7 @@ class MedicationSystem:
             self.scheduler = MedicationScheduler(
                 self.config["schedule"], self.logger
             )
-            self.scheduler.set_reminder_callback(self._on_medication_reminder)
+            self.scheduler.set_reminder_callback(self.queue_manual_reminder)
             self.scheduler.set_missed_dose_callback(self._on_missed_dose)
 
             self.logger.info("All modules initialized successfully")
@@ -1162,6 +1163,13 @@ class MedicationSystem:
                 self._process_pending_weight_event()
                 if self.display:
                     self.display.update()
+                    if self.state_machine.get_state() == SystemState.IDLE:
+                        current_minute = datetime.now().strftime('%H:%M')
+                        if current_minute != self._last_idle_minute:
+                            self._last_idle_minute = current_minute
+                            self.display.show_idle_screen(
+                                self.scheduler.get_next_scheduled_time()
+                            )
                 time.sleep(0.1)
 
         except KeyboardInterrupt:
