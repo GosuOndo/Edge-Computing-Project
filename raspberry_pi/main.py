@@ -84,6 +84,7 @@ class MedicationSystem:
         self.min_secured_bottle_weight_g = float(
             self.config.get("registration", {}).get("min_bottle_weight_g", 5.0)
         )
+        self._last_security_violation_message = None
         self._last_idle_minute           = None
         
         self._initialize_modules()
@@ -430,6 +431,59 @@ class MedicationSystem:
 
         return False
 
+    def _get_station_security_issue(self, secure_state: dict):
+        if secure_state.get("wrong_bottle_on_station", False):
+            return "incorrect"
+        if secure_state.get("early_alert_sent", False):
+            return "missing"
+        return None
+
+    def _build_security_violation_message(self, issues: dict) -> str:
+        parts = []
+        for station_id in sorted(issues):
+            label = station_id.replace("_", " ").title()
+            issue = issues[station_id]
+            if issue == "incorrect":
+                parts.append(f"{label} wrong bottle")
+            elif issue == "missing":
+                parts.append(f"{label} missing bottle")
+        return " | ".join(parts)
+
+    def _refresh_security_violation_screen(self):
+        issues = {}
+        now_ts = time.time()
+
+        for station_id, secure_state in self.secured_medications.items():
+            if now_ts >= secure_state.get("next_due_timestamp", 0):
+                continue
+            if secure_state.get("authorized", False):
+                continue
+            if (
+                self.current_medication
+                and self.current_medication.get("station_id") == station_id
+            ):
+                continue
+
+            issue = self._get_station_security_issue(secure_state)
+            if issue:
+                issues[station_id] = issue
+
+        if not issues:
+            self._last_security_violation_message = None
+            return
+
+        message = self._build_security_violation_message(issues)
+        if not message:
+            self._last_security_violation_message = None
+            return
+
+        if (
+            getattr(self, "display", None)
+            and message != self._last_security_violation_message
+        ):
+            self.display.show_error_screen(message)
+        self._last_security_violation_message = message
+
     def _prompt_return_bottle_to_station(self, secure_state: dict):
         station_id    = secure_state.get("station_id", "station")
         medicine_name = secure_state.get("medicine_name", "medication")
@@ -439,9 +493,6 @@ class MedicationSystem:
         )
 
         self.logger.info("Prompting patient to return the bottle to the station")
-
-        if getattr(self, "display", None):
-            self.display.show_error_screen(message)
 
         if getattr(self, "audio", None):
             self.audio.speak_async(message)
@@ -605,6 +656,8 @@ class MedicationSystem:
                 self.tag_runtime_service.start_scanning(station_id)
 
             secure_state["present"] = False
+
+        self._refresh_security_violation_screen()
 
     def _authorize_current_medication_if_ready(self):
         if not self.current_medication:
@@ -1030,6 +1083,7 @@ class MedicationSystem:
         self.secured_medications.pop(station_id, None)
         self.current_medication    = None
         self.pending_monitoring_ui = None
+        self._last_security_violation_message = None
 
         # Stop scanning - scanning resumes the next time the bottle is lifted
         self.tag_runtime_service.stop_scanning()

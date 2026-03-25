@@ -233,6 +233,7 @@ def make_system():
     system.secured_medications = {}
     system._processed_tag_scans = {}
     system.min_secured_bottle_weight_g = 5.0
+    system._last_security_violation_message = None
     system.telegram = FakeTelegram()
     system.display = None
     system.audio = None
@@ -361,11 +362,57 @@ def test_unauthorized_bottle_movement_alerts_once_before_due():
     assert len(system.telegram.alerts) == 1
     assert system.secured_medications["station_1"]["early_alert_sent"] is True
     assert system.display.error_calls == [
-        "Aspirin 100mg removed from station_1. Place it back on the correct station."
+        "Station 1 missing bottle"
     ]
     assert system.audio.messages == [
         "Aspirin 100mg removed from station_1. Place it back on the correct station."
     ]
+
+
+def test_simultaneous_missing_bottles_show_combined_error_screen():
+    system = make_system()
+    system.display = FakeDisplay()
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 0.0,
+            "event_detection_enabled": False,
+        },
+        "station_2": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 0.0,
+            "event_detection_enabled": False,
+        },
+    })
+    future_ts = time.time() + 3600
+    system.secured_medications = {
+        "station_1": {
+            "medicine_name": "Aspirin 100mg",
+            "station_id": "station_1",
+            "next_due_timestamp": future_ts,
+            "next_due_display": "2026-03-25 20:00:00",
+            "present": True,
+            "authorized": False,
+            "early_alert_sent": False,
+        },
+        "station_2": {
+            "medicine_name": "Metformin 500mg",
+            "station_id": "station_2",
+            "next_due_timestamp": future_ts,
+            "next_due_display": "2026-03-25 21:00:00",
+            "present": True,
+            "authorized": False,
+            "early_alert_sent": False,
+        },
+    }
+
+    system._process_secured_bottle_movements()
+
+    assert system.display.error_calls[-1] == (
+        "Station 1 missing bottle | Station 2 missing bottle"
+    )
 
 
 def test_authorize_current_medication_captures_baseline_before_enabling_detection():
@@ -542,11 +589,174 @@ def test_simultaneous_returns_are_verified_per_station():
     assert station_2["wrong_bottle_on_station"] is True
     assert system.display.idle_calls == []
     assert system.display.error_calls[-1] == (
-        "Wrong bottle on station_2. Please replace with Metformin 500mg."
+        "Station 2 wrong bottle"
     )
     assert ("stop", "station_1") in system.tag_runtime_service.scan_commands
     assert ("start", "station_2") in system.tag_runtime_service.scan_commands
     assert "station_2" in system.tag_runtime_service.cleared_stations
+
+
+def test_one_correct_one_missing_keeps_remaining_station_error_on_screen():
+    record_1 = {
+        "medicine_id": "M001",
+        "medicine_name": "Aspirin 100mg",
+        "station_id": "station_1",
+        "tag_uid": "TAG123",
+        "time_slots": "08:00,20:00",
+    }
+
+    system = make_system()
+    system.display = FakeDisplay()
+    system.database = FakeDatabase(
+        records_by_tag={"TAG123": record_1},
+        records_by_station={"station_1": record_1},
+    )
+    now_ts = time.time()
+    system.tag_runtime_service = FakeTagRuntimeService(
+        latest_by_station={
+            "station_1": {
+                "received_at": now_ts - 1.0,
+                "scan_msg": {"tag_uid": "TAG123"},
+            }
+        }
+    )
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 43.0,
+            "event_detection_enabled": False,
+        },
+        "station_2": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 0.0,
+            "event_detection_enabled": False,
+        },
+    })
+    system.secured_medications = {
+        "station_1": {
+            "medicine_id": "M001",
+            "medicine_name": "Aspirin 100mg",
+            "station_id": "station_1",
+            "tag_uid": "TAG123",
+            "next_due_timestamp": now_ts + 3600,
+            "next_due_display": "2026-03-25 20:00:00",
+            "present": False,
+            "authorized": False,
+            "early_alert_sent": True,
+            "early_alert_sent_at": now_ts - 10,
+            "bottle_returned_at": now_ts - 3,
+        },
+        "station_2": {
+            "medicine_id": "M002",
+            "medicine_name": "Metformin 500mg",
+            "station_id": "station_2",
+            "tag_uid": "TAG456",
+            "next_due_timestamp": now_ts + 3600,
+            "next_due_display": "2026-03-25 21:00:00",
+            "present": False,
+            "authorized": False,
+            "early_alert_sent": True,
+            "early_alert_sent_at": now_ts - 10,
+        },
+    }
+
+    system._process_secured_bottle_movements()
+
+    assert system.secured_medications["station_1"]["early_alert_sent"] is False
+    assert system.secured_medications["station_2"]["early_alert_sent"] is True
+    assert system.display.error_calls[-1] == "Station 2 missing bottle"
+
+
+def test_both_incorrect_bottles_show_combined_error_screen():
+    wrong_record_1 = {
+        "medicine_id": "M900",
+        "medicine_name": "Vitamin C",
+        "station_id": "station_1",
+        "tag_uid": "WRONG1",
+        "time_slots": "08:00",
+    }
+    wrong_record_2 = {
+        "medicine_id": "M901",
+        "medicine_name": "Fish Oil",
+        "station_id": "station_2",
+        "tag_uid": "WRONG2",
+        "time_slots": "09:00",
+    }
+
+    system = make_system()
+    system.display = FakeDisplay()
+    system.audio = FakeAudio()
+    now_ts = time.time()
+    system.database = FakeDatabase(
+        records_by_tag={
+            "WRONG1": wrong_record_1,
+            "WRONG2": wrong_record_2,
+        }
+    )
+    system.tag_runtime_service = FakeTagRuntimeService(
+        latest_by_station={
+            "station_1": {
+                "received_at": now_ts - 1.0,
+                "scan_msg": {"tag_uid": "WRONG1"},
+            },
+            "station_2": {
+                "received_at": now_ts - 0.5,
+                "scan_msg": {"tag_uid": "WRONG2"},
+            },
+        }
+    )
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 40.0,
+            "event_detection_enabled": False,
+        },
+        "station_2": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 41.0,
+            "event_detection_enabled": False,
+        },
+    })
+    system.secured_medications = {
+        "station_1": {
+            "medicine_id": "M001",
+            "medicine_name": "Aspirin 100mg",
+            "station_id": "station_1",
+            "tag_uid": "TAG123",
+            "next_due_timestamp": now_ts + 3600,
+            "next_due_display": "2026-03-25 20:00:00",
+            "present": False,
+            "authorized": False,
+            "early_alert_sent": True,
+            "early_alert_sent_at": now_ts - 10,
+            "bottle_returned_at": now_ts - 3,
+        },
+        "station_2": {
+            "medicine_id": "M002",
+            "medicine_name": "Metformin 500mg",
+            "station_id": "station_2",
+            "tag_uid": "TAG456",
+            "next_due_timestamp": now_ts + 3600,
+            "next_due_display": "2026-03-25 21:00:00",
+            "present": False,
+            "authorized": False,
+            "early_alert_sent": True,
+            "early_alert_sent_at": now_ts - 10,
+            "bottle_returned_at": now_ts - 3,
+        },
+    }
+
+    system._process_secured_bottle_movements()
+
+    assert system.secured_medications["station_1"]["wrong_bottle_on_station"] is True
+    assert system.secured_medications["station_2"]["wrong_bottle_on_station"] is True
+    assert system.display.error_calls[-1] == (
+        "Station 1 wrong bottle | Station 2 wrong bottle"
+    )
 
 
 def test_weight_manager_rolls_baseline_to_returned_weight(tmp_path):
