@@ -20,66 +20,63 @@ class DummyLogger:
         self.messages.append(("error", message))
 
 
-class FakeSoundDevice:
-    def __init__(self):
-        self.play_calls = []
-        self.wait_calls = 0
-        self.stop_calls = 0
-        self.query_calls = 0
-
-    def query_devices(self):
-        self.query_calls += 1
-        return [{"name": "fake-output"}]
-
-    def play(self, waveform, sample_rate, blocking=False):
-        self.play_calls.append((waveform, sample_rate, blocking))
-
-    def wait(self):
-        self.wait_calls += 1
-
-    def stop(self):
-        self.stop_calls += 1
+class Result:
+    def __init__(self, returncode=0, stderr=""):
+        self.returncode = returncode
+        self.stderr = stderr
 
 
-def test_initialize_uses_sounddevice_backend(monkeypatch):
-    fake_sd = FakeSoundDevice()
-    monkeypatch.setattr("raspberry_pi.modules.audio_manager.sd", fake_sd)
+def test_initialize_only_requires_espeak(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, capture_output=False, text=False, check=False):
+        calls.append(cmd)
+        return Result(returncode=0)
+
+    monkeypatch.setattr("raspberry_pi.modules.audio_manager.subprocess.run", fake_run)
 
     audio = AudioManager({}, DummyLogger())
 
     assert audio.initialize() is True
-    assert fake_sd.query_calls == 1
+    assert calls == [["which", "espeak"]]
     assert audio.initialized is True
     assert audio.mixer_initialized is True
 
 
-def test_speak_plays_native_waveform(monkeypatch):
-    fake_sd = FakeSoundDevice()
-    monkeypatch.setattr("raspberry_pi.modules.audio_manager.sd", fake_sd)
+def test_speak_uses_direct_espeak_command(monkeypatch):
+    calls = []
 
-    audio = AudioManager({"sample_rate": 8000, "volume": 0.5}, DummyLogger())
+    def fake_run(cmd, capture_output=False, text=False, check=False):
+        calls.append(cmd)
+        return Result(returncode=0)
+
+    monkeypatch.setattr("raspberry_pi.modules.audio_manager.subprocess.run", fake_run)
+
+    audio = AudioManager(
+        {"voice": "en-us", "speed": 120, "pitch": 55},
+        DummyLogger()
+    )
     audio.initialized = True
     audio.mixer_initialized = True
 
     audio.speak("hello world", wait=True)
 
-    assert len(fake_sd.play_calls) == 1
-    waveform, sample_rate, blocking = fake_sd.play_calls[0]
-    assert sample_rate == 8000
-    assert blocking is False
-    assert waveform.ndim == 1
-    assert waveform.size > 0
-    assert fake_sd.wait_calls == 1
+    assert calls == [[
+        "espeak",
+        "-v", "en-us",
+        "-s", "120",
+        "-p", "55",
+        "hello world",
+    ]]
 
 
 def test_speak_failure_disables_audio(monkeypatch):
     logger = DummyLogger()
 
-    class BrokenSoundDevice(FakeSoundDevice):
-        def play(self, waveform, sample_rate, blocking=False):
-            raise RuntimeError("audio backend failed")
+    def fake_run(cmd, capture_output=False, text=False, check=False):
+        return Result(returncode=1, stderr="audio backend failed")
 
-    monkeypatch.setattr("raspberry_pi.modules.audio_manager.sd", BrokenSoundDevice())
+    monkeypatch.setattr("raspberry_pi.modules.audio_manager.subprocess.run", fake_run)
 
     audio = AudioManager({}, logger)
     audio.initialized = True
