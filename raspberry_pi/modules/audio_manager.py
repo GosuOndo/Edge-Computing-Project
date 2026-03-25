@@ -16,7 +16,6 @@ class AudioManager:
         self.pitch = int(config.get("pitch", 45))
 
         self.initialized = False
-        self._espeak_bin = "espeak"   # updated in initialize()
         # Non-blocking lock: if audio is already playing, new requests are
         # dropped instead of queuing up and fighting over the ALSA device.
         self._audio_lock = threading.Lock()
@@ -27,28 +26,21 @@ class AudioManager:
             return True
 
         try:
-            # Prefer espeak-ng (installed by default on Pi OS Bullseye/Bookworm);
-            # fall back to the legacy espeak binary.
-            found = False
-            for binary in ["espeak-ng", "espeak"]:
-                result = subprocess.run(
-                    ["which", binary],
-                    capture_output=True, text=True, check=False
-                )
-                if result.returncode == 0:
-                    self._espeak_bin = binary
-                    found = True
-                    break
-
-            if not found:
-                self.logger.error("Audio init failed: espeak-ng / espeak not found")
+            result = subprocess.run(
+                ["which", "espeak"],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if result.returncode != 0:
+                self.logger.error("Audio init failed: espeak not found")
                 self.initialized = False
                 return False
 
             self.initialized = True
             self.logger.info(
-                f"Audio manager initialized using {self._espeak_bin} "
-                f"(voice={self.voice}, speed={self.speed}, pitch={self.pitch})"
+                f"Audio manager initialized (voice={self.voice}, "
+                f"speed={self.speed}, pitch={self.pitch})"
             )
             return True
 
@@ -76,21 +68,15 @@ class AudioManager:
 
             quoted_text = shlex.quote(safe_text)
 
-            # Force audio to the 3.5mm headphone jack (numid=3: 1=headphones,
-            # 2=HDMI). Errors are suppressed in case this control does not
-            # exist on this hardware revision.
-            subprocess.run(
-                "amixer -q cset numid=3 1 2>/dev/null; "
-                "amixer -q set PCM 100% 2>/dev/null; "
-                "amixer -q set Master 100% unmute 2>/dev/null",
-                shell=True, check=False
-            )
-
-            # Use espeak/espeak-ng direct output - avoids the aplay pipeline
-            # that caused "Unknown error 524" (ALSA device busy/suspended).
-            # -a 200 sets amplitude to maximum (range 0-200).
+            # Use espeak's built-in audio output directly.
+            # The old pipeline (espeak --stdout | ffmpeg | aplay) caused
+            # "aplay: Unknown error 524" (ALSA ESTRPIPE) because aplay
+            # could not open the device when PulseAudio/PipeWire is running
+            # or the ALSA stream is suspended. espeak without --stdout plays
+            # through its own PortAudio backend which handles all of this
+            # automatically. -a 200 sets amplitude to maximum.
             cmd = (
-                f"{self._espeak_bin} -v {self.voice} -s {self.speed} "
+                f"espeak -v {self.voice} -s {self.speed} "
                 f"-p {self.pitch} -a 200 {quoted_text}"
             )
 
