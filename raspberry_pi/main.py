@@ -328,6 +328,40 @@ class MedicationSystem:
         ):
             return
 
+        # Only accept the medicine that is registered to this station.
+        # If a different bottle is placed (e.g. aspirin on a paracetamol
+        # station), reject it immediately so it cannot overwrite the
+        # secured state.
+        registered = self.database.get_registered_medicine_by_station(station_id)
+        if registered:
+            registered_medicine_id = registered.get("medicine_id")
+            registered_tag_uid     = registered.get("tag_uid")
+            scanned_medicine_id    = record.get("medicine_id")
+            scanned_tag_uid        = record.get("tag_uid") or scan_msg.get("tag_uid")
+            match = (
+                (registered_medicine_id and scanned_medicine_id == registered_medicine_id)
+                or (registered_tag_uid and scanned_tag_uid == registered_tag_uid)
+            )
+            if not match:
+                self.logger.warning(
+                    f"Wrong medicine placed on {station_id}: "
+                    f"expected {registered.get('medicine_name')} ({registered_medicine_id}), "
+                    f"got {record.get('medicine_name')} ({scanned_medicine_id})"
+                )
+                if self.display:
+                    self.display.show_warning_screen(
+                        "Wrong medicine detected",
+                        f"Please place {registered.get('medicine_name', 'the correct medicine')} "
+                        f"on {station_id}"
+                    )
+                if self.audio:
+                    self.audio.speak_async(
+                        f"Wrong medicine detected. Please place "
+                        f"{registered.get('medicine_name', 'the correct medicine')} "
+                        f"on {station_id}"
+                    )
+                return
+
         status = self.weight_manager.get_station_status(station_id)
         if not status.get("connected"):
             return
@@ -466,21 +500,38 @@ class MedicationSystem:
                 if (
                     not secure_state.get("present", False)
                     and secure_state.get("early_alert_sent", False)
+                    and not secure_state.get("wrong_bottle_on_station", False)
                 ):
                     # Bottle returned after early removal - verify it's the correct one
                     correct = self._verify_returned_bottle(secure_state)
-                    # Reset so future removals trigger alerts and scanning again
-                    secure_state["early_alert_sent"] = False
-                    if correct and getattr(self, "display", None):
-                        next_scheduled = None
-                        if hasattr(self, "scheduler") and self.scheduler:
-                            next_scheduled = self.scheduler.get_next_scheduled_time()
-                        self.display.show_idle_screen(next_scheduled)
-
-                secure_state["present"] = True
-                if status.get("stable", False):
-                    secure_state["current_weight_g"] = weight_g
+                    if correct:
+                        # Reset so future removals trigger alerts and scanning again
+                        secure_state["early_alert_sent"] = False
+                        secure_state["present"] = True
+                        if status.get("stable", False):
+                            secure_state["current_weight_g"] = weight_g
+                        if getattr(self, "display", None):
+                            next_scheduled = None
+                            if hasattr(self, "scheduler") and self.scheduler:
+                                next_scheduled = self.scheduler.get_next_scheduled_time()
+                            self.display.show_idle_screen(next_scheduled)
+                    else:
+                        # Wrong bottle - flag it so we don't re-verify every tick.
+                        # Restart scanning so a new scan is captured when the
+                        # correct bottle is placed.
+                        secure_state["wrong_bottle_on_station"] = True
+                        self.tag_runtime_service.start_scanning()
+                        self.tag_runtime_service.clear_latest_scan()
+                elif not secure_state.get("wrong_bottle_on_station", False):
+                    secure_state["present"] = True
+                    if status.get("stable", False):
+                        secure_state["current_weight_g"] = weight_g
                 continue
+
+            # Bottle not present - clear wrong-bottle flag so the next
+            # placement triggers a fresh verification attempt.
+            if secure_state.get("wrong_bottle_on_station", False):
+                secure_state["wrong_bottle_on_station"] = False
 
             if secure_state.get("present", False) and not secure_state.get(
                 "early_alert_sent", False
@@ -1052,7 +1103,7 @@ class MedicationSystem:
         self.logger.info("Starting medication system...")
         self.running = True
 
-        EXPECTED_MEDICINE_COUNT = 3
+        EXPECTED_MEDICINE_COUNT = 1
 
         registered_before    = self.database.list_registered_medicines()
         onboarding_was_needed = len(registered_before) < EXPECTED_MEDICINE_COUNT
