@@ -26,23 +26,21 @@ class AudioManager:
             return True
 
         try:
-            for tool_name in ["espeak", "ffmpeg", "aplay"]:
-                result = subprocess.run(
-                    ["which", tool_name],
-                    capture_output=True,
-                    text=True,
-                    check=False
-                )
-                if result.returncode != 0:
-                    self.logger.error(f"Audio init failed: {tool_name} not found")
-                    self.initialized = False
-                    return False
+            result = subprocess.run(
+                ["which", "espeak"],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if result.returncode != 0:
+                self.logger.error("Audio init failed: espeak not found")
+                self.initialized = False
+                return False
 
             self.initialized = True
             self.logger.info(
-                "Audio manager initialized successfully using "
-                f"espeak -> ffmpeg -> aplay "
-                f"(voice={self.voice}, speed={self.speed}, pitch={self.pitch})"
+                f"Audio manager initialized (voice={self.voice}, "
+                f"speed={self.speed}, pitch={self.pitch})"
             )
             return True
 
@@ -70,13 +68,16 @@ class AudioManager:
 
             quoted_text = shlex.quote(safe_text)
 
-            # 44100 Hz matches the Pi 3.5 mm jack's native rate; using 48000
-            # caused "Unknown error 524" (ALSA ESTRPIPE) on some Pi models.
-            # -t wav tells aplay to parse the WAV header explicitly.
+            # Use espeak's built-in audio output directly.
+            # The old pipeline (espeak --stdout | ffmpeg | aplay) caused
+            # "aplay: Unknown error 524" (ALSA ESTRPIPE) because aplay
+            # could not open the device when PulseAudio/PipeWire is running
+            # or the ALSA stream is suspended. espeak without --stdout plays
+            # through its own PortAudio backend which handles all of this
+            # automatically. -a 200 sets amplitude to maximum.
             cmd = (
-                f"espeak -v {self.voice} -s {self.speed} -p {self.pitch} --stdout {quoted_text} "
-                f"| ffmpeg -loglevel error -i pipe:0 -ar 44100 -ac 2 -f wav - "
-                f"| aplay -t wav"
+                f"espeak -v {self.voice} -s {self.speed} "
+                f"-p {self.pitch} -a 200 {quoted_text}"
             )
 
             self.logger.info(f"SPEAKING: {safe_text}")
