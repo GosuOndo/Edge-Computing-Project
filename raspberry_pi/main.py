@@ -502,6 +502,19 @@ class MedicationSystem:
                     and secure_state.get("early_alert_sent", False)
                     and not secure_state.get("wrong_bottle_on_station", False)
                 ):
+                    # Record the moment the bottle first landed back on the scale.
+                    # We wait 2 s before verifying so the RFID reader has time to
+                    # send its scan - without this delay the weight sensor wins the
+                    # race and _verify_returned_bottle sees no scan yet, causing it
+                    # to accept the bottle gracefully before the tag arrives.
+                    if secure_state.get("bottle_returned_at") is None:
+                        secure_state["bottle_returned_at"] = time.time()
+
+                    if time.time() - secure_state["bottle_returned_at"] < 2.0:
+                        continue   # still waiting for RFID scan to arrive
+
+                    secure_state.pop("bottle_returned_at", None)
+
                     # Bottle returned after early removal - verify it's the correct one
                     correct = self._verify_returned_bottle(secure_state)
                     if correct:
@@ -528,10 +541,11 @@ class MedicationSystem:
                         secure_state["current_weight_g"] = weight_g
                 continue
 
-            # Bottle not present - clear wrong-bottle flag so the next
-            # placement triggers a fresh verification attempt.
+            # Bottle not present - clear flags so the next placement
+            # triggers a fresh verification attempt.
             if secure_state.get("wrong_bottle_on_station", False):
                 secure_state["wrong_bottle_on_station"] = False
+            secure_state.pop("bottle_returned_at", None)
 
             if secure_state.get("present", False) and not secure_state.get(
                 "early_alert_sent", False

@@ -16,6 +16,9 @@ class AudioManager:
         self.pitch = int(config.get("pitch", 45))
 
         self.initialized = False
+        # Non-blocking lock: if audio is already playing, new requests are
+        # dropped instead of queuing up and fighting over the ALSA device.
+        self._audio_lock = threading.Lock()
 
     def initialize(self):
         if not self.enabled:
@@ -53,6 +56,13 @@ class AudioManager:
             self.logger.warning("Audio speak skipped: audio not initialized")
             return
 
+        # If audio is already playing, skip this request rather than pile up
+        # threads that all compete for the ALSA device (causes error 524 /
+        # broken pipe on the Raspberry Pi).
+        if not self._audio_lock.acquire(blocking=False):
+            self.logger.debug(f"Audio busy, skipping: {text}")
+            return
+
         try:
             safe_text = str(text).strip()
             if not safe_text:
@@ -60,10 +70,13 @@ class AudioManager:
 
             quoted_text = shlex.quote(safe_text)
 
+            # 44100 Hz matches the Pi 3.5 mm jack's native rate; using 48000
+            # caused "Unknown error 524" (ALSA ESTRPIPE) on some Pi models.
+            # -t wav tells aplay to parse the WAV header explicitly.
             cmd = (
                 f"espeak -v {self.voice} -s {self.speed} -p {self.pitch} --stdout {quoted_text} "
-                f"| ffmpeg -loglevel error -i pipe:0 -ar 48000 -ac 2 -f wav - "
-                f"| aplay"
+                f"| ffmpeg -loglevel error -i pipe:0 -ar 44100 -ac 2 -f wav - "
+                f"| aplay -t wav"
             )
 
             self.logger.info(f"SPEAKING: {safe_text}")
@@ -71,6 +84,8 @@ class AudioManager:
 
         except Exception as e:
             self.logger.error(f"Speak error: {e}")
+        finally:
+            self._audio_lock.release()
 
     def speak(self, text, wait=True):
         if not self.initialized or not self.enabled:
