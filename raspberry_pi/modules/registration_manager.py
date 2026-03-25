@@ -208,7 +208,7 @@ class RegistrationManager:
                 bottle_detected_at = time.time()
                 self._update_screen(
                     station_id,
-                    f"Bottle detected ({weight_g:.1f}g) - stabilising..."
+                    "Bottle detected - stabilising..."
                 )
 
             if not is_stable:
@@ -216,6 +216,13 @@ class RegistrationManager:
                 continue
 
             stable_weight = weight_g
+            # Show the confirmed stable weight now that the reading has settled
+            self._update_screen(
+                station_id,
+                "Weight stable",
+                weight_g=stable_weight,
+                stable=True,
+            )
             break
         else:
             self._timeout(station_id)
@@ -227,7 +234,8 @@ class RegistrationManager:
         # which typically happens before or during weight stabilisation.
         # We accept any scan received since bottle_detected_at - 2 s.
         lookback_from = bottle_detected_at - 2.0
-        self._update_screen(station_id, "Reading tag...")
+        self._update_screen(station_id, "Reading tag...",
+                            weight_g=stable_weight, stable=True)
         if self.audio:
             self.audio.speak("Reading tag.")
 
@@ -259,7 +267,8 @@ class RegistrationManager:
                 )
                 self._update_screen(
                     station_id,
-                    "Tag detected but unreadable - keep bottle still..."
+                    "Tag detected but unreadable - keep bottle still...",
+                    weight_g=stable_weight, stable=True,
                 )
                 self.tag_runtime_service.clear_latest_scan(station_id)
                 time.sleep(0.5)
@@ -442,9 +451,12 @@ class RegistrationManager:
                 "Restart the system and try again."
             )
 
-    def _update_screen(self, station_id: str, message: str):
+    def _update_screen(self, station_id: str, message: str,
+                       weight_g: float = None, stable: bool = False):
         if self.display:
-            self.display.show_registration_screen(station_id, message)
+            self.display.show_registration_screen(
+                station_id, message, weight_g=weight_g, stable=stable
+            )
 
     def _build_registration_record(
         self,
