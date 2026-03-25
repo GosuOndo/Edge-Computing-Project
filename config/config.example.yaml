@@ -22,6 +22,8 @@ hardware:
 
   audio:
     enabled: true
+    playback_mode: "alsa_pipe"  # "alsa_pipe" or "direct_espeak"
+    output_device: null         # e.g. "plughw:0,0" if your Pi needs a specific ALSA device
     volume: 0.8  # 0.0 to 1.0
 
 # MQTT Configuration
