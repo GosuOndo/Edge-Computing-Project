@@ -130,7 +130,7 @@ class MedicationSystem:
                     self.config["hardware"]["display"], self.logger
                 )
                 self.display.initialize()
-                self.display.show_idle_screen()
+                self._show_idle_screen()
             else:
                 self.display = None
                 self.logger.info("Display skipped (headless mode)")
@@ -623,10 +623,7 @@ class MedicationSystem:
                             getattr(self, "display", None)
                             and not self._has_pending_security_violation()
                         ):
-                            next_scheduled = None
-                            if hasattr(self, "scheduler") and self.scheduler:
-                                next_scheduled = self.scheduler.get_next_scheduled_time()
-                            self.display.show_idle_screen(next_scheduled)
+                            self._show_idle_screen()
                     else:
                         # Wrong bottle - flag it so we don't re-verify every tick.
                         # Restart scanning so a new scan is captured when the
@@ -867,7 +864,7 @@ class MedicationSystem:
         self.pending_monitoring_ui = None
 
         if self.display:
-            self.display.show_idle_screen(self.scheduler.get_next_scheduled_time())
+            self._show_idle_screen()
 
     # ------------------------------------------------------------------
     # Verification pipeline
@@ -1092,7 +1089,7 @@ class MedicationSystem:
         )
 
         if self.display:
-            self.display.show_idle_screen(self.scheduler.get_next_scheduled_time())
+            self._show_idle_screen()
 
     # ------------------------------------------------------------------
     # Decision handling
@@ -1211,6 +1208,23 @@ class MedicationSystem:
         entries.sort()
         return entries
 
+    def _get_idle_screen_payload(self):
+        next_medication = None
+        today_schedule = []
+
+        if hasattr(self, "scheduler") and self.scheduler:
+            next_medication = self.scheduler.get_next_scheduled_time()
+            today_schedule = self.scheduler.get_todays_schedule()
+
+        return {
+            "next_medication": next_medication,
+            "today_schedule": today_schedule,
+        }
+
+    def _show_idle_screen(self):
+        if self.display:
+            self.display.show_idle_screen(self._get_idle_screen_payload())
+
     # ------------------------------------------------------------------
     # Start / stop
     # ------------------------------------------------------------------
@@ -1258,7 +1272,7 @@ class MedicationSystem:
         self.scheduler.start()
 
         if self.display:
-            self.display.show_idle_screen(self.scheduler.get_next_scheduled_time())
+            self._show_idle_screen()
 
         self.logger.info("System ready")
 
@@ -1275,9 +1289,7 @@ class MedicationSystem:
                         current_minute = datetime.now().strftime('%H:%M')
                         if current_minute != self._last_idle_minute:
                             self._last_idle_minute = current_minute
-                            self.display.show_idle_screen(
-                                self.scheduler.get_next_scheduled_time()
-                            )
+                            self._show_idle_screen()
                 time.sleep(0.1)
 
         except KeyboardInterrupt:

@@ -312,35 +312,155 @@ class DisplayManager:
     # Existing screens (unchanged)
     # ------------------------------------------------------------------ #
 
+    def _normalize_idle_screen_data(self, idle_data):
+        next_medication = None
+        today_schedule = []
+
+        if isinstance(idle_data, dict):
+            if "next_medication" in idle_data or "today_schedule" in idle_data:
+                next_medication = idle_data.get("next_medication")
+                today_schedule = idle_data.get("today_schedule") or []
+            elif (
+                "medicine_name" in idle_data
+                or "time" in idle_data
+                or "time_until" in idle_data
+            ):
+                next_medication = idle_data
+        elif isinstance(idle_data, str):
+            next_medication = {"medicine_name": idle_data}
+
+        return next_medication, today_schedule
+
     def show_idle_screen(self, next_medication=None):
         if not self.initialized:
             return
         with self.screen_lock:
             self._fill('background')
 
+            next_medication, today_schedule = self._normalize_idle_screen_data(
+                next_medication
+            )
             time_str = datetime.now().strftime('%H:%M')
             date_str = datetime.now().strftime('%A, %d %B %Y')
 
-            self._draw_text(time_str, 'huge', 'primary', self.width // 2, 160, center=True)
-            self._draw_text(date_str, 'normal', 'text_light', self.width // 2, 240, center=True)
+            self._draw_text(time_str, 'large', 'primary', self.width // 2, 70, center=True)
+            self._draw_text(date_str, 'normal', 'text_light', self.width // 2, 115, center=True)
 
-            divider_y = 280
-            pygame.draw.line(
-                self.screen, self.colors['text_light'],
-                (100, divider_y), (self.width - 100, divider_y), 1
+            header_x = 70
+            header_y = 150
+            header_w = self.width - 140
+            header_h = 110
+            self._draw_rect('white', header_x, header_y, header_w, header_h, radius=18)
+            self._draw_rect('secondary', header_x, header_y, header_w, 10, radius=18)
+
+            self._draw_text(
+                "Next Medication",
+                'small',
+                'text_light',
+                header_x + 32,
+                header_y + 26
             )
 
             if next_medication:
-                self._draw_text("Next medication", 'normal', 'text_light',
-                                self.width // 2, 320, center=True)
-                name = next_medication.get('medicine_name', '')
+                name = next_medication.get('medicine_name', 'Unknown')
                 time_val = next_medication.get('time', '')
-                self._draw_text(name, 'large', 'primary', self.width // 2, 370, center=True)
-                self._draw_text(f"at {time_val}", 'medium', 'secondary',
-                                self.width // 2, 430, center=True)
+                station_val = next_medication.get('station_id', '')
+                summary = f"at {time_val}" if time_val else "Scheduled"
+                if station_val:
+                    summary = f"{summary} on {station_val.replace('_', ' ').title()}"
+
+                self._draw_text(
+                    name,
+                    'medium',
+                    'primary',
+                    header_x + 32,
+                    header_y + 58
+                )
+                self._draw_text(
+                    summary,
+                    'normal',
+                    'secondary',
+                    header_x + 32,
+                    header_y + 86
+                )
             else:
-                self._draw_text("No medications scheduled", 'medium', 'text_light',
-                                self.width // 2, 360, center=True)
+                self._draw_text(
+                    "No medications scheduled",
+                    'medium',
+                    'text_light',
+                    header_x + 32,
+                    header_y + 62
+                )
+
+            panel_x = 70
+            panel_y = 285
+            panel_w = self.width - 140
+            panel_h = 250
+
+            self._draw_rect('white', panel_x, panel_y, panel_w, panel_h, radius=20)
+            self._draw_rect('primary', panel_x, panel_y, panel_w, 10, radius=20)
+            self._draw_text(
+                "Today's Timetable",
+                'normal',
+                'primary',
+                panel_x + 28,
+                panel_y + 24
+            )
+
+            if today_schedule:
+                row_y = panel_y + 62
+                row_h = 34
+                max_rows = 5
+
+                for idx, item in enumerate(today_schedule[:max_rows]):
+                    if idx > 0:
+                        pygame.draw.line(
+                            self.screen,
+                            self.colors['background'],
+                            (panel_x + 24, row_y - 14),
+                            (panel_x + panel_w - 24, row_y - 14),
+                            1
+                        )
+
+                    station_label = str(item.get('station_id', '')).replace('_', ' ').title()
+                    details = item.get('medicine_name', 'Unknown')
+                    if station_label:
+                        details = f"{details}  ({station_label})"
+
+                    self._draw_text(
+                        item.get('time', '--:--'),
+                        'normal',
+                        'secondary',
+                        panel_x + 28,
+                        row_y
+                    )
+                    self._draw_text(
+                        details,
+                        'normal',
+                        'text_dark',
+                        panel_x + 150,
+                        row_y
+                    )
+                    row_y += row_h
+
+                if len(today_schedule) > max_rows:
+                    remaining = len(today_schedule) - max_rows
+                    self._draw_text(
+                        f"+ {remaining} more scheduled dose(s)",
+                        'small',
+                        'text_light',
+                        panel_x + 28,
+                        panel_y + panel_h - 28
+                    )
+            else:
+                self._draw_text(
+                    "No registered medicine timetable available yet",
+                    'normal',
+                    'text_light',
+                    self.width // 2,
+                    panel_y + 120,
+                    center=True
+                )
 
             self._draw_text("Smart Medication System", 'small', 'text_light',
                             self.width // 2, 570, center=True)

@@ -300,19 +300,52 @@ class MedicationScheduler:
         Returns:
             Dictionary with medication name and time
         """
-        jobs = schedule.get_jobs()
-        
-        if not jobs:
+        now = datetime.now()
+        next_entry = None
+
+        for medication in self.medications:
+            for scheduled_time in medication.get('times', []):
+                parts = str(scheduled_time).split(':')
+                if len(parts) < 2:
+                    continue
+
+                try:
+                    hour = int(parts[0])
+                    minute = int(parts[1])
+                    second = int(parts[2]) if len(parts) > 2 else 0
+                except ValueError:
+                    self.logger.warning(
+                        f"Invalid scheduled time skipped: {scheduled_time}"
+                    )
+                    continue
+
+                candidate = now.replace(
+                    hour=hour,
+                    minute=minute,
+                    second=second,
+                    microsecond=0
+                )
+                if candidate <= now:
+                    candidate += timedelta(days=1)
+
+                entry = {
+                    'medicine_name': medication.get('name', 'Unknown'),
+                    'station_id': medication.get('station_id'),
+                    'dosage_pills': medication.get('dosage_pills'),
+                    'time': candidate.strftime('%H:%M'),
+                    'scheduled_time': str(scheduled_time),
+                    'time_until': str(candidate - now).split('.')[0],
+                    '_next_run': candidate,
+                }
+
+                if next_entry is None or candidate < next_entry['_next_run']:
+                    next_entry = entry
+
+        if not next_entry:
             return None
-        
-        # Find next job
-        next_job = min(jobs, key=lambda j: j.next_run)
-        
-        return {
-            'medicine_name': next_job.job_func.args[0] if next_job.job_func.args else 'Unknown',
-            'time': next_job.next_run.strftime('%H:%M:%S'),
-            'time_until': str(next_job.next_run - datetime.now())
-        }
+
+        next_entry.pop('_next_run', None)
+        return next_entry
     
     def get_todays_schedule(self) -> List[Dict[str, Any]]:
         """
