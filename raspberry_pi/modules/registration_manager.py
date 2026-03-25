@@ -16,7 +16,11 @@ Scan control during onboarding
   slot is confirmed, as the belt-and-suspenders final stop.
 
 Tag payload format (written via medication_tag_write_read_test.ino):
-    ID=M001;P=P001;N=ASPIRIN100;D=2;T=08,20;M=AF;S=1
+    ID=M001;P=P001;N=ASPIRIN100;D=2;T=08,20;M=AF;S=1;W=290
+
+W field (optional): per-pill weight in milligrams.  When present it overrides
+the hard-coded pill_weight_mg config value for this station, allowing the
+system to use the correct weight for each specific medicine.
 """
 
 import time
@@ -316,6 +320,16 @@ class RegistrationManager:
             self.logger.error(f"Database write failed for {medicine_id}")
             self.tag_runtime_service.stop_scanning(station_id)   # stop on DB failure
             return False
+
+        # ---- Apply tag-derived pill weight override ----
+        pill_weight_mg = record.get("pill_weight_mg")
+        if pill_weight_mg is not None:
+            self.weight_manager.set_pill_weight_from_tag(station_id, pill_weight_mg)
+        else:
+            self.logger.info(
+                f"Tag for {medicine_id} has no W field; "
+                "pill weight falls back to config value"
+            )
 
         # ---- Capture baseline ----
         self.weight_manager.baseline_weights[station_id]          = stable_weight

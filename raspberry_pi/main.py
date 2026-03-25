@@ -916,6 +916,16 @@ class MedicationSystem:
             self.logger.info(f"Identity result: {identity_result}")
 
             if identity_result.get("success"):
+                # If the verified tag carries a pill weight, keep the override
+                # up-to-date (e.g. after a system restart the override file may
+                # be stale or missing).
+                tag_record = identity_result.get("record") or {}
+                pill_weight_mg = tag_record.get("pill_weight_mg")
+                if pill_weight_mg is not None:
+                    self.weight_manager.set_pill_weight_from_tag(
+                        expected_station_id, pill_weight_mg
+                    )
+
                 ocr_result = {
                     "success":       True,
                     "medicine_name": identity_result.get("medicine_name", medicine_name),

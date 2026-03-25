@@ -75,6 +75,10 @@ class WeightManager:
         # is ready to capture the tag when the bottle is placed back.
         self.bottle_lifted_callback: Optional[Callable] = None
 
+        # Per-station pill weight overrides read from NFC tags.
+        # These take priority over the hard-coded config pill_weight_mg values.
+        self._pill_weight_override_mg: Dict[str, Optional[int]] = {}
+
         # Build per-station dicts
         self.station_configs: Dict[str, dict] = {}
         for _, station_cfg in config.items():
@@ -88,8 +92,10 @@ class WeightManager:
 
         # Persistence
         self.baseline_file = Path("data/station_baselines.json")
+        self.pill_weight_override_file = Path("data/pill_weight_overrides.json")
         self.baseline_file.parent.mkdir(parents=True, exist_ok=True)
         self._load_persisted_baselines()
+        self._load_pill_weight_overrides()
 
         self.logger.info(
             f"WeightManager initialised for {len(self.station_configs)} station(s)"
@@ -100,6 +106,10 @@ class WeightManager:
     # --------------------------------------------------------------------------
 
     def _get_pill_weight_g(self, station_id: str) -> float:
+        # Tag-derived override takes priority over config value.
+        override = self._pill_weight_override_mg.get(station_id)
+        if override is not None:
+            return float(override) / 1000.0
         cfg = self.station_configs.get(station_id, {})
         return float(cfg.get("pill_weight_mg", 500)) / 1000.0
 
@@ -161,6 +171,51 @@ class WeightManager:
                 json.dump(self.baseline_weights, f, indent=2)
         except Exception as e:
             self.logger.error(f"Failed to save persisted baselines: {e}")
+
+    # --------------------------------------------------------------------------
+    # Pill weight override persistence (tag-derived values)
+    # --------------------------------------------------------------------------
+
+    def _load_pill_weight_overrides(self):
+        if not self.pill_weight_override_file.exists():
+            return
+        try:
+            with open(self.pill_weight_override_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for sid, val in data.items():
+                if sid in self.station_configs:
+                    self._pill_weight_override_mg[sid] = int(val)
+            self.logger.info(
+                f"Loaded tag-derived pill weights: {self._pill_weight_override_mg}"
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to load pill weight overrides: {e}")
+
+    def _save_pill_weight_overrides(self):
+        try:
+            with open(self.pill_weight_override_file, "w", encoding="utf-8") as f:
+                json.dump(self._pill_weight_override_mg, f, indent=2)
+        except Exception as e:
+            self.logger.error(f"Failed to save pill weight overrides: {e}")
+
+    def set_pill_weight_from_tag(self, station_id: str, pill_weight_mg: int):
+        """
+        Store the per-pill weight (mg) read from an NFC tag for station_id.
+
+        This overrides the hard-coded config value so subsequent weight events
+        use the tag-specific pill weight for pill count estimation and dosage
+        verification.  The value is persisted to survive system restarts.
+        """
+        if station_id not in self.station_configs:
+            self.logger.warning(
+                f"set_pill_weight_from_tag: unknown station {station_id!r}"
+            )
+            return
+        self._pill_weight_override_mg[station_id] = int(pill_weight_mg)
+        self._save_pill_weight_overrides()
+        self.logger.info(
+            f"[{station_id}] Pill weight updated from tag: {pill_weight_mg} mg"
+        )
 
     # --------------------------------------------------------------------------
     # Arm / disarm event detection

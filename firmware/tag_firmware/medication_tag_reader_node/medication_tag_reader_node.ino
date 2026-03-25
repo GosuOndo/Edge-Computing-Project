@@ -29,10 +29,11 @@ char topic_read[64];
 char topic_status[64];
 char topic_command[64];   // Pi sends start_scan / stop_scan here
 
-// Read pages 4 to 15 = safe compact payload area
+// Read pages 4-17 = 14 pages = 56 bytes (NTAG213 or larger).
+// Supports the W=<pill_weight_mg> field added to the payload format.
 const byte START_PAGE = 4;
-const byte END_PAGE = 15;
-const int MAX_PAYLOAD_BYTES = 48;
+const byte END_PAGE = 17;
+const int MAX_PAYLOAD_BYTES = 56;
 
 String lastUid = "";
 unsigned long lastScanMs = 0;

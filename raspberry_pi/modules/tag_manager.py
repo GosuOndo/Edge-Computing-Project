@@ -22,7 +22,10 @@ class TagManager:
     def parse_payload(self, payload_raw: str) -> Dict[str, Any]:
         """
         Parse compact payload like:
-        ID=M001;P=P001;N=ASPIRIN100;D=2;T=08,20;M=AF;S=1
+        ID=M001;P=P001;N=ASPIRIN100;D=2;T=08,20;M=AF;S=1;W=290
+
+        W (optional): per-pill weight in milligrams, stored on the tag so the
+        system does not rely on hard-coded config values.
         """
         result: Dict[str, Any] = {}
 
@@ -106,6 +109,14 @@ class TagManager:
             except ValueError:
                 dosage_amount = None
 
+        pill_weight_mg = None
+        raw_weight = parsed.get("W")
+        if raw_weight:
+            try:
+                pill_weight_mg = int(raw_weight)
+            except ValueError:
+                pill_weight_mg = None
+
         record = {
             "medicine_id": medicine_id,
             "patient_id": parsed.get("P"),
@@ -115,6 +126,7 @@ class TagManager:
             "time_slots": self._normalise_time_slots(parsed.get("T")),
             "meal_rule": self._normalise_meal_rule(parsed.get("M")),
             "station_id": self._normalise_station_id(parsed.get("S")),
+            "pill_weight_mg": pill_weight_mg,
             "tag_uid": tag_uid,
             "tag_payload": payload_raw,
             "source_method": "tag",

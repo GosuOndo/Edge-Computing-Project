@@ -43,7 +43,7 @@ weight_sensors:
     id: "station_1"
     tag_reader_id: "tag_reader_1"   # RFID reader mounted under this station's scale
     medicine_name: "Aspirin 100mg"  # updated automatically on registration
-    pill_weight_mg: 290             # calibrated: 2 pills = ~0.58g delta -> 290mg each
+    pill_weight_mg: 290             # fallback only: overridden at runtime by W= field in NFC tag
     threshold_stable_g: 0.05        # stability threshold
     threshold_delta_g: 0.22         # minimum change to consider a delta
     event_settle_seconds: 1.5       # how long weight must be stable before firing
@@ -54,7 +54,7 @@ weight_sensors:
     id: "station_2"
     tag_reader_id: "tag_reader_2"   # RFID reader mounted under this station's scale
     medicine_name: "Paracetamol 500mg"  # updated automatically on registration
-    pill_weight_mg: 290             # calibrated: 2 pills = ~0.58g delta -> 290mg each
+    pill_weight_mg: 290             # fallback only: overridden at runtime by W= field in NFC tag
     threshold_stable_g: 0.05        # stability threshold
     threshold_delta_g: 0.22         # minimum change to consider a delta
     event_settle_seconds: 1.5       # how long weight must be stable before firing

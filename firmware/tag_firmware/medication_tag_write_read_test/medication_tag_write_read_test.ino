@@ -10,13 +10,17 @@
 
 MFRC522 rfid(SS_PIN, RST_PIN);
 
-// Keep payload compact
-const char* TEST_PAYLOAD = "ID=M001;P=P001;N=ASPIRIN100;D=2;T=08,20;M=AF;S=1";
+// Compact payload including W=<pill_weight_mg> so the Pi can use per-medicine
+// weights without relying on hard-coded config values.
+// W field: per-pill weight in milligrams (e.g. W=290 for a 290 mg tablet).
+// Total must be <= MAX_PAYLOAD_BYTES (56 bytes).
+const char* TEST_PAYLOAD = "ID=M001;P=P001;N=ASPIRIN100;D=2;T=08,20;M=AF;S=1;W=290";
 
-// We will use pages 4 to 15 inclusive = 12 pages = 48 bytes total
+// Pages 4-17 = 14 pages = 56 bytes (safe for NTAG213 and larger variants).
+// Standard MIFARE Ultralight only has pages 4-15; use NTAG213 or larger tags.
 const byte START_PAGE = 4;
-const byte END_PAGE = 15;
-const int MAX_PAYLOAD_BYTES = 48;
+const byte END_PAGE = 17;
+const int MAX_PAYLOAD_BYTES = 56;
 
 String readUltralightPayload() {
   char out[MAX_PAYLOAD_BYTES + 1];
