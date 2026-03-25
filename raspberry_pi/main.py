@@ -154,19 +154,40 @@ class MedicationSystem:
             identity_cfg = self.config.get("identity", {})
             tag_cfg      = identity_cfg.get("tag", {})
             tag_topic    = tag_cfg.get("mqtt_topic", "medication/tag/read/+")
-            # NEW: command_topic tells the firmware to start/stop scanning.
-            # Defaults to tag_reader_1; override in config.yaml if needed:
-            #   identity.tag.command_topic: "medication/tag/command/tag_reader_1"
-            command_topic = tag_cfg.get(
-                "command_topic", "medication/tag/command/tag_reader_1"
-            )
+
+            # Build per-station command topics and station->reader mapping from
+            # weight_sensors config (each station declares its tag_reader_id).
+            weight_cfg = self.config.get("weight_sensors", {})
+            station_to_reader: dict = {}
+            for _, sc in weight_cfg.items():
+                if isinstance(sc, dict) and sc.get("id") and sc.get("tag_reader_id"):
+                    station_to_reader[sc["id"]] = sc["tag_reader_id"]
+
+            # command_topics: prefer explicit config block; fall back to
+            # deriving topics from station_to_reader mapping.
+            cfg_command_topics: dict = tag_cfg.get("command_topics", {})
+            if cfg_command_topics:
+                command_topics = cfg_command_topics
+            elif station_to_reader:
+                command_topics = {
+                    sid: f"medication/tag/command/{rid}"
+                    for sid, rid in station_to_reader.items()
+                }
+            else:
+                # Legacy single-reader fallback
+                command_topics = {
+                    "_default": tag_cfg.get(
+                        "command_topic", "medication/tag/command/tag_reader_1"
+                    )
+                }
 
             self.tag_runtime_service = TagRuntimeService(
                 mqtt_config=self.config["mqtt"],
                 database=self.database,
                 logger=self.logger,
                 topic=tag_topic,
-                command_topic=command_topic,   # NEW
+                command_topics=command_topics,
+                station_to_reader=station_to_reader,
             )
             self.tag_runtime_service.start()
 
@@ -416,7 +437,7 @@ class MedicationSystem:
         station_id    = secure_state.get("station_id", "unknown")
         alert_sent_at = secure_state.get("early_alert_sent_at", 0.0)
 
-        latest = self.tag_runtime_service.get_latest_scan()
+        latest = self.tag_runtime_service.get_latest_scan(station_id)
         if not latest or float(latest.get("received_at", 0.0)) <= alert_sent_at:
             self.logger.warning(
                 f"Bottle returned to {station_id} but no new tag scan received - "
@@ -471,7 +492,7 @@ class MedicationSystem:
                     f"{secure_state.get('medicine_name', 'the correct medication')}"
                 )
 
-        self.tag_runtime_service.stop_scanning()
+        self.tag_runtime_service.stop_scanning(station_id)
         return correct
 
     def _process_secured_bottle_movements(self):
@@ -534,8 +555,8 @@ class MedicationSystem:
                         # Restart scanning so a new scan is captured when the
                         # correct bottle is placed.
                         secure_state["wrong_bottle_on_station"] = True
-                        self.tag_runtime_service.start_scanning()
-                        self.tag_runtime_service.clear_latest_scan()
+                        self.tag_runtime_service.start_scanning(station_id)
+                        self.tag_runtime_service.clear_latest_scan(station_id)
                 elif not secure_state.get("wrong_bottle_on_station", False):
                     secure_state["present"] = True
                     if status.get("stable", False):
@@ -555,7 +576,7 @@ class MedicationSystem:
                 self._prompt_return_bottle_to_station()
                 secure_state["early_alert_sent"]    = True
                 secure_state["early_alert_sent_at"] = time.time()
-                self.tag_runtime_service.start_scanning()
+                self.tag_runtime_service.start_scanning(station_id)
 
             secure_state["present"] = False
 
@@ -654,7 +675,7 @@ class MedicationSystem:
         self.logger.info(
             f"Bottle lifted from {station_id} - starting tag scanning"
         )
-        self.tag_runtime_service.start_scanning()
+        self.tag_runtime_service.start_scanning(station_id)
 
     # ------------------------------------------------------------------
     # Main-thread event processing
@@ -1118,23 +1139,30 @@ class MedicationSystem:
         self.logger.info("Starting medication system...")
         self.running = True
 
-        EXPECTED_MEDICINE_COUNT = 1
+        EXPECTED_MEDICINE_COUNT = 1  # one medicine per station
+        STATION_IDS = list(self.weight_manager.station_configs.keys())
 
-        registered_before    = self.database.list_registered_medicines()
-        onboarding_was_needed = len(registered_before) < EXPECTED_MEDICINE_COUNT
-
-        all_registered = self.registration_manager.run_onboarding_if_needed(
-            station_id="station_1",
-            expected_medicine_count=EXPECTED_MEDICINE_COUNT,
-            scheduler=self.scheduler
+        registered_before = self.database.list_registered_medicines()
+        registered_station_ids = {r.get("station_id") for r in registered_before}
+        onboarding_was_needed = any(
+            sid not in registered_station_ids for sid in STATION_IDS
         )
-        # run_onboarding_if_needed calls stop_scanning() when done,
-        # so the reader is idle when we enter the main loop.
 
-        if not all_registered:
-            self.logger.error(
-                "Onboarding did not complete. System may have partial setup."
+        all_registered = True
+        for station_id in STATION_IDS:
+            ok = self.registration_manager.run_onboarding_if_needed(
+                station_id=station_id,
+                expected_medicine_count=EXPECTED_MEDICINE_COUNT,
+                scheduler=self.scheduler
             )
+            if not ok:
+                self.logger.error(
+                    f"Onboarding did not complete for {station_id}. "
+                    "System may have partial setup."
+                )
+                all_registered = False
+        # run_onboarding_if_needed calls stop_scanning() per station when done,
+        # so all readers are idle when we enter the main loop.
 
         self._load_schedule_from_database()
 

@@ -22,7 +22,7 @@ Scan control:
 import json
 import time
 from threading import Lock
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import paho.mqtt.client as mqtt
 
@@ -39,19 +39,37 @@ class TagRuntimeService:
         logger,
         topic: str,
         command_topic: str = "medication/tag/command/tag_reader_1",
+        command_topics: Optional[Dict[str, str]] = None,
+        station_to_reader: Optional[Dict[str, str]] = None,
     ):
         self.mqtt_config = mqtt_config
         self.database = database
         self.logger = logger
         self.topic = topic
-        self.command_topic = command_topic   # NEW: where scan commands are published
+
+        # Per-station command topics: station_id -> MQTT command topic.
+        # Falls back to the legacy single command_topic when not provided.
+        if command_topics:
+            self._station_command_topics: Dict[str, str] = command_topics
+        else:
+            self._station_command_topics = {"_default": command_topic}
+
+        # station_id -> reader_id mapping (used to filter per-reader scan buffers)
+        self._station_to_reader: Dict[str, str] = station_to_reader or {}
+        # Reverse map: reader_id -> station_id (built from station_to_reader)
+        self._reader_to_station: Dict[str, str] = {
+            v: k for k, v in self._station_to_reader.items()
+        }
 
         self.tag_manager = TagManager(logger)
 
         self.client = None
         self.connected = False
 
+        # Latest scan from any reader (backward-compat)
         self.latest_scan: Optional[Dict[str, Any]] = None
+        # Per-reader scan buffers: reader_id -> scan dict
+        self._latest_scans_by_reader: Dict[str, Optional[Dict[str, Any]]] = {}
         self.latest_scan_lock = Lock()
 
     # ------------------------------------------------------------------
@@ -115,15 +133,19 @@ class TagRuntimeService:
             payload_text = msg.payload.decode("utf-8")
             scan_msg = json.loads(payload_text)
 
+            reader_id = scan_msg.get("reader_id", "unknown")
+            scan_entry = {
+                "received_at": time.time(),
+                "scan_msg": scan_msg
+            }
+
             with self.latest_scan_lock:
-                self.latest_scan = {
-                    "received_at": time.time(),
-                    "scan_msg": scan_msg
-                }
+                self.latest_scan = scan_entry
+                self._latest_scans_by_reader[reader_id] = scan_entry
 
             self.logger.info(
                 f"Live tag scan received: UID={scan_msg.get('tag_uid')} "
-                f"reader={scan_msg.get('reader_id')}"
+                f"reader={reader_id}"
             )
 
         except Exception as e:
@@ -133,12 +155,15 @@ class TagRuntimeService:
     # Scan control  (NEW)
     # ------------------------------------------------------------------
 
-    def _send_scan_command(self, command: str):
+    def _send_scan_command(self, command: str, station_id: Optional[str] = None):
         """
         Publish a scan control command to the firmware.
 
         Args:
-            command: "start_scan" or "stop_scan"
+            command:    "start_scan" or "stop_scan"
+            station_id: If provided, only the reader for that station is
+                        commanded.  If None, all configured readers are
+                        commanded simultaneously.
         """
         if not self.client or not self.connected:
             self.logger.warning(
@@ -147,47 +172,84 @@ class TagRuntimeService:
             return
 
         payload = json.dumps({"command": command})
-        result = self.client.publish(self.command_topic, payload, qos=1)
 
-        if result.rc == mqtt.MQTT_ERR_SUCCESS:
-            self.logger.info(f"Tag scan command sent: {command}")
+        if station_id and station_id in self._station_command_topics:
+            topics: List[str] = [self._station_command_topics[station_id]]
         else:
-            self.logger.error(
-                f"Failed to send tag scan command {command} (rc={result.rc})"
-            )
+            topics = list(self._station_command_topics.values())
 
-    def start_scanning(self):
+        for topic in topics:
+            result = self.client.publish(topic, payload, qos=1)
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                self.logger.info(
+                    f"Tag scan command sent: {command} -> {topic}"
+                )
+            else:
+                self.logger.error(
+                    f"Failed to send tag scan command {command} to {topic} "
+                    f"(rc={result.rc})"
+                )
+
+    def start_scanning(self, station_id: Optional[str] = None):
         """
         Enable RF polling on the tag reader firmware.
 
-        Call at the start of each onboarding slot and when the bottle is
-        lifted during daily use so the reader is ready to capture the tag
-        when the bottle is placed back.
+        Pass station_id to target only that station's reader; omit to
+        broadcast to all readers (e.g. during global reset / onboarding).
         """
-        self._send_scan_command("start_scan")
+        self._send_scan_command("start_scan", station_id)
 
-    def stop_scanning(self):
+    def stop_scanning(self, station_id: Optional[str] = None):
         """
         Disable RF polling on the tag reader firmware.
 
-        Call after onboarding completes, between onboarding slots (while the
-        patient swaps bottles), and after each identity verification cycle so
-        the reader does not accumulate stale scans.
+        Pass station_id to target only that station's reader; omit to
+        broadcast to all readers.
         """
-        self._send_scan_command("stop_scan")
+        self._send_scan_command("stop_scan", station_id)
 
     # ------------------------------------------------------------------
     # Scan buffer access
     # ------------------------------------------------------------------
 
-    def clear_latest_scan(self):
-        """Discard the stored scan so the next query starts fresh."""
-        with self.latest_scan_lock:
-            self.latest_scan = None
+    def _reader_id_for_station(self, station_id: Optional[str]) -> Optional[str]:
+        """Return the reader_id associated with station_id, or None if unknown."""
+        return self._station_to_reader.get(station_id) if station_id else None
 
-    def get_latest_scan(self) -> Optional[Dict[str, Any]]:
-        """Return the stored scan dict (or None) without removing it."""
+    def clear_latest_scan(self, station_id: Optional[str] = None):
+        """
+        Discard the stored scan so the next query starts fresh.
+
+        If station_id is provided, only that station's reader buffer is cleared
+        (plus the global latest_scan if it came from that reader).
+        """
+        reader_id = self._reader_id_for_station(station_id)
         with self.latest_scan_lock:
+            if reader_id:
+                self._latest_scans_by_reader.pop(reader_id, None)
+                # Clear global buffer only when it came from the same reader
+                if (
+                    self.latest_scan
+                    and self.latest_scan.get("scan_msg", {}).get("reader_id")
+                    == reader_id
+                ):
+                    self.latest_scan = None
+            else:
+                self.latest_scan = None
+                self._latest_scans_by_reader.clear()
+
+    def get_latest_scan(self, station_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Return the stored scan dict (or None) without removing it.
+
+        If station_id is provided, return only the scan from that station's
+        reader.  Otherwise return the most recent scan from any reader.
+        """
+        reader_id = self._reader_id_for_station(station_id)
+        with self.latest_scan_lock:
+            if reader_id:
+                entry = self._latest_scans_by_reader.get(reader_id)
+                return entry.copy() if entry else None
             return self.latest_scan.copy() if self.latest_scan else None
 
     # ------------------------------------------------------------------
@@ -195,18 +257,27 @@ class TagRuntimeService:
     # ------------------------------------------------------------------
 
     def get_tag_within_window(
-        self, window_seconds: float = 10.0
+        self,
+        window_seconds: float = 10.0,
+        station_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Return the most recent scan if it arrived within the last
         window_seconds. Returns None if no scan or scan is older.
+
+        If station_id is provided, only that station's reader is checked.
         """
+        reader_id = self._reader_id_for_station(station_id)
         with self.latest_scan_lock:
-            if not self.latest_scan:
+            if reader_id:
+                entry = self._latest_scans_by_reader.get(reader_id)
+            else:
+                entry = self.latest_scan
+            if not entry:
                 return None
-            age = time.time() - self.latest_scan.get("received_at", 0)
+            age = time.time() - entry.get("received_at", 0)
             if age <= window_seconds:
-                return self.latest_scan.copy()
+                return entry.copy()
             return None
 
     def verify_coincident_tag(
@@ -222,15 +293,24 @@ class TagRuntimeService:
         Acceptance window:
             [weight_event_timestamp - window_seconds,
              weight_event_timestamp + 3.0]
+
+        When expected_station_id is provided and a station->reader mapping
+        exists, only the scan from that station's dedicated reader is checked.
         """
+        reader_id = self._reader_id_for_station(expected_station_id)
         with self.latest_scan_lock:
-            if not self.latest_scan:
+            if reader_id:
+                entry = self._latest_scans_by_reader.get(reader_id)
+            else:
+                entry = self.latest_scan
+
+            if not entry:
                 return {
                     "success": False,
                     "reason": "No tag scan on record"
                 }
 
-            scan_time    = self.latest_scan.get("received_at", 0)
+            scan_time    = entry.get("received_at", 0)
             window_start = weight_event_timestamp - window_seconds
             window_end   = weight_event_timestamp + 3.0
 
@@ -244,7 +324,7 @@ class TagRuntimeService:
                     )
                 }
 
-            scan_msg = self.latest_scan["scan_msg"]
+            scan_msg = entry["scan_msg"]
             tag_uid  = scan_msg.get("tag_uid")
 
         # Resolve medicine record: database first, tag payload fallback

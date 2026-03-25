@@ -85,16 +85,21 @@ class RegistrationManager:
             self.logger.info("Registration disabled, skipping onboarding")
             return True
 
-        registered       = self.database.list_registered_medicines()
-        registered_ids   = {r["medicine_id"] for r in registered}
-        registered_count = len(registered)
+        # Count only medicines registered to THIS station so that a completed
+        # station does not prevent a second station from being onboarded.
+        all_registered   = self.database.list_registered_medicines()
+        station_records  = [r for r in all_registered
+                            if r.get("station_id") == station_id]
+        registered_ids   = {r["medicine_id"] for r in station_records}
+        registered_count = len(station_records)
 
         if registered_count >= expected_medicine_count:
             self.logger.info(
-                f"All {expected_medicine_count} medicines already registered"
+                f"All {expected_medicine_count} medicine(s) already registered "
+                f"for {station_id}"
             )
             # Ensure scanner is off if we skip onboarding entirely
-            self.tag_runtime_service.stop_scanning()
+            self.tag_runtime_service.stop_scanning(station_id)
             return True
 
         remaining = expected_medicine_count - registered_count
@@ -117,12 +122,15 @@ class RegistrationManager:
                 return False
 
             # Refresh the set after each successful registration
-            registered     = self.database.list_registered_medicines()
-            registered_ids = {r["medicine_id"] for r in registered}
+            all_registered = self.database.list_registered_medicines()
+            registered_ids = {r["medicine_id"] for r in all_registered
+                              if r.get("station_id") == station_id}
 
         # All slots done - belt-and-suspenders final stop
-        self.tag_runtime_service.stop_scanning()
-        self.logger.info("Onboarding complete. Tag scanning stopped.")
+        self.tag_runtime_service.stop_scanning(station_id)
+        self.logger.info(
+            f"Onboarding complete for {station_id}. Tag scanning stopped."
+        )
         return True
 
     # ------------------------------------------------------------------
@@ -156,7 +164,7 @@ class RegistrationManager:
         # ----------------------------------------------------------------
         # START scanning for this slot
         # ----------------------------------------------------------------
-        self.tag_runtime_service.start_scanning()
+        self.tag_runtime_service.start_scanning(station_id)
         self.logger.info(f"Tag scanning STARTED for onboarding slot {slot_number}")
 
         # ---- Guide the user ----
@@ -207,7 +215,7 @@ class RegistrationManager:
             break
         else:
             self._timeout(station_id)
-            self.tag_runtime_service.stop_scanning()   # stop on timeout
+            self.tag_runtime_service.stop_scanning(station_id)   # stop on timeout
             return False
 
         # ---- Phase B: find tag scan ----
@@ -226,7 +234,7 @@ class RegistrationManager:
             if self.display:
                 self.display.update()
 
-            latest = self.tag_runtime_service.get_latest_scan()
+            latest = self.tag_runtime_service.get_latest_scan(station_id)
 
             if not latest or latest.get("received_at", 0) < lookback_from:
                 time.sleep(0.3)
@@ -249,7 +257,7 @@ class RegistrationManager:
                     station_id,
                     "Tag detected but unreadable - keep bottle still..."
                 )
-                self.tag_runtime_service.clear_latest_scan()
+                self.tag_runtime_service.clear_latest_scan(station_id)
                 time.sleep(0.5)
                 continue
 
@@ -263,7 +271,7 @@ class RegistrationManager:
                 self.audio.speak(
                     "No tag detected. Please check the sticker and try again."
                 )
-            self.tag_runtime_service.stop_scanning()   # stop on no-tag failure
+            self.tag_runtime_service.stop_scanning(station_id)   # stop on no-tag failure
             time.sleep(2.0)
             return False
 
@@ -273,7 +281,7 @@ class RegistrationManager:
             self._update_screen(station_id, "Tag unreadable - check sticker content")
             if self.audio:
                 self.audio.speak("Tag could not be read. Please check the sticker.")
-            self.tag_runtime_service.stop_scanning()   # stop on bad record
+            self.tag_runtime_service.stop_scanning(station_id)   # stop on bad record
             time.sleep(2.0)
             return False
 
@@ -296,7 +304,7 @@ class RegistrationManager:
                     f"Please place a different medicine bottle."
                 )
             # Stop scanning while the patient swaps bottles, then retry
-            self.tag_runtime_service.stop_scanning()
+            self.tag_runtime_service.stop_scanning(station_id)
             time.sleep(3.0)
             return self._onboard_one_medicine(
                 station_id, slot_number, total, registered_ids, scheduler
@@ -306,7 +314,7 @@ class RegistrationManager:
         ok = self.database.upsert_registered_medicine(record)
         if not ok:
             self.logger.error(f"Database write failed for {medicine_id}")
-            self.tag_runtime_service.stop_scanning()   # stop on DB failure
+            self.tag_runtime_service.stop_scanning(station_id)   # stop on DB failure
             return False
 
         # ---- Capture baseline ----
@@ -365,7 +373,7 @@ class RegistrationManager:
         if slot_number < total:
             # STOP scanning BEFORE asking the patient to remove the current
             # bottle so we do not capture its tag as the next slot's scan.
-            self.tag_runtime_service.stop_scanning()
+            self.tag_runtime_service.stop_scanning(station_id)
             self.logger.info(
                 f"Tag scanning STOPPED after slot {slot_number} "
                 f"- waiting for bottle swap"
@@ -398,7 +406,7 @@ class RegistrationManager:
                 )
 
             # Clear stale scan buffer before the next slot's start_scanning()
-            self.tag_runtime_service.clear_latest_scan()
+            self.tag_runtime_service.clear_latest_scan(station_id)
             time.sleep(1.0)
 
         # For the FINAL slot, stop_scanning() is called by

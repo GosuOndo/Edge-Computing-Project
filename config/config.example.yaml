@@ -40,7 +40,19 @@ mqtt:
 weight_sensors:
   station_1:
     id: "station_1"
+    tag_reader_id: "tag_reader_1"   # RFID reader mounted under this station's scale
     medicine_name: "Aspirin 100mg"  # updated automatically on registration
+    pill_weight_mg: 290             # calibrated: 2 pills = ~0.58g delta -> 290mg each
+    threshold_stable_g: 0.05        # stability threshold
+    threshold_delta_g: 0.22         # minimum change to consider a delta
+    event_settle_seconds: 1.5       # how long weight must be stable before firing
+    event_cooldown_seconds: 2.0     # minimum gap between two events
+    min_delta_g: 0.20               # below this = scale noise, not a pill removal
+
+  station_2:
+    id: "station_2"
+    tag_reader_id: "tag_reader_2"   # RFID reader mounted under this station's scale
+    medicine_name: "Paracetamol 500mg"  # updated automatically on registration
     pill_weight_mg: 290             # calibrated: 2 pills = ~0.58g delta -> 290mg each
     threshold_stable_g: 0.05        # stability threshold
     threshold_delta_g: 0.22         # minimum change to consider a delta
@@ -76,6 +88,11 @@ identity:
     # Tag scan arrives when bottle touches reader (before weight settles),
     # so the scan is typically 1-5s older than the weight event timestamp.
     coincident_window_seconds: 15.0
+    # Per-station MQTT command topics for scan gate control (start_scan / stop_scan).
+    # Keys must match the station ids defined in weight_sensors above.
+    command_topics:
+      station_1: "medication/tag/command/tag_reader_1"
+      station_2: "medication/tag/command/tag_reader_2"
     # Legacy active-wait settings (used only if integrated_mode: false)
     max_attempts: 1
     attempt_timeout_seconds: 3
@@ -137,6 +154,11 @@ schedule:
   medications:
     - name: "Aspirin 100mg"
       station_id: "station_1"
+      dosage_pills: 2
+      times: ["08:00", "20:00"]
+
+    - name: "Paracetamol 500mg"
+      station_id: "station_2"
       dosage_pills: 2
       times: ["08:00", "20:00"]
 
