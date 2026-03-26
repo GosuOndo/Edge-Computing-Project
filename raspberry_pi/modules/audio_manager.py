@@ -16,8 +16,6 @@ class AudioManager:
         self.pitch = int(config.get("pitch", 45))
 
         self.initialized = False
-        # Non-blocking lock: if audio is already playing, new requests are
-        # dropped instead of queuing up and fighting over the ALSA device.
         self._audio_lock = threading.Lock()
 
     def initialize(self):
@@ -26,21 +24,23 @@ class AudioManager:
             return True
 
         try:
-            result = subprocess.run(
-                ["which", "espeak"],
-                capture_output=True,
-                text=True,
-                check=False
-            )
-            if result.returncode != 0:
-                self.logger.error("Audio init failed: espeak not found")
-                self.initialized = False
-                return False
+            for tool_name in ["espeak", "ffmpeg", "aplay"]:
+                result = subprocess.run(
+                    ["which", tool_name],
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                if result.returncode != 0:
+                    self.logger.error(f"Audio init failed: {tool_name} not found")
+                    self.initialized = False
+                    return False
 
             self.initialized = True
             self.logger.info(
-                f"Audio manager initialized (voice={self.voice}, "
-                f"speed={self.speed}, pitch={self.pitch})"
+                "Audio manager initialized successfully using "
+                f"espeak -> ffmpeg -> aplay "
+                f"(voice={self.voice}, speed={self.speed}, pitch={self.pitch})"
             )
             return True
 
@@ -54,11 +54,8 @@ class AudioManager:
             self.logger.warning("Audio speak skipped: audio not initialized")
             return
 
-        # If audio is already playing, skip this request rather than pile up
-        # threads that all compete for the ALSA device (causes error 524 /
-        # broken pipe on the Raspberry Pi).
         if not self._audio_lock.acquire(blocking=False):
-            self.logger.debug(f"Audio busy, skipping: {text}")
+            self.logger.info(f"Audio busy, skipping: {text}")
             return
 
         try:
@@ -68,16 +65,10 @@ class AudioManager:
 
             quoted_text = shlex.quote(safe_text)
 
-            # Use espeak's built-in audio output directly.
-            # The old pipeline (espeak --stdout | ffmpeg | aplay) caused
-            # "aplay: Unknown error 524" (ALSA ESTRPIPE) because aplay
-            # could not open the device when PulseAudio/PipeWire is running
-            # or the ALSA stream is suspended. espeak without --stdout plays
-            # through its own PortAudio backend which handles all of this
-            # automatically. -a 200 sets amplitude to maximum.
             cmd = (
-                f"espeak -v {self.voice} -s {self.speed} "
-                f"-p {self.pitch} -a 200 {quoted_text}"
+                f"espeak -v {self.voice} -s {self.speed} -p {self.pitch} --stdout {quoted_text} "
+                f"| ffmpeg -loglevel error -i pipe:0 -ar 48000 -ac 2 -f wav - "
+                f"| aplay"
             )
 
             self.logger.info(f"SPEAKING: {safe_text}")
