@@ -86,6 +86,16 @@ class MedicationSystem:
         )
         self._last_security_violation_message = None
         self._last_idle_minute           = None
+
+        # ------------------------------------------------------------------
+        # Dosage retry state
+        # Per station, tracks how many pills have been cumulatively detected
+        # in the current dose window and how many attempts have been made.
+        # Both are reset when a new reminder fires or the cycle ends.
+        # ------------------------------------------------------------------
+        self._MAX_DOSAGE_ATTEMPTS  = 3
+        self._dose_pills_removed: dict = {}   # station_id -> int cumulative
+        self._dose_attempt_count: dict = {}   # station_id -> int attempts used
         
         self._initialize_modules()
 
@@ -724,8 +734,9 @@ class MedicationSystem:
         self.weight_manager.process_weight_data(data)
 
     def _on_pill_removal(self, event_data: dict):
+        pills_this_event = int(event_data.get("pills_removed", 0))
         self.logger.info(
-            f"Pill removal detected: {event_data['pills_removed']} pill(s) "
+            f"Pill removal detected: {pills_this_event} pill(s) "
             f"from {event_data['station_id']}"
         )
         if self.state_machine.get_state() != SystemState.REMINDER_ACTIVE:
@@ -735,6 +746,16 @@ class MedicationSystem:
             self.current_medication
             and self.current_medication.get("station_id") == station_id
         ):
+            # Accumulate across multiple lift-and-replace events within the
+            # same dose window so partial doses (e.g. 1 pill at a time) are
+            # counted correctly toward the total required.
+            prev = self._dose_pills_removed.get(station_id, 0)
+            self._dose_pills_removed[station_id] = prev + pills_this_event
+            self.logger.info(
+                f"Dose window total for {station_id}: "
+                f"{self._dose_pills_removed[station_id]} pill(s) "
+                f"(+{pills_this_event} this event)"
+            )
             self.pending_weight_event = event_data
             self.logger.info("Weight event queued for main-thread processing")
 
@@ -785,6 +806,10 @@ class MedicationSystem:
         self.logger.info(f"Medication reminder triggered: {reminder_data}")
         self.current_medication = reminder_data
         station_id = reminder_data["station_id"]
+
+        # Fresh dose window – clear any leftover state from a previous cycle.
+        self._dose_pills_removed[station_id] = 0
+        self._dose_attempt_count[station_id] = 0
 
         medicine_id = reminder_data.get("medicine_id") or \
             self._resolve_medicine_id_for_station(
@@ -957,12 +982,52 @@ class MedicationSystem:
                 f"Checking pill count for {medicine_name}"
             )
 
+        # Per-event weight check (used for the raw delta / pill_weight metadata).
         weight_result = self.weight_manager.verify_dosage(
             expected_station_id, expected_dosage
         )
-        self.logger.info(f"Weight verification: {weight_result}")
+        self.logger.info(f"Weight verification (per-event): {weight_result}")
 
-        # HARD STOP on identity failure
+        # Build a cumulative weight result that reflects all pills removed
+        # during this dose window (across every lift-and-replace cycle).
+        cumulative_pills = self._dose_pills_removed.get(expected_station_id, 0)
+        pill_weight_g    = float(
+            weight_result.get("pill_weight_g")
+            or self.weight_manager._get_pill_weight_g(expected_station_id)
+        )
+        cum_delta_g      = cumulative_pills * pill_weight_g
+        exp_delta_g      = expected_dosage  * pill_weight_g
+        cum_delta_err    = abs(cum_delta_g - exp_delta_g)
+        tolerance_g      = float(
+            self.weight_manager.station_configs
+            .get(expected_station_id, {})
+            .get("dose_verification_tolerance_g", 0.12)
+        )
+        cumulative_weight_result = dict(weight_result)
+        cumulative_weight_result.update({
+            "actual":           cumulative_pills,
+            "weight_change_g":  round(cum_delta_g,  3),
+            "expected_delta_g": round(exp_delta_g,  3),
+            "delta_error_g":    round(cum_delta_err, 3),
+            "difference":       abs(cumulative_pills - expected_dosage),
+            "verified":         (
+                cumulative_pills == expected_dosage
+                and cum_delta_err <= tolerance_g
+            ),
+            "status": (
+                "correct"
+                if cumulative_pills == expected_dosage and cum_delta_err <= tolerance_g
+                else "incorrect"
+            ),
+        })
+        self.logger.info(
+            f"Cumulative dosage check: {cumulative_pills}/{expected_dosage} pills "
+            f"(delta_err={cum_delta_err:.3f}g, verified={cumulative_weight_result['verified']})"
+        )
+
+        # ------------------------------------------------------------------
+        # HARD STOP: identity failed
+        # ------------------------------------------------------------------
         if identity_result and not identity_result.get("success", False):
             self.logger.warning(
                 "Stopping pipeline early due to identity mismatch/failure"
@@ -972,35 +1037,143 @@ class MedicationSystem:
                 expected_dosage=expected_dosage,
                 identity_result=identity_result,
                 ocr_result=None,
-                weight_result=weight_result,
+                weight_result=cumulative_weight_result,
                 monitoring_result=None
             )
             self._handle_decision(decision)
             self.database.log_medication_event(decision)
-
             time.sleep(3)
             self._end_verification_cycle(expected_station_id)
             return
 
-        # HARD STOP on wrong dosage
-        if not weight_result.get("verified", False):
+        # ------------------------------------------------------------------
+        # DOSAGE CHECK with retry
+        # ------------------------------------------------------------------
+        if not cumulative_weight_result.get("verified", False):
+            attempt = self._dose_attempt_count.get(expected_station_id, 0) + 1
+            self._dose_attempt_count[expected_station_id] = attempt
+
+            # ---- Overdose: took more pills than required ----
+            if cumulative_pills > expected_dosage:
+                self.logger.warning(
+                    f"Overdose detected: {cumulative_pills} pills taken, "
+                    f"{expected_dosage} required"
+                )
+                if self.display:
+                    self.display.show_overdose_screen(
+                        medicine_name, cumulative_pills, expected_dosage
+                    )
+                if self.audio:
+                    self.audio.announce_warning(
+                        f"Too many pills detected. "
+                        f"You took {cumulative_pills} but only {expected_dosage} "
+                        f"are required. Please contact your caregiver."
+                    )
+                self.telegram.send_incorrect_dosage_alert(
+                    medicine_name=medicine_name,
+                    expected=expected_dosage,
+                    actual=cumulative_pills
+                )
+                decision = self.decision_engine.verify_medication_intake(
+                    expected_medicine=medicine_name,
+                    expected_dosage=expected_dosage,
+                    identity_result=identity_result,
+                    ocr_result=ocr_result,
+                    weight_result=cumulative_weight_result,
+                    monitoring_result=None
+                )
+                self.database.log_medication_event(decision)
+                time.sleep(5)
+                self._end_verification_cycle(expected_station_id)
+                return
+
+            # ---- Under-dose: took fewer pills than required ----
+            remaining = expected_dosage - cumulative_pills
             self.logger.warning(
-                "Stopping pipeline early due to incorrect dosage"
+                f"Under-dose: {cumulative_pills}/{expected_dosage} pills detected "
+                f"(attempt {attempt}/{self._MAX_DOSAGE_ATTEMPTS})"
             )
-            decision = self.decision_engine.verify_medication_intake(
-                expected_medicine=medicine_name,
-                expected_dosage=expected_dosage,
-                identity_result=identity_result,
-                ocr_result=ocr_result,
-                weight_result=weight_result,
-                monitoring_result=None
-            )
-            self._handle_decision(decision)
-            self.database.log_medication_event(decision)
 
-            time.sleep(3)
-            self._end_verification_cycle(expected_station_id)
+            # Exhausted all retries – log and abort.
+            if attempt >= self._MAX_DOSAGE_ATTEMPTS:
+                self.logger.error(
+                    f"Dosage not corrected after {self._MAX_DOSAGE_ATTEMPTS} attempts"
+                )
+                if self.display:
+                    self.display.show_warning_screen(
+                        "Incorrect Dosage",
+                        f"You took {cumulative_pills} pill(s) but "
+                        f"{expected_dosage} are required.\n"
+                        "Maximum attempts reached. Your caregiver has been notified."
+                    )
+                if self.audio:
+                    self.audio.announce_warning(
+                        f"Incorrect dosage after {self._MAX_DOSAGE_ATTEMPTS} attempts. "
+                        "Your caregiver has been notified."
+                    )
+                self.telegram.send_incorrect_dosage_alert(
+                    medicine_name=medicine_name,
+                    expected=expected_dosage,
+                    actual=cumulative_pills
+                )
+                decision = self.decision_engine.verify_medication_intake(
+                    expected_medicine=medicine_name,
+                    expected_dosage=expected_dosage,
+                    identity_result=identity_result,
+                    ocr_result=ocr_result,
+                    weight_result=cumulative_weight_result,
+                    monitoring_result=None
+                )
+                self.database.log_medication_event(decision)
+                time.sleep(5)
+                self._end_verification_cycle(expected_station_id)
+                return
+
+            # Still have retries left – guide the patient to correct the dose.
+            if self.display:
+                self.display.show_dosage_retry_screen(
+                    medicine_name=medicine_name,
+                    taken=cumulative_pills,
+                    required=expected_dosage,
+                    attempt=attempt,
+                    max_attempts=self._MAX_DOSAGE_ATTEMPTS,
+                )
+            if self.audio:
+                pill_word = "pill" if remaining == 1 else "pills"
+                self.audio.announce_warning(
+                    f"Incorrect dosage. You have taken {cumulative_pills} "
+                    f"out of {expected_dosage} pills. "
+                    f"Please take {remaining} more {pill_word}."
+                )
+
+            self.logger.info(
+                f"Returning to REMINDER_ACTIVE for retry "
+                f"(attempt {attempt}/{self._MAX_DOSAGE_ATTEMPTS})"
+            )
+
+            # Hold the retry screen briefly so the patient can read it,
+            # then return to the reminder screen and re-arm for the next event.
+            time.sleep(4)
+
+            # Reset state so the next pill-removal event is accepted.
+            self.state_machine.transition_to(
+                SystemState.REMINDER_ACTIVE,
+                self.current_medication
+            )
+            time_str = self.current_medication.get("scheduled_time", "")
+            if self.display:
+                self.display.show_reminder_screen(
+                    medicine_name, expected_dosage, time_str
+                )
+            # Weight detection stays armed (already enabled); tag scanning
+            # re-starts automatically via _on_bottle_lifted when the patient
+            # lifts the bottle for their next attempt.
             return
+
+        # Cumulative dosage is correct – proceed to patient monitoring.
+        # Replace the per-event weight_result with the cumulative one so the
+        # decision engine sees the accurate total.
+        weight_result = cumulative_weight_result
 
         if not self.running:
             return
@@ -1091,6 +1264,10 @@ class MedicationSystem:
         self.current_medication    = None
         self.pending_monitoring_ui = None
         self._last_security_violation_message = None
+
+        # Clear per-dose retry counters for this station.
+        self._dose_pills_removed.pop(station_id, None)
+        self._dose_attempt_count.pop(station_id, None)
 
         # Stop scanning - scanning resumes the next time the bottle is lifted
         self.tag_runtime_service.stop_scanning()

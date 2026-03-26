@@ -582,6 +582,137 @@ class DisplayManager:
             pygame.display.flip()
 
     # ------------------------------------------------------------------
+    # Dosage retry screen
+    # ------------------------------------------------------------------
+
+    def show_dosage_retry_screen(
+        self,
+        medicine_name: str,
+        taken: int,
+        required: int,
+        attempt: int,
+        max_attempts: int,
+    ):
+        """
+        Shown when the patient has removed the wrong number of pills and a
+        retry is available.
+
+        Parameters
+        ----------
+        medicine_name : display name of the medicine
+        taken         : cumulative pills detected so far this dose window
+        required      : total pills required for the dose
+        attempt       : current attempt number (1-based)
+        max_attempts  : maximum attempts allowed before aborting
+        """
+        if not self.initialized:
+            return
+
+        remaining = required - taken
+
+        with self.screen_lock:
+            self._draw_frame("INCORRECT DOSAGE", 'warning')
+            self._draw_card('warning')
+
+            cy = self._card_text_y(10)
+
+            # Medicine name
+            self._draw_text(medicine_name, 'large', 'text_dark',
+                            self.width // 2, cy, center=True)
+
+            # Pill count summary bar
+            bar_y = cy + 72
+            cell_w = 64
+            cell_h = 64
+            gap    = 12
+            total_bar_w = required * cell_w + (required - 1) * gap
+            bar_x = (self.width - total_bar_w) // 2
+
+            for i in range(required):
+                x = bar_x + i * (cell_w + gap)
+                color = 'success' if i < taken else 'text_light'
+                self._draw_rect(color, x, bar_y, cell_w, cell_h, radius=10)
+                label = str(i + 1)
+                self._draw_text(label, 'normal', 'white',
+                                x + cell_w // 2, bar_y + cell_h // 2, center=True)
+
+            # Counts
+            count_y = bar_y + cell_h + 22
+            self._draw_text(
+                f"Detected:  {taken} pill(s)   |   Required:  {required} pill(s)",
+                'normal', 'text_light', self.width // 2, count_y, center=True
+            )
+
+            # Main instruction
+            instr_y = count_y + 52
+            if remaining > 0:
+                instr = (
+                    f"Please take  {remaining}  more pill(s)"
+                    if remaining > 1
+                    else "Please take  1  more pill"
+                )
+            else:
+                instr = "Correct amount detected - please wait..."
+            self._draw_text(instr, 'medium', 'primary',
+                            self.width // 2, instr_y, center=True)
+
+            # Attempt counter
+            attempt_y = instr_y + 52
+            dots = "  ".join(
+                ("●" if i < attempt else "○") for i in range(max_attempts)
+            )
+            self._draw_text(
+                f"Attempt  {attempt} / {max_attempts}    {dots}",
+                'small', 'text_light', self.width // 2, attempt_y, center=True
+            )
+
+            self._draw_footer(
+                "Lift the bottle  |  Take the correct number  |  Replace the bottle",
+                'warning'
+            )
+            pygame.display.flip()
+
+    # ------------------------------------------------------------------
+    # Overdose / too-many-pills screen
+    # ------------------------------------------------------------------
+
+    def show_overdose_screen(
+        self,
+        medicine_name: str,
+        taken: int,
+        required: int,
+    ):
+        """Shown when more pills than required have been detected."""
+        if not self.initialized:
+            return
+        with self.screen_lock:
+            self._draw_frame("TOO MANY PILLS", 'error')
+            self._draw_card('error')
+
+            cy = self._card_text_y(20)
+            self._draw_text(medicine_name, 'large', 'text_dark',
+                            self.width // 2, cy, center=True)
+
+            self._draw_text(
+                f"Detected  {taken}  pill(s)  —  only  {required}  required",
+                'medium', 'error', self.width // 2, cy + 80, center=True
+            )
+
+            self._draw_text(
+                "Do NOT take more medication.",
+                'medium', 'text_dark', self.width // 2, cy + 140, center=True
+            )
+            self._draw_text(
+                "Your caregiver will be notified immediately.",
+                'normal', 'text_light', self.width // 2, cy + 192, center=True
+            )
+
+            self._draw_footer(
+                "Please contact your caregiver.", 'error'
+            )
+            pygame.display.flip()
+
+    # ------------------------------------------------------------------
     # Warning / verification-failed screen
     # ------------------------------------------------------------------
 
