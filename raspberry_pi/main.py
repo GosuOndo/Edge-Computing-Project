@@ -972,8 +972,11 @@ class MedicationSystem:
     def _render_pending_monitoring_ui(self):
         if not self.display or not self.pending_monitoring_ui:
             return
-        elapsed, duration, message = self.pending_monitoring_ui
-        self.display.show_monitoring_screen(elapsed, duration, message)
+        elapsed, duration, message, swallow_count, expected_dosage = \
+            self.pending_monitoring_ui
+        self.display.show_monitoring_screen(
+            elapsed, duration, message, swallow_count, expected_dosage
+        )
 
     # ------------------------------------------------------------------
     # Reminder / missed-dose callbacks
@@ -1357,18 +1360,22 @@ class MedicationSystem:
 
         self.logger.info("Starting patient monitoring (30 seconds)...")
         self.state_machine.transition_to(SystemState.MONITORING_PATIENT)
-        self.pending_monitoring_ui = (0, 30, "Monitoring intake...")
+        # Tuple: (elapsed, duration, message, live_swallow_count, expected_dosage)
+        self.pending_monitoring_ui = (0, 30, "Monitoring intake...", 0, expected_dosage)
         monitoring_result = None
 
         if self.display:
-            self.display.show_pipeline_screen(
-                "Patient Monitoring",
-                "Please bring hand to mouth and swallow naturally"
+            self.display.show_monitoring_screen(
+                0, 30, "Monitoring intake...", 0, expected_dosage
             )
 
         try:
             def progress_callback(detections, elapsed, duration):
-                self.pending_monitoring_ui = (elapsed, duration, "Monitoring intake...")
+                live_count = int(detections.get("swallow_count", 0))
+                self.pending_monitoring_ui = (
+                    elapsed, duration, "Monitoring intake...",
+                    live_count, expected_dosage
+                )
 
             started = self.patient_monitor.start_monitoring(
                 duration=30, callback=progress_callback
@@ -1394,7 +1401,9 @@ class MedicationSystem:
 
                 monitoring_result = self.patient_monitor.get_results()
                 self.logger.info(
-                    f"Monitoring complete: {monitoring_result['compliance_status']}"
+                    f"Monitoring complete: "
+                    f"status={monitoring_result['compliance_status']}  "
+                    f"swallows={monitoring_result.get('swallow_count', 0)}"
                 )
 
         except Exception as e:
@@ -1405,6 +1414,31 @@ class MedicationSystem:
                 "cough_count":       0,
                 "hand_motion_count": 0
             }
+
+        # ------------------------------------------------------------------
+        # Intake count vs expected dosage check
+        # ------------------------------------------------------------------
+        final_swallow_count = int(monitoring_result.get("swallow_count", 0))
+        if final_swallow_count < expected_dosage:
+            self.logger.warning(
+                f"Intake mismatch: {final_swallow_count} swallow(s) detected, "
+                f"~{expected_dosage} expected for {medicine_name}"
+            )
+            if self.display:
+                self.display.show_intake_mismatch_screen(
+                    medicine_name=medicine_name,
+                    swallow_count=final_swallow_count,
+                    expected_dosage=expected_dosage,
+                )
+            if self.audio:
+                pill_word = "pill" if expected_dosage == 1 else "pills"
+                self.audio.announce_warning(
+                    f"Only {final_swallow_count} swallow detected "
+                    f"out of approximately {expected_dosage} expected for "
+                    f"{expected_dosage} {pill_word} of {medicine_name}. "
+                    "Medication intake may be incomplete."
+                )
+            time.sleep(4)   # hold mismatch screen briefly before verdict
 
         if not self.running:
             return

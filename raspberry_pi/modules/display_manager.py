@@ -537,45 +537,162 @@ class DisplayManager:
     # Monitoring screen
     # ------------------------------------------------------------------
 
-    def show_monitoring_screen(self, elapsed: float, duration: float,
-                                message: str = "Monitoring intake..."):
+    def show_monitoring_screen(
+        self,
+        elapsed: float,
+        duration: float,
+        message: str = "Monitoring intake...",
+        swallow_count: int = 0,
+        expected_dosage: int = 0,
+    ):
         if not self.initialized:
             return
         with self.screen_lock:
             self._draw_frame("MONITORING INTAKE", 'secondary')
             self._draw_card('secondary')
 
-            cy = self._card_text_y(10)
-            self._draw_text(message, 'medium', 'text_dark',
-                            self.width // 2, cy, center=True)
+            cy = self._card_text_y(8)
 
+            # Instruction line
             self._draw_text(
-                "Bring your hand to your mouth and open your mouth clearly",
-                'normal', 'text_light', self.width // 2, cy + 52, center=True
+                "Bring your hand to your mouth and swallow naturally",
+                'normal', 'text_light', self.width // 2, cy, center=True
             )
 
+            # ----------------------------------------------------------
+            # Live swallow counter row
+            # ----------------------------------------------------------
+            counter_y = cy + 44
+
+            if expected_dosage > 0:
+                # Dot indicators – filled (success) for detected, hollow for pending
+                dot_r    = 18
+                dot_gap  = 16
+                n        = expected_dosage
+                total_w  = n * (dot_r * 2) + (n - 1) * dot_gap
+                dot_x0   = (self.width - total_w) // 2
+
+                for i in range(n):
+                    cx_dot = dot_x0 + i * (dot_r * 2 + dot_gap) + dot_r
+                    if i < swallow_count:
+                        color = self.colors['success']
+                        pygame.draw.circle(
+                            self.screen, color, (cx_dot, counter_y), dot_r
+                        )
+                    else:
+                        pygame.draw.circle(
+                            self.screen, self.colors['text_light'],
+                            (cx_dot, counter_y), dot_r, 2
+                        )
+
+                count_color = (
+                    'success' if swallow_count >= expected_dosage else
+                    'warning' if swallow_count > 0 else
+                    'text_light'
+                )
+                self._draw_text(
+                    f"Swallows detected:  {swallow_count}  /  {expected_dosage}",
+                    'medium', count_color,
+                    self.width // 2, counter_y + dot_r + 28, center=True
+                )
+            else:
+                # No expected dosage info – just show raw count
+                self._draw_text(
+                    f"Swallows detected:  {swallow_count}",
+                    'medium', 'secondary',
+                    self.width // 2, counter_y, center=True
+                )
+
+            # ----------------------------------------------------------
             # Progress bar
+            # ----------------------------------------------------------
             bar_w = 700
             bar_x = (self.width - bar_w) // 2
-            bar_y = cy + 120
-            self._draw_rect('text_light', bar_x, bar_y, bar_w, 36, radius=18)
+            bar_y = counter_y + (dot_r + 28 + 52 if expected_dosage > 0 else 60)
+            self._draw_rect('text_light', bar_x, bar_y, bar_w, 28, radius=14)
             progress = min(elapsed / duration, 1.0) if duration > 0 else 0
             fill_w   = int(bar_w * progress)
             if fill_w > 0:
                 pygame.draw.rect(
                     self.screen, self.colors['secondary'],
-                    (bar_x, bar_y, fill_w, 36), border_radius=18
+                    (bar_x, bar_y, fill_w, 28), border_radius=14
                 )
-            self._draw_text(f"{int(progress * 100)}%", 'medium', 'text_dark',
-                            self.width // 2, bar_y + 52, center=True)
 
             remaining = max(0, int(duration - elapsed))
-            self._draw_text(f"{remaining} seconds remaining", 'medium', 'text_light',
-                            self.width // 2, bar_y + 100, center=True)
+            self._draw_text(
+                f"{remaining}s remaining  ({int(progress * 100)}%)",
+                'normal', 'text_light',
+                self.width // 2, bar_y + 44, center=True
+            )
 
             self._draw_footer(
                 "Please remain in front of the camera", 'secondary'
             )
+            pygame.display.flip()
+
+    # ------------------------------------------------------------------
+    # Intake mismatch screen (post-monitoring, before verdict)
+    # ------------------------------------------------------------------
+
+    def show_intake_mismatch_screen(
+        self,
+        medicine_name: str,
+        swallow_count: int,
+        expected_dosage: int,
+    ):
+        """
+        Shown when the detected swallow count is less than the expected
+        dosage after patient monitoring completes.
+        """
+        if not self.initialized:
+            return
+        with self.screen_lock:
+            self._draw_frame("INCOMPLETE INTAKE", 'warning')
+            self._draw_card('warning')
+
+            cy = self._card_text_y(10)
+
+            self._draw_text(medicine_name, 'large', 'text_dark',
+                            self.width // 2, cy, center=True)
+
+            # Dot indicator row
+            dot_r   = 22
+            dot_gap = 18
+            n       = expected_dosage
+            total_w = n * (dot_r * 2) + (n - 1) * dot_gap
+            dot_x0  = (self.width - total_w) // 2
+            dot_y   = cy + 74
+
+            for i in range(n):
+                cx_dot = dot_x0 + i * (dot_r * 2 + dot_gap) + dot_r
+                if i < swallow_count:
+                    pygame.draw.circle(
+                        self.screen, self.colors['success'], (cx_dot, dot_y), dot_r
+                    )
+                else:
+                    pygame.draw.circle(
+                        self.screen, self.colors['error'],
+                        (cx_dot, dot_y), dot_r, 3
+                    )
+
+            self._draw_text(
+                f"Swallows detected:  {swallow_count}  /  ~{expected_dosage}  expected",
+                'medium', 'warning',
+                self.width // 2, dot_y + dot_r + 30, center=True
+            )
+
+            self._draw_text(
+                "Medication intake may be incomplete.",
+                'normal', 'text_dark',
+                self.width // 2, dot_y + dot_r + 82, center=True
+            )
+            self._draw_text(
+                "Caregiver will review the monitoring record.",
+                'normal', 'text_light',
+                self.width // 2, dot_y + dot_r + 118, center=True
+            )
+
+            self._draw_footer("Please contact your caregiver if unsure.", 'warning')
             pygame.display.flip()
 
     # ------------------------------------------------------------------
