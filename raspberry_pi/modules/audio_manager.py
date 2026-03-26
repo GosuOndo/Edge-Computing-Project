@@ -1,5 +1,6 @@
 """Audio Manager - offline speech and alerts for Raspberry Pi"""
 
+import queue
 import subprocess
 import threading
 
@@ -17,7 +18,13 @@ class AudioManager:
 
         self.initialized = False
         self.mixer_initialized = False
-        self._audio_lock = threading.Lock()
+
+        # Serial playback queue – items are (text, done_event | None).
+        # A single background worker thread drains the queue so that
+        # simultaneous callers are played one-after-another rather than the
+        # second one being dropped with "Audio busy".
+        self._speech_queue: queue.Queue = queue.Queue()
+        self._worker_thread: threading.Thread | None = None
 
     def initialize(self):
         if not self.enabled:
@@ -42,6 +49,15 @@ class AudioManager:
 
             self.initialized = True
             self.mixer_initialized = True
+
+            # Start the single serial-playback worker thread.
+            self._worker_thread = threading.Thread(
+                target=self._queue_worker,
+                name="audio-worker",
+                daemon=True,
+            )
+            self._worker_thread.start()
+
             self.logger.info(
                 "Audio manager initialized successfully using "
                 f"espeak -> aplay "
@@ -56,33 +72,49 @@ class AudioManager:
             self.mixer_initialized = False
             return False
 
-    def _speak_worker(self, text):
+    # ------------------------------------------------------------------
+    # Internal: worker thread + blocking espeak call
+    # ------------------------------------------------------------------
+
+    def _queue_worker(self):
+        """Drain the speech queue serially; runs on the audio-worker thread."""
+        while True:
+            item = self._speech_queue.get()
+            if item is None:          # sentinel – time to stop
+                self._speech_queue.task_done()
+                break
+            text, done_event = item
+            try:
+                self._speak_blocking(text)
+            finally:
+                self._speech_queue.task_done()
+                if done_event is not None:
+                    done_event.set()
+
+    def _speak_blocking(self, text: str):
+        """Run espeak → aplay synchronously on the calling thread."""
         if not self.initialized or not self.enabled:
             self.logger.warning("Audio speak skipped: audio not initialized")
             return
 
-        if not self._audio_lock.acquire(blocking=False):
-            self.logger.info(f"Audio busy, skipping: {text}")
+        safe_text = str(text).strip()
+        if not safe_text:
             return
 
+        self.logger.info(f"SPEAKING: {safe_text}")
+        espeak_cmd = [
+            "espeak",
+            "-v", str(self.voice),
+            "-s", str(self.speed),
+            "-p", str(self.pitch),
+            "--stdout",
+            safe_text,
+        ]
+        aplay_cmd = ["aplay", "-q"]
+        if self.output_device:
+            aplay_cmd.extend(["-D", str(self.output_device)])
+
         try:
-            safe_text = str(text).strip()
-            if not safe_text:
-                return
-
-            self.logger.info(f"SPEAKING: {safe_text}")
-            espeak_cmd = [
-                "espeak",
-                "-v", str(self.voice),
-                "-s", str(self.speed),
-                "-p", str(self.pitch),
-                "--stdout",
-                safe_text,
-            ]
-            aplay_cmd = ["aplay", "-q"]
-            if self.output_device:
-                aplay_cmd.extend(["-D", str(self.output_device)])
-
             espeak_proc = subprocess.Popen(
                 espeak_cmd,
                 stdout=subprocess.PIPE,
@@ -106,48 +138,55 @@ class AudioManager:
             aplay_stderr = aplay_proc.communicate()[1] or b""
             espeak_return = espeak_proc.wait()
 
-            class Result:
-                def __init__(self, returncode=0, stderr=""):
-                    self.returncode = returncode
-                    self.stderr = stderr
-
             error_parts = []
             if espeak_stderr:
                 error_parts.append(espeak_stderr.decode(errors="ignore").strip())
             if aplay_stderr:
                 error_parts.append(aplay_stderr.decode(errors="ignore").strip())
 
-            result = Result(
-                returncode=aplay_proc.returncode or espeak_return,
-                stderr=" | ".join(part for part in error_parts if part),
-            )
-            if result.returncode != 0:
-                error_message = result.stderr.strip() or "unknown audio backend error"
+            combined_rc = aplay_proc.returncode or espeak_return
+            if combined_rc != 0:
+                error_message = (
+                    " | ".join(p for p in error_parts if p)
+                    or "unknown audio backend error"
+                )
                 self.logger.error(f"Unable to play audio: {error_message}")
                 self.initialized = False
                 self.mixer_initialized = False
 
         except Exception as e:
             self.logger.error(f"Speak error: {e}")
-        finally:
-            self._audio_lock.release()
 
-    def speak(self, text, wait=True):
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def speak_async(self, text: str):
+        """
+        Enqueue *text* for playback and return immediately.
+        If another message is already playing it will be played afterwards –
+        nothing is dropped.
+        """
         if not self.initialized or not self.enabled:
             self.logger.warning("Audio speak skipped: audio not initialized")
             return
+        self._speech_queue.put((str(text), None))
 
+    def speak(self, text: str, wait: bool = True):
+        """
+        Speak *text*.  When *wait=True* (default) block until playback of
+        this specific message completes.  When *wait=False* behave like
+        speak_async.
+        """
+        if not self.initialized or not self.enabled:
+            self.logger.warning("Audio speak skipped: audio not initialized")
+            return
         if wait:
-            self._speak_worker(text)
+            done = threading.Event()
+            self._speech_queue.put((str(text), done))
+            done.wait()
         else:
-            threading.Thread(
-                target=self._speak_worker,
-                args=(text,),
-                daemon=True
-            ).start()
-
-    def speak_async(self, text):
-        self.speak(text, wait=False)
+            self.speak_async(text)
 
     def announce_reminder(self, medicine_name, dosage):
         self.speak_async(
@@ -166,8 +205,12 @@ class AudioManager:
         pass
 
     def stop(self):
-        pass
+        """Signal the worker thread to exit after finishing the current item."""
+        self._speech_queue.put(None)   # sentinel
 
     def cleanup(self):
+        self.stop()
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=5)
         self.mixer_initialized = False
         self.logger.info("Audio manager cleanup complete")

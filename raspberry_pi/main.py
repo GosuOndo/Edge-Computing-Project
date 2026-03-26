@@ -438,6 +438,11 @@ class MedicationSystem:
                 return True
             if secure_state.get("wrong_bottle_on_station", False):
                 return True
+            if (
+                secure_state.get("tamper_alert_sent", False)
+                and now_ts < secure_state.get("tamper_alert_until", 0)
+            ):
+                return True
 
         return False
 
@@ -446,18 +451,52 @@ class MedicationSystem:
             return "incorrect"
         if secure_state.get("early_alert_sent", False):
             return "missing"
+        if (
+            secure_state.get("tamper_alert_sent", False)
+            and time.time() < secure_state.get("tamper_alert_until", 0)
+        ):
+            return "tampered"
         return None
 
-    def _build_security_violation_message(self, issues: dict) -> str:
+    def _build_security_violation_key(self, issues: dict) -> str:
+        """
+        Build a stable string key from the issues dict so we can detect when
+        the set of violations changes and redraw only when necessary.
+        """
         parts = []
         for station_id in sorted(issues):
-            label = station_id.replace("_", " ").title()
-            issue = issues[station_id]
-            if issue == "incorrect":
-                parts.append(f"{label} wrong bottle")
-            elif issue == "missing":
-                parts.append(f"{label} missing bottle")
-        return " | ".join(parts)
+            parts.append(f"{station_id}:{issues[station_id]}")
+        return "|".join(parts)
+
+    def _build_security_violation_issues(self, issues: dict) -> list:
+        """
+        Enrich the bare {station_id: issue_type} dict with medicine name,
+        station label, and scheduled time so the display can show meaningful
+        context rather than just station IDs.
+        """
+        detailed = []
+        for station_id in sorted(issues):
+            secure_state   = self.secured_medications.get(station_id, {})
+            medicine_name  = secure_state.get("medicine_name", "Unknown medicine")
+            scheduled_time = secure_state.get("scheduled_time", "")
+            station_label  = station_id.replace("_", " ").title()
+            issue          = issues[station_id]
+
+            entry = {
+                "station_id":     station_id,
+                "station_label":  station_label,
+                "medicine_name":  medicine_name,
+                "issue":          issue,
+                "scheduled_time": scheduled_time,
+            }
+
+            # Carry tamper-specific detail so the display can show weight delta.
+            if issue == "tampered":
+                entry["tamper_delta_g"]   = secure_state.get("tamper_delta_g", 0.0)
+                entry["tamper_pills_est"] = secure_state.get("tamper_pills_est", "?")
+
+            detailed.append(entry)
+        return detailed
 
     def _refresh_security_violation_screen(self):
         issues = {}
@@ -479,20 +518,29 @@ class MedicationSystem:
                 issues[station_id] = issue
 
         if not issues:
-            self._last_security_violation_message = None
+            # All violations cleared – return to idle immediately if the
+            # alert screen was previously being shown.
+            if self._last_security_violation_message is not None:
+                self._last_security_violation_message = None
+                if getattr(self, "display", None):
+                    self._show_idle_screen()
+            else:
+                self._last_security_violation_message = None
             return
 
-        message = self._build_security_violation_message(issues)
-        if not message:
+        # Use a stable key to avoid unnecessary redraws.
+        key = self._build_security_violation_key(issues)
+        if not key:
             self._last_security_violation_message = None
             return
 
         if (
             getattr(self, "display", None)
-            and message != self._last_security_violation_message
+            and key != self._last_security_violation_message
         ):
-            self.display.show_error_screen(message)
-        self._last_security_violation_message = message
+            detailed = self._build_security_violation_issues(issues)
+            self.display.show_security_alert_screen(detailed)
+        self._last_security_violation_message = key
 
     def _prompt_return_bottle_to_station(self, secure_state: dict):
         station_id    = secure_state.get("station_id", "station")
@@ -506,6 +554,101 @@ class MedicationSystem:
 
         if getattr(self, "audio", None):
             self.audio.speak_async(message)
+
+    def _check_returned_bottle_weight(
+        self, secure_state: dict, returned_weight_g: float
+    ):
+        """
+        Compare *returned_weight_g* against the snapshot taken the moment the
+        bottle went missing.  A significant loss indicates pills may have been
+        removed while the bottle was off the station.
+
+        Outcome A – within tolerance  : log pass, update baseline, return.
+        Outcome B – exceeds tolerance : audio alert, Telegram to caregiver,
+                    mark tamper state so the security-alert screen stays visible
+                    for 30 s, update baseline to reflect actual bottle state.
+        """
+        station_id    = secure_state.get("station_id", "unknown")
+        medicine_name = secure_state.get("medicine_name", "Unknown")
+
+        reference_g = secure_state.get("pre_removal_weight_g")
+        if not reference_g or reference_g <= 0:
+            self.logger.info(
+                f"[{station_id}] No pre-removal weight snapshot — "
+                "skipping tamper check"
+            )
+            return
+
+        delta_g = reference_g - returned_weight_g   # positive = bottle is lighter
+
+        # Tamper threshold: station-level override, or half a pill weight
+        # (same heuristic used by WeightManager for noise rejection).
+        cfg         = self.weight_manager.station_configs.get(station_id, {})
+        threshold_g = float(
+            cfg.get("tamper_tolerance_g")
+            or self.weight_manager._get_min_delta_g(station_id)
+        )
+
+        self.logger.info(
+            f"[{station_id}] Tamper check: "
+            f"ref={reference_g:.2f}g  returned={returned_weight_g:.2f}g  "
+            f"delta={delta_g:.2f}g  threshold={threshold_g:.2f}g"
+        )
+
+        # Always bring the weight_manager baseline in line with what is
+        # physically on the scale now so future dose calculations are accurate.
+        if returned_weight_g > 0:
+            self.weight_manager.baseline_weights[station_id] = returned_weight_g
+            self.weight_manager._save_persisted_baselines()
+
+        if delta_g <= threshold_g:
+            self.logger.info(
+                f"[{station_id}] Tamper check PASSED — "
+                "returned weight within tolerance"
+            )
+            return
+
+        # ---- Weight discrepancy detected ----
+        pill_weight_g    = self.weight_manager._get_pill_weight_g(station_id)
+        estimated_pills  = (
+            max(1, round(delta_g / pill_weight_g))
+            if pill_weight_g > 0 else "unknown"
+        )
+        station_label = station_id.replace("_", " ").title()
+
+        self.logger.warning(
+            f"[{station_id}] TAMPER ALERT: {medicine_name} returned "
+            f"{delta_g:.2f}g lighter than pre-removal weight "
+            f"(~{estimated_pills} pill(s) potentially removed outside dose window)"
+        )
+
+        # Audio
+        if self.audio:
+            self.audio.speak_async(
+                f"Warning. {medicine_name} bottle weight does not match. "
+                f"Approximately {estimated_pills} pill may have been removed. "
+                "Your caregiver has been notified."
+            )
+
+        # Telegram caregiver alert
+        self.telegram.send_bottle_tampering_alert(
+            medicine_name=medicine_name,
+            station_id=station_id,
+            station_label=station_label,
+            reference_weight_g=reference_g,
+            returned_weight_g=returned_weight_g,
+            delta_g=delta_g,
+            estimated_pills_removed=estimated_pills,
+        )
+
+        # Flag tamper state – keeps the security-alert screen visible for 30 s
+        # via _get_station_security_issue / _has_pending_security_violation.
+        secure_state["tamper_alert_sent"]  = True
+        secure_state["tamper_alert_until"] = time.time() + 30
+        secure_state["tamper_delta_g"]     = round(delta_g, 2)
+        secure_state["tamper_pills_est"]   = estimated_pills
+        # Immediately refresh the security screen to show the tamper alert.
+        self._refresh_security_violation_screen()
 
     def _verify_returned_bottle(self, secure_state: dict):
         """
@@ -623,7 +766,21 @@ class MedicationSystem:
                     secure_state.pop("bottle_returned_at", None)
 
                     if correct:
-                        # Reset so future removals trigger alerts and scanning again
+                        # Identity confirmed – now check whether the returned
+                        # bottle weighs the same as when it was removed.  If the
+                        # reading is already stable we do it immediately;
+                        # otherwise we defer until the first stable reading.
+                        if status.get("stable", False):
+                            self._check_returned_bottle_weight(secure_state, weight_g)
+                            secure_state["tamper_check_pending"] = False
+                        else:
+                            self.logger.info(
+                                f"[{station_id}] Weight not yet stable – "
+                                "deferring tamper check to next stable reading"
+                            )
+                            secure_state["tamper_check_pending"] = True
+
+                        # Reset so future removals trigger alerts and scanning again.
                         secure_state["early_alert_sent"] = False
                         secure_state["present"] = True
                         secure_state["wrong_bottle_on_station"] = False
@@ -645,6 +802,16 @@ class MedicationSystem:
                     secure_state["present"] = True
                     if status.get("stable", False):
                         secure_state["current_weight_g"] = weight_g
+                        # Execute any deferred tamper check on the first stable
+                        # reading after the correct bottle was returned.
+                        if secure_state.get("tamper_check_pending", False):
+                            self._check_returned_bottle_weight(secure_state, weight_g)
+                            secure_state["tamper_check_pending"] = False
+                            if (
+                                getattr(self, "display", None)
+                                and not self._has_pending_security_violation()
+                            ):
+                                self._show_idle_screen()
                 continue
 
             # Bottle not present - clear flags so the next placement
@@ -656,6 +823,16 @@ class MedicationSystem:
             if secure_state.get("present", False) and not secure_state.get(
                 "early_alert_sent", False
             ):
+                # Snapshot the last known stable weight so we can compare it
+                # against the weight when the bottle is returned later.
+                secure_state["pre_removal_weight_g"] = secure_state.get("current_weight_g")
+                # Clear any stale tamper state from a previous removal cycle.
+                secure_state.pop("tamper_alert_sent",  None)
+                secure_state.pop("tamper_alert_until", None)
+                secure_state.pop("tamper_delta_g",     None)
+                secure_state.pop("tamper_pills_est",   None)
+                secure_state.pop("tamper_check_pending", None)
+
                 self._notify_unauthorized_bottle_movement(secure_state)
                 self._prompt_return_bottle_to_station(secure_state)
                 secure_state["early_alert_sent"]    = True
@@ -1479,7 +1656,16 @@ class MedicationSystem:
                         current_minute = datetime.now().strftime('%H:%M')
                         if current_minute != self._last_idle_minute:
                             self._last_idle_minute = current_minute
-                            self._show_idle_screen()
+                            # Only refresh to idle when there is no active
+                            # security alert being displayed.  The alert screen
+                            # stays visible until the issue is resolved; it is
+                            # re-evaluated every tick by
+                            # _process_secured_bottle_movements →
+                            # _refresh_security_violation_screen, which clears
+                            # _last_security_violation_message and calls
+                            # _show_idle_screen when violations are gone.
+                            if not self._has_pending_security_violation():
+                                self._show_idle_screen()
                 time.sleep(0.1)
 
         except KeyboardInterrupt:

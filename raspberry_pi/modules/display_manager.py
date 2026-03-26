@@ -100,15 +100,25 @@ class DisplayManager:
     # Low-level drawing helpers
     # ------------------------------------------------------------------
 
-    def _draw_text(self, text, font_key, color_key, x, y, center=False):
+    def _draw_text(self, text, font_key, color_key, x, y,
+                   center=False, right=False):
+        """
+        Render text onto the screen.
+
+        Alignment (pick at most one):
+          center=True  → x,y is the centre of the text box
+          right=True   → x is the right edge; y is the vertical centre
+          (neither)    → x,y is the top-left corner (default)
+        """
         font    = self.fonts[font_key]
         color   = self.colors[color_key]
         surface = font.render(str(text), True, color)
-        rect    = (
-            surface.get_rect(center=(x, y))
-            if center
-            else surface.get_rect(topleft=(x, y))
-        )
+        if center:
+            rect = surface.get_rect(center=(x, y))
+        elif right:
+            rect = surface.get_rect(midright=(x, y))
+        else:
+            rect = surface.get_rect(topleft=(x, y))
         self.screen.blit(surface, rect)
 
     def _draw_rect(self, color_key, x, y, w, h, radius=0):
@@ -215,13 +225,31 @@ class DisplayManager:
             time_str = datetime.now().strftime('%H:%M')
             date_str = datetime.now().strftime('%A, %d %B %Y')
 
-            self._draw_frame("Smart Medication System", 'primary')
+            # Draw accent bar and divider only; no title text so the header
+            # band is free for the clock / system-name layout.
+            self._draw_frame('', 'primary')
 
-            # Clock + date inside a small banner above the main card
-            self._draw_text(time_str, 'large', 'primary',
-                            self.width // 2, self._TITLE_Y, center=True)
-            self._draw_text(date_str, 'small', 'text_light',
-                            self.width // 2, self._DIVIDER_Y - 8, center=True)
+            right_edge = self._PANEL_X + self._PANEL_W  # x = 954
+
+            # System name – small, left-aligned, vertically centred in header
+            self._draw_text(
+                "Smart Medication System", 'small', 'text_light',
+                self._PANEL_X, self._TITLE_Y, center=False
+                # topleft; small font ~16 px tall, TITLE_Y=42 → visible ≈ 42–58
+            )
+
+            # Clock – large, right-aligned, vertically centred in header
+            self._draw_text(
+                time_str, 'large', 'primary',
+                right_edge, self._TITLE_Y + 6, right=True
+                # midright; large font ~40 px tall → visible ≈ 28–68
+            )
+
+            # Date – small, right-aligned just above the divider line
+            self._draw_text(
+                date_str, 'small', 'text_light',
+                right_edge, self._DIVIDER_Y - 4, right=True
+            )
 
             # ---- Next Medication card (top half) ----
             nm_x, nm_y, nm_w, nm_h = self._PANEL_X, self._PANEL_Y, self._PANEL_W, 110
@@ -742,6 +770,124 @@ class DisplayManager:
             self._draw_footer(
                 "Press SPACE to continue", 'error'
             )
+            pygame.display.flip()
+
+    # ------------------------------------------------------------------
+    # Security alert screen
+    # ------------------------------------------------------------------
+
+    def show_security_alert_screen(self, issues: list):
+        """
+        Show a structured alert for one or more security violations.
+
+        Each entry in *issues* is a dict with keys:
+          station_label  : human-readable station name, e.g. "Station 1"
+          medicine_name  : registered medicine name
+          issue          : "missing" | "incorrect" | "tampered"
+          scheduled_time : dose time string, e.g. "08:00"
+          tamper_delta_g : (tampered only) weight discrepancy in grams
+          tamper_pills_est : (tampered only) estimated pills removed
+        """
+        if not self.initialized:
+            return
+        with self.screen_lock:
+            self._draw_frame("SECURITY ALERT", 'error')
+            self._draw_card('error')
+
+            cy = self._card_text_y(0)
+
+            if not issues:
+                self._draw_text(
+                    "Security violation detected",
+                    'large', 'error', self.width // 2, cy + 40, center=True
+                )
+                self._draw_footer("Please check all medication stations.", 'error')
+                pygame.display.flip()
+                return
+
+            # Row layout – up to 3 issues fit comfortably
+            row_h      = min(130, (self._PANEL_BOT - cy - 20) // max(len(issues), 1))
+            row_y      = cy
+            left_x     = self._PANEL_X + 24
+            right_x    = self._PANEL_X + self._PANEL_W - 24
+
+            for item in issues[:3]:
+                station_label  = item.get("station_label", "Unknown Station")
+                medicine_name  = item.get("medicine_name", "Unknown Medicine")
+                issue          = item.get("issue", "missing")
+                scheduled_time = item.get("scheduled_time", "")
+
+                # Row tint: amber = missing, red = incorrect/tampered
+                strip_color = (
+                    (255, 193, 7, 40) if issue == "missing"
+                    else (220, 53, 69, 40)
+                )
+                strip_surf = pygame.Surface(
+                    (self._PANEL_W - 16, row_h - 8), pygame.SRCALPHA
+                )
+                strip_surf.fill(strip_color)
+                self.screen.blit(strip_surf, (self._PANEL_X + 8, row_y))
+
+                # Medicine name – medium, left
+                self._draw_text(
+                    medicine_name, 'medium', 'text_dark',
+                    left_x, row_y + 10
+                )
+
+                # Issue badge – right side
+                if issue == "missing":
+                    badge_text  = "BOTTLE REMOVED"
+                    badge_color = 'warning'
+                elif issue == "incorrect":
+                    badge_text  = "WRONG BOTTLE"
+                    badge_color = 'error'
+                elif issue == "tampered":
+                    badge_text  = "TAMPERING DETECTED"
+                    badge_color = 'error'
+                else:
+                    badge_text  = "ALERT"
+                    badge_color = 'error'
+                self._draw_text(
+                    badge_text, 'small', badge_color,
+                    right_x, row_y + 14, right=True
+                )
+
+                # Station + time – second line, left
+                detail = station_label
+                if issue != "tampered" and scheduled_time:
+                    detail += f"   •   Due at  {scheduled_time}"
+                if issue == "tampered":
+                    delta_g   = item.get("tamper_delta_g", 0.0)
+                    pills_est = item.get("tamper_pills_est", "?")
+                    detail += f"   •   {delta_g:.1f} g lighter  (~{pills_est} pills)"
+                self._draw_text(detail, 'normal', 'text_light', left_x, row_y + 46)
+
+                # Action instruction – third line, left
+                if issue == "missing":
+                    action = f"Please return {medicine_name} to {station_label}"
+                elif issue == "incorrect":
+                    action = f"Replace bottle with {medicine_name} on {station_label}"
+                else:  # tampered
+                    action = "Caregiver has been notified. Do not take any more pills."
+                self._draw_text(action, 'normal', 'primary', left_x, row_y + 78)
+
+                # Divider between rows
+                if item is not issues[-1]:
+                    pygame.draw.line(
+                        self.screen, self.colors['text_light'],
+                        (self._PANEL_X + 24, row_y + row_h - 6),
+                        (self._PANEL_X + self._PANEL_W - 24, row_y + row_h - 6), 1
+                    )
+
+                row_y += row_h
+
+            has_tamper = any(i.get("issue") == "tampered" for i in issues[:3])
+            footer_text = (
+                "Possible tampering detected — caregiver alerted."
+                if has_tamper
+                else "Medication must remain on the station until dose time."
+            )
+            self._draw_footer(footer_text, 'error')
             pygame.display.flip()
 
     # ------------------------------------------------------------------

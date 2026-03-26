@@ -307,6 +307,38 @@ class TelegramBot:
         )
         return self.send_message(self.caregiver_chat_id, message)
 
+    def send_bottle_tampering_alert(
+        self,
+        medicine_name: str,
+        station_id: str,
+        station_label: str,
+        reference_weight_g: float,
+        returned_weight_g: float,
+        delta_g: float,
+        estimated_pills_removed,
+    ) -> bool:
+        name  = self._escape_md(medicine_name)
+        sid   = self._escape_md(station_label or station_id)
+        ref_w = self._escape_md(f"{reference_weight_g:.1f}")
+        ret_w = self._escape_md(f"{returned_weight_g:.1f}")
+        delta = self._escape_md(f"{delta_g:.1f}")
+        pills = self._escape_md(str(estimated_pills_removed))
+        ts    = self._escape_md(time.strftime("%Y-%m-%d %H:%M:%S"))
+
+        message = (
+            f"*ALERT - Bottle Tampering Detected*\n\n"
+            f"Medicine: {name}\n"
+            f"Station: {sid}\n\n"
+            f"Weight before removal: {ref_w} g\n"
+            f"Weight on return: {ret_w} g\n"
+            f"Discrepancy: {delta} g\n"
+            f"Estimated pills removed: ~{pills}\n\n"
+            f"Time: {ts}\n\n"
+            f"The bottle was returned lighter than expected. "
+            f"Pills may have been taken outside the scheduled dose window."
+        )
+        return self.send_message(self.caregiver_chat_id, message)
+
     def send_registration_confirmation(
         self,
         medicine_name: str,
