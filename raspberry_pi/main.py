@@ -639,17 +639,94 @@ class MedicationSystem:
             detected_time=detected_time,
         )
 
+    def _tamper_alert_active(self, secure_state: dict) -> bool:
+        return bool(secure_state.get("tamper_alert_sent", False))
+
+    def _clear_tamper_alert_state(self, secure_state: dict):
+        secure_state.pop("tamper_alert_sent", None)
+        secure_state.pop("tamper_alert_until", None)
+        secure_state.pop("tamper_delta_g", None)
+        secure_state.pop("tamper_pills_est", None)
+
+    def _station_has_normal_security_window(
+        self, station_id: str, secure_state: dict, now_ts: float
+    ) -> bool:
+        if now_ts >= secure_state.get("next_due_timestamp", 0):
+            return False
+        if secure_state.get("authorized", False):
+            return False
+        if (
+            self.current_medication
+            and self.current_medication.get("station_id") == station_id
+        ):
+            return False
+        return True
+
+    def _sync_station_baseline_weight(self, station_id: str, weight_g: float):
+        if weight_g <= 0:
+            return
+
+        previous_weight = self.weight_manager.baseline_weights.get(station_id)
+        if previous_weight is not None and abs(previous_weight - weight_g) < 0.01:
+            return
+
+        self.weight_manager.baseline_weights[station_id] = weight_g
+        self.weight_manager._save_persisted_baselines()
+
+    def _assess_returned_bottle_weight(
+        self, secure_state: dict, returned_weight_g: float, log_result: bool = True
+    ):
+        station_id    = secure_state.get("station_id", "unknown")
+        medicine_name = secure_state.get("medicine_name", "Unknown")
+
+        reference_g = secure_state.get("pre_removal_weight_g")
+        if not reference_g or reference_g <= 0:
+            if log_result:
+                self.logger.info(
+                    f"[{station_id}] No pre-removal weight snapshot for "
+                    f"{medicine_name} — skipping tamper check"
+                )
+            return None
+
+        delta_g = reference_g - returned_weight_g   # positive = bottle is lighter
+
+        # Tamper threshold: station-level override, or half a pill weight
+        # (same heuristic used by WeightManager for noise rejection).
+        cfg         = self.weight_manager.station_configs.get(station_id, {})
+        threshold_g = float(
+            cfg.get("tamper_tolerance_g")
+            or self.weight_manager._get_min_delta_g(station_id)
+        )
+
+        if log_result:
+            self.logger.info(
+                f"[{station_id}] Tamper check: "
+                f"ref={reference_g:.2f}g  returned={returned_weight_g:.2f}g  "
+                f"delta={delta_g:.2f}g  threshold={threshold_g:.2f}g"
+            )
+
+        pill_weight_g   = self.weight_manager._get_pill_weight_g(station_id)
+        estimated_pills = (
+            max(1, round(delta_g / pill_weight_g))
+            if pill_weight_g > 0 else "unknown"
+        )
+        return {
+            "station_id":       station_id,
+            "medicine_name":    medicine_name,
+            "reference_g":      reference_g,
+            "delta_g":          delta_g,
+            "threshold_g":      threshold_g,
+            "estimated_pills":  estimated_pills,
+        }
+
     def _has_pending_security_violation(self) -> bool:
         now_ts = time.time()
 
         for station_id, secure_state in self.secured_medications.items():
-            if now_ts >= secure_state.get("next_due_timestamp", 0):
-                continue
-            if secure_state.get("authorized", False):
-                continue
-            if (
-                self.current_medication
-                and self.current_medication.get("station_id") == station_id
+            if self._tamper_alert_active(secure_state):
+                return True
+            if not self._station_has_normal_security_window(
+                station_id, secure_state, now_ts
             ):
                 continue
             if secure_state.get("tamper_check_pending", False):
@@ -658,26 +735,18 @@ class MedicationSystem:
                 return True
             if secure_state.get("wrong_bottle_on_station", False):
                 return True
-            if (
-                secure_state.get("tamper_alert_sent", False)
-                and now_ts < secure_state.get("tamper_alert_until", 0)
-            ):
-                return True
 
         return False
 
     def _get_station_security_issue(self, secure_state: dict):
+        if self._tamper_alert_active(secure_state):
+            return "tampered"
         if secure_state.get("wrong_bottle_on_station", False):
             return "incorrect"
         if secure_state.get("early_alert_sent", False):
             return "missing"
         if secure_state.get("tamper_check_pending", False):
             return "missing"
-        if (
-            secure_state.get("tamper_alert_sent", False)
-            and time.time() < secure_state.get("tamper_alert_until", 0)
-        ):
-            return "tampered"
         return None
 
     def _build_security_violation_key(self, issues: dict) -> str:
@@ -725,13 +794,11 @@ class MedicationSystem:
         now_ts = time.time()
 
         for station_id, secure_state in self.secured_medications.items():
-            if now_ts >= secure_state.get("next_due_timestamp", 0):
-                continue
-            if secure_state.get("authorized", False):
-                continue
             if (
-                self.current_medication
-                and self.current_medication.get("station_id") == station_id
+                not self._tamper_alert_active(secure_state)
+                and not self._station_has_normal_security_window(
+                    station_id, secure_state, now_ts
+                )
             ):
                 continue
 
@@ -787,55 +854,39 @@ class MedicationSystem:
 
         Outcome A – within tolerance  : log pass, update baseline, return.
         Outcome B – exceeds tolerance : audio alert, Telegram to caregiver,
-                    mark tamper state so the security-alert screen stays visible
-                    for 30 s, update baseline to reflect actual bottle state.
+                    mark tamper state so the shared security-alert screen stays
+                    visible until the bottle weight is restored within tolerance,
+                    update baseline to reflect actual bottle state.
         """
-        station_id    = secure_state.get("station_id", "unknown")
-        medicine_name = secure_state.get("medicine_name", "Unknown")
-
-        reference_g = secure_state.get("pre_removal_weight_g")
-        if not reference_g or reference_g <= 0:
-            self.logger.info(
-                f"[{station_id}] No pre-removal weight snapshot — "
-                "skipping tamper check"
-            )
+        assessment = self._assess_returned_bottle_weight(secure_state, returned_weight_g)
+        if not assessment:
             return
-
-        delta_g = reference_g - returned_weight_g   # positive = bottle is lighter
-
-        # Tamper threshold: station-level override, or half a pill weight
-        # (same heuristic used by WeightManager for noise rejection).
-        cfg         = self.weight_manager.station_configs.get(station_id, {})
-        threshold_g = float(
-            cfg.get("tamper_tolerance_g")
-            or self.weight_manager._get_min_delta_g(station_id)
-        )
-
-        self.logger.info(
-            f"[{station_id}] Tamper check: "
-            f"ref={reference_g:.2f}g  returned={returned_weight_g:.2f}g  "
-            f"delta={delta_g:.2f}g  threshold={threshold_g:.2f}g"
-        )
+        station_id    = assessment["station_id"]
+        medicine_name = assessment["medicine_name"]
+        reference_g   = assessment["reference_g"]
+        delta_g       = assessment["delta_g"]
+        threshold_g   = assessment["threshold_g"]
+        estimated_pills = assessment["estimated_pills"]
 
         # Always bring the weight_manager baseline in line with what is
         # physically on the scale now so future dose calculations are accurate.
-        if returned_weight_g > 0:
-            self.weight_manager.baseline_weights[station_id] = returned_weight_g
-            self.weight_manager._save_persisted_baselines()
+        self._sync_station_baseline_weight(station_id, returned_weight_g)
 
         if delta_g <= threshold_g:
             self.logger.info(
                 f"[{station_id}] Tamper check PASSED — "
                 "returned weight within tolerance"
             )
+            if self._tamper_alert_active(secure_state):
+                self.logger.info(
+                    f"[{station_id}] Tamper alert cleared — "
+                    "weight is back within tolerance"
+                )
+                self._clear_tamper_alert_state(secure_state)
+                self._refresh_security_violation_screen()
             return
 
         # ---- Weight discrepancy detected ----
-        pill_weight_g    = self.weight_manager._get_pill_weight_g(station_id)
-        estimated_pills  = (
-            max(1, round(delta_g / pill_weight_g))
-            if pill_weight_g > 0 else "unknown"
-        )
         station_label = station_id.replace("_", " ").title()
 
         self.logger.warning(
@@ -863,14 +914,39 @@ class MedicationSystem:
             estimated_pills_removed=estimated_pills,
         )
 
-        # Flag tamper state – keeps the security-alert screen visible for 30 s
-        # via _get_station_security_issue / _has_pending_security_violation.
+        # Flag tamper state so the shared security-alert screen keeps showing
+        # until the bottle weight returns within tolerance.
         secure_state["tamper_alert_sent"]  = True
-        secure_state["tamper_alert_until"] = time.time() + 30
         secure_state["tamper_delta_g"]     = round(delta_g, 2)
         secure_state["tamper_pills_est"]   = estimated_pills
         # Immediately refresh the security screen to show the tamper alert.
         self._refresh_security_violation_screen()
+
+    def _recheck_active_tamper_alert(
+        self, secure_state: dict, current_weight_g: float
+    ):
+        assessment = self._assess_returned_bottle_weight(
+            secure_state, current_weight_g, log_result=False
+        )
+        if not assessment:
+            return
+
+        station_id   = assessment["station_id"]
+        delta_g      = assessment["delta_g"]
+        threshold_g  = assessment["threshold_g"]
+
+        self._sync_station_baseline_weight(station_id, current_weight_g)
+
+        if delta_g <= threshold_g:
+            self.logger.info(
+                f"[{station_id}] Tamper condition resolved — "
+                "returned weight is now within tolerance"
+            )
+            self._clear_tamper_alert_state(secure_state)
+            return
+
+        secure_state["tamper_delta_g"]   = round(delta_g, 2)
+        secure_state["tamper_pills_est"] = assessment["estimated_pills"]
 
     def _verify_returned_bottle(self, secure_state: dict):
         """
@@ -939,24 +1015,26 @@ class MedicationSystem:
         now_ts = time.time()
 
         for station_id, secure_state in self.secured_medications.items():
-            if now_ts >= secure_state.get("next_due_timestamp", 0):
-                continue
-
-            if secure_state.get("authorized", False):
-                continue
-
-            if (
-                self.current_medication
-                and self.current_medication.get("station_id") == station_id
-            ):
-                continue
-
             status   = self.weight_manager.get_station_status(station_id)
             weight_g = float(status.get("weight_g") or 0.0)
             bottle_present = (
                 bool(status.get("connected"))
                 and weight_g >= self.min_secured_bottle_weight_g
             )
+
+            if self._tamper_alert_active(secure_state):
+                secure_state["present"] = bottle_present
+                if bottle_present and status.get("stable", False):
+                    secure_state["current_weight_g"] = weight_g
+                    self._recheck_active_tamper_alert(secure_state, weight_g)
+                else:
+                    secure_state.pop("bottle_returned_at", None)
+                continue
+
+            if not self._station_has_normal_security_window(
+                station_id, secure_state, now_ts
+            ):
+                continue
 
             if bottle_present:
                 if (
