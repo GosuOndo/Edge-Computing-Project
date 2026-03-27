@@ -365,6 +365,59 @@ class MedicationSystem:
         else:
             self.logger.info("Continuous NFC scanning active on all stations")
 
+    def _bootstrap_registered_station_security_state(self):
+        """
+        Seed secured station expectations from registration data so the system
+        knows which bottle belongs on which station even when stations are
+        empty at startup.
+        """
+        now_ts = time.time()
+        for record in self.database.list_registered_medicines():
+            station_id = record.get("station_id")
+            if not station_id or station_id in self.secured_medications:
+                continue
+
+            next_due_at, scheduled_time = self._get_next_due_datetime(
+                record.get("time_slots", "")
+            )
+            if not next_due_at:
+                continue
+
+            status = self.weight_manager.get_station_status(station_id)
+            weight_g = float(status.get("weight_g") or 0.0)
+            bottle_present = (
+                bool(status.get("connected"))
+                and weight_g >= self.min_secured_bottle_weight_g
+            )
+
+            self.secured_medications[station_id] = {
+                "medicine_id":         record.get("medicine_id"),
+                "medicine_name":       record.get("medicine_name", "Unknown"),
+                "station_id":          station_id,
+                "tag_uid":             record.get("tag_uid"),
+                "secured_at":          now_ts,
+                "secured_weight_g":    weight_g if bottle_present else 0.0,
+                "current_weight_g":    weight_g if bottle_present else 0.0,
+                "next_due_timestamp":  next_due_at.timestamp(),
+                "next_due_display":    next_due_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "scheduled_time":      scheduled_time,
+                "authorized":          False,
+                "present":             bottle_present,
+                "early_alert_sent":    not bottle_present,
+                "early_alert_sent_at": now_ts if not bottle_present else 0.0,
+            }
+
+            if not bottle_present:
+                self.logger.warning(
+                    f"Startup check: {record.get('medicine_name', 'Medicine')} "
+                    f"is missing from {station_id}"
+                )
+            else:
+                self.logger.info(
+                    f"Startup check: expected bottle for {station_id} is present; "
+                    "awaiting NFC verification"
+                )
+
     def _audit_occupied_stations_with_nfc(self, audit_interval_seconds: float = 5.0):
         """
         Periodically force a fresh NFC read for occupied stations so bottle
@@ -2014,9 +2067,12 @@ class MedicationSystem:
                 )
 
         self.scheduler.start()
+        self._bootstrap_registered_station_security_state()
 
         if self.display:
             self._show_idle_screen()
+            if self._has_pending_security_violation():
+                self._refresh_security_violation_screen()
 
         self.logger.info("System ready")
 

@@ -98,6 +98,11 @@ class FakeDatabase:
             return self.records_by_station.get(station_id)
         return self.record
 
+    def list_registered_medicines(self):
+        if self.records_by_station:
+            return [r for r in self.records_by_station.values() if r]
+        return [self.record] if self.record else []
+
 
 class FakeTagManager:
     def __init__(self, record=None):
@@ -271,6 +276,7 @@ def make_system():
     system._firmware_dosing_active = False
     system.secured_medications = {}
     system._processed_tag_scans = {}
+    system._last_station_scan_audit = {}
     system.min_secured_bottle_weight_g = 5.0
     system._last_security_violation_message = None
     system.telegram = FakeTelegram()
@@ -313,6 +319,59 @@ def test_process_secured_bottle_placement_tracks_next_due():
     assert secure_state["present"] is True
     assert secure_state["authorized"] is False
     assert secure_state["secured_weight_g"] == 42.5
+
+
+def test_bootstrap_from_registration_marks_missing_bottles_and_shows_alert():
+    record_1 = {
+        "medicine_id": "M001",
+        "medicine_name": "Aspirin 100mg",
+        "station_id": "station_1",
+        "tag_uid": "TAG123",
+        "time_slots": "08:00,20:00",
+    }
+    record_2 = {
+        "medicine_id": "M002",
+        "medicine_name": "Metformin 500mg",
+        "station_id": "station_2",
+        "tag_uid": "TAG456",
+        "time_slots": "09:00,21:00",
+    }
+
+    system = make_system()
+    system.display = FakeDisplay()
+    system.database = FakeDatabase(
+        records_by_station={"station_1": record_1, "station_2": record_2}
+    )
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 0.0,
+            "event_detection_enabled": False,
+        },
+        "station_2": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 0.0,
+            "event_detection_enabled": False,
+        },
+    })
+    due_map = {
+        "08:00,20:00": (datetime(2099, 3, 25, 20, 0, 0), "20:00"),
+        "09:00,21:00": (datetime(2099, 3, 25, 21, 0, 0), "21:00"),
+    }
+    system._get_next_due_datetime = lambda raw_slots, now=None: due_map[raw_slots]
+
+    system._bootstrap_registered_station_security_state()
+    system._refresh_security_violation_screen()
+
+    assert system.secured_medications["station_1"]["early_alert_sent"] is True
+    assert system.secured_medications["station_1"]["present"] is False
+    assert system.secured_medications["station_2"]["early_alert_sent"] is True
+    assert system.secured_medications["station_2"]["present"] is False
+    assert system.display.error_calls[-1] == (
+        "Station 1 missing bottle | Station 2 missing bottle"
+    )
 
 
 def test_station_with_scheduler_times_skips_onboarding():
