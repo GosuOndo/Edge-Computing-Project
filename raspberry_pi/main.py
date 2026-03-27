@@ -1420,8 +1420,6 @@ class MedicationSystem:
         # ------------------------------------------------------------------
         final_swallow_count = int(monitoring_result.get("swallow_count", 0))
         if final_swallow_count < expected_dosage:
-            remaining  = expected_dosage - final_swallow_count
-            pill_word  = "pill" if remaining == 1 else "pills"
             self.logger.warning(
                 f"Intake mismatch: {final_swallow_count} swallow(s) detected, "
                 f"~{expected_dosage} expected for {medicine_name}"
@@ -1433,39 +1431,14 @@ class MedicationSystem:
                     expected_dosage=expected_dosage,
                 )
             if self.audio:
+                pill_word = "pill" if expected_dosage == 1 else "pills"
                 self.audio.announce_warning(
                     f"Only {final_swallow_count} swallow detected "
-                    f"out of approximately {expected_dosage} expected for {medicine_name}. "
-                    f"Please take {remaining} more {pill_word}."
+                    f"out of approximately {expected_dosage} expected for "
+                    f"{expected_dosage} {pill_word} of {medicine_name}. "
+                    "Medication intake may be incomplete."
                 )
-            self.telegram.send_incorrect_dosage_alert(
-                medicine_name=medicine_name,
-                expected=expected_dosage,
-                actual=final_swallow_count
-            )
             time.sleep(4)   # hold mismatch screen briefly before verdict
-
-        elif final_swallow_count > expected_dosage:
-            self.logger.warning(
-                f"Intake excess: {final_swallow_count} swallow(s) detected, "
-                f"only ~{expected_dosage} expected for {medicine_name}"
-            )
-            if self.display:
-                self.display.show_overdose_screen(
-                    medicine_name, final_swallow_count, expected_dosage
-                )
-            if self.audio:
-                self.audio.announce_warning(
-                    f"Too many intakes detected. {final_swallow_count} swallows detected "
-                    f"but only {expected_dosage} expected for {medicine_name}. "
-                    "Your caregiver has been notified."
-                )
-            self.telegram.send_incorrect_dosage_alert(
-                medicine_name=medicine_name,
-                expected=expected_dosage,
-                actual=final_swallow_count
-            )
-            time.sleep(4)
 
         if not self.running:
             return
