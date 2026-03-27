@@ -645,7 +645,10 @@ class MedicationSystem:
                 return True
             if secure_state.get("wrong_bottle_on_station", False):
                 return True
-            if secure_state.get("tamper_alert_sent", False):
+            if (
+                secure_state.get("tamper_alert_sent", False)
+                and now_ts < secure_state.get("tamper_alert_until", 0)
+            ):
                 return True
 
         return False
@@ -655,7 +658,10 @@ class MedicationSystem:
             return "incorrect"
         if secure_state.get("early_alert_sent", False):
             return "missing"
-        if secure_state.get("tamper_alert_sent", False):
+        if (
+            secure_state.get("tamper_alert_sent", False)
+            and time.time() < secure_state.get("tamper_alert_until", 0)
+        ):
             return "tampered"
         return None
 
@@ -842,11 +848,12 @@ class MedicationSystem:
             estimated_pills_removed=estimated_pills,
         )
 
-        # Flag tamper state – keeps the security-alert screen visible until the
-        # scheduled window closes or a new removal cycle clears it.
-        secure_state["tamper_alert_sent"] = True
-        secure_state["tamper_delta_g"]    = round(delta_g, 2)
-        secure_state["tamper_pills_est"]  = estimated_pills
+        # Flag tamper state – keeps the security-alert screen visible for 30 s
+        # via _get_station_security_issue / _has_pending_security_violation.
+        secure_state["tamper_alert_sent"]  = True
+        secure_state["tamper_alert_until"] = time.time() + 30
+        secure_state["tamper_delta_g"]     = round(delta_g, 2)
+        secure_state["tamper_pills_est"]   = estimated_pills
         # Immediately refresh the security screen to show the tamper alert.
         self._refresh_security_violation_screen()
 
@@ -1022,8 +1029,9 @@ class MedicationSystem:
                 # against the weight when the bottle is returned later.
                 secure_state["pre_removal_weight_g"] = secure_state.get("current_weight_g")
                 # Clear any stale tamper state from a previous removal cycle.
-                secure_state.pop("tamper_alert_sent", None)
-                secure_state.pop("tamper_delta_g",    None)
+                secure_state.pop("tamper_alert_sent",  None)
+                secure_state.pop("tamper_alert_until", None)
+                secure_state.pop("tamper_delta_g",     None)
                 secure_state.pop("tamper_pills_est",   None)
                 secure_state.pop("tamper_check_pending", None)
 
