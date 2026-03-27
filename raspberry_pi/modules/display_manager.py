@@ -747,14 +747,10 @@ class DisplayManager:
         medicine_name: str,
         swallow_count: int,
         expected_dosage: int,
-        elapsed: float = 0,
-        duration: float = 30,
     ):
         """
         Shown when the detected swallow count is less than the expected
-        dosage after patient monitoring completes.  When *elapsed* and
-        *duration* are provided a live countdown bar is rendered so the
-        patient can see how much time remains to take the missing pills.
+        dosage after patient monitoring completes.
         """
         if not self.initialized:
             return
@@ -762,7 +758,7 @@ class DisplayManager:
             self._draw_frame("INCOMPLETE INTAKE", 'warning')
             self._draw_card('warning')
 
-            cy = self._card_text_y(4)
+            cy = self._card_text_y(10)
 
             self._draw_text(medicine_name, 'large', 'text_dark',
                             self.width // 2, cy, center=True)
@@ -773,7 +769,7 @@ class DisplayManager:
             n       = expected_dosage
             total_w = n * (dot_r * 2) + (n - 1) * dot_gap
             dot_x0  = (self.width - total_w) // 2
-            dot_y   = cy + 68
+            dot_y   = cy + 74
 
             for i in range(n):
                 cx_dot = dot_x0 + i * (dot_r * 2 + dot_gap) + dot_r
@@ -788,9 +784,9 @@ class DisplayManager:
                     )
 
             self._draw_text(
-                f"Swallows detected:  {swallow_count}  /  {expected_dosage}  expected",
+                f"Swallows detected:  {swallow_count}  /  ~{expected_dosage}  expected",
                 'medium', 'warning',
-                self.width // 2, dot_y + dot_r + 28, center=True
+                self.width // 2, dot_y + dot_r + 30, center=True
             )
 
             remaining = max(0, expected_dosage - swallow_count)
@@ -799,32 +795,8 @@ class DisplayManager:
                 self._draw_text(
                     f"Please take  {remaining}  more {pill_word}.",
                     'medium', 'primary',
-                    self.width // 2, dot_y + dot_r + 74, center=True
+                    self.width // 2, dot_y + dot_r + 82, center=True
                 )
-
-            # ----------------------------------------------------------
-            # Countdown progress bar
-            # ----------------------------------------------------------
-            bar_w = 700
-            bar_x = (self.width - bar_w) // 2
-            bar_y = dot_y + dot_r + 120
-            self._draw_rect('text_light', bar_x, bar_y, bar_w, 28, radius=14)
-            progress = min(elapsed / duration, 1.0) if duration > 0 else 0
-            fill_w   = int(bar_w * progress)
-            if fill_w > 0:
-                bar_color = (
-                    self.colors['error'] if progress > 0.75 else self.colors['warning']
-                )
-                pygame.draw.rect(
-                    self.screen, bar_color,
-                    (bar_x, bar_y, fill_w, 28), border_radius=14
-                )
-            time_remaining = max(0, int(duration - elapsed))
-            self._draw_text(
-                f"{time_remaining}s remaining to take medication",
-                'normal', 'text_light',
-                self.width // 2, bar_y + 44, center=True
-            )
 
             self._draw_footer("Please contact your caregiver if unsure.", 'warning')
             pygame.display.flip()

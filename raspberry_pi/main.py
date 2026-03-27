@@ -1952,27 +1952,16 @@ class MedicationSystem:
                 "hand_motion_count": 0,
             }
 
-    def _wait_for_pill_removal_event(
-        self,
-        timeout_seconds: float = 120.0,
-        medicine_name: str = "",
-        swallow_count: int = 0,
-        expected_dosage: int = 0,
-    ):
+    def _wait_for_pill_removal_event(self, timeout_seconds: float = 120.0):
         """
         Block until the weight sensor fires a pill-removal event or the
         timeout expires.  The caller must have already transitioned to
         REMINDER_ACTIVE so that _on_pill_removal() queues the event.
 
-        When medicine_name / swallow_count / expected_dosage are provided
-        the intake-mismatch screen is refreshed each tick with a live
-        countdown so the patient can see how much time remains.
-
         Returns the event dict on success, or None on timeout / shutdown.
         """
         self.pending_weight_event = None
-        start    = time.time()
-        deadline = start + timeout_seconds
+        deadline = time.time() + timeout_seconds
 
         while time.time() < deadline:
             if not self.running:
@@ -1982,15 +1971,6 @@ class MedicationSystem:
                 self.pending_weight_event = None
                 return event
             if self.display:
-                if medicine_name:
-                    elapsed = time.time() - start
-                    self.display.show_intake_mismatch_screen(
-                        medicine_name=medicine_name,
-                        swallow_count=swallow_count,
-                        expected_dosage=expected_dosage,
-                        elapsed=elapsed,
-                        duration=timeout_seconds,
-                    )
                 self.display.update()
             time.sleep(0.05)
 
