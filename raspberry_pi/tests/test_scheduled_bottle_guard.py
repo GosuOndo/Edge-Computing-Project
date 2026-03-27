@@ -395,6 +395,79 @@ def test_station_with_scheduler_times_skips_onboarding():
     assert system._station_has_existing_schedule("station_1") is True
 
 
+def test_database_schedule_replaces_placeholder_scheduler_for_idle_screen():
+    class DummyScheduler:
+        def __init__(self):
+            self.medications = [
+                {
+                    "name": "Placeholder Med",
+                    "station_id": "station_1",
+                    "dosage_pills": 1,
+                    "times": ["06:00"],
+                }
+            ]
+
+        def get_scheduled_medicines(self):
+            return [m["name"] for m in self.medications]
+
+        def get_next_scheduled_time(self):
+            now = datetime(2026, 3, 26, 8, 15, 0)
+            next_entry = None
+
+            for medication in self.medications:
+                for scheduled_time in medication.get("times", []):
+                    hour, minute = [int(part) for part in scheduled_time.split(":")[:2]]
+                    candidate = now.replace(
+                        hour=hour, minute=minute, second=0, microsecond=0
+                    )
+                    if candidate <= now:
+                        from datetime import timedelta
+                        candidate += timedelta(days=1)
+                    entry = {
+                        "medicine_name": medication["name"],
+                        "station_id": medication["station_id"],
+                        "time": scheduled_time,
+                        "_next_run": candidate,
+                    }
+                    if next_entry is None or candidate < next_entry["_next_run"]:
+                        next_entry = entry
+
+            next_entry.pop("_next_run", None)
+            return next_entry
+
+    system = make_system()
+    system.scheduler = DummyScheduler()
+    system.database = FakeDatabase(
+        records_by_station={
+            "station_1": {
+                "medicine_id": "M001",
+                "medicine_name": "Aspirin 100mg",
+                "station_id": "station_1",
+                "dosage_amount": 1,
+                "time_slots": "08:00,20:00",
+            },
+            "station_2": {
+                "medicine_id": "M002",
+                "medicine_name": "Metformin 500mg",
+                "station_id": "station_2",
+                "dosage_amount": 2,
+                "time_slots": "09:30,21:00",
+            },
+        }
+    )
+
+    system._load_schedule_from_database()
+    payload = system._get_idle_screen_payload()
+
+    assert [m["name"] for m in system.scheduler.medications] == [
+        "Aspirin 100mg",
+        "Metformin 500mg",
+    ]
+    assert payload["next_medication"]["medicine_name"] == "Metformin 500mg"
+    assert payload["next_medication"]["station_id"] == "station_2"
+    assert payload["next_medication"]["time"] == "09:30"
+
+
 def test_end_verification_cycle_keeps_continuous_scanning_active():
     system = make_system()
     system.state_machine = FakeStateMachine(SystemState.MONITORING_PATIENT)

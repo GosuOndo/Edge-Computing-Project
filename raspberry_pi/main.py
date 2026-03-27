@@ -2024,11 +2024,8 @@ class MedicationSystem:
     # Schedule helpers
     # ------------------------------------------------------------------
 
-    def _load_schedule_from_database(self):
-        registered = self.database.list_registered_medicines()
-        if not registered:
-            self.logger.warning("No registered medicines found in database")
-            return
+    def _build_scheduler_entries_from_database(self, registered: list) -> list:
+        entries = []
 
         for record in registered:
             medicine_name = record.get("medicine_name")
@@ -2046,15 +2043,34 @@ class MedicationSystem:
             if not times:
                 continue
 
-            self.scheduler.add_medication(
-                medicine_name=medicine_name,
-                station_id=station_id,
-                dosage_pills=dosage,
-                times=times
-            )
+            entries.append({
+                "name":         medicine_name,
+                "station_id":   station_id,
+                "dosage_pills": dosage,
+                "times":        times,
+            })
+
+        return entries
+
+    def _load_schedule_from_database(self):
+        registered = self.database.list_registered_medicines()
+        if not registered:
+            self.logger.warning("No registered medicines found in database")
+            return
+
+        entries = self._build_scheduler_entries_from_database(registered)
+        if not entries:
+            self.logger.warning("No usable medication schedules found in database")
+            return
+
+        # The database is the source of truth after onboarding, so replace
+        # any placeholder config schedule before the scheduler starts.
+        self.scheduler.medications = entries
+
+        for entry in entries:
             self.logger.info(
-                f"Loaded from DB into scheduler: {medicine_name} "
-                f"at {times} on {station_id}"
+                f"Loaded from DB into scheduler: {entry['name']} "
+                f"at {entry['times']} on {entry['station_id']}"
             )
 
         self.logger.info(

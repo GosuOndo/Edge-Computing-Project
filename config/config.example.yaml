@@ -1,3 +1,4 @@
+Gregory, [28 Mar 2026 at 12:08:03 AM]:
 # Smart Medication System Configuration
 # Copy this file to config.yaml and fill in your actual values
 
@@ -20,10 +21,14 @@ hardware:
     height: 600
     fullscreen: false  # set to true for production deployment
 
+
+
   audio:
     enabled: true
-    output_device: null  # e.g. "plughw:CARD=vc4hdmi0,DEV=0"
-    volume: 0.8  # 0.0 to 1.0
+    playback_mode: "alsa_pipe"
+    output_device: "plughw:CARD=vc4hdmi0,DEV=0"
+    volume: 0.8
+
 
 # MQTT Configuration
 mqtt:
@@ -81,20 +86,11 @@ identity:
   tag:
     enabled: true
     mqtt_topic: "medication/tag/read/+"
-    # integrated_mode: tag reader is mounted under the scale platform.
-    # The bottle tag is read passively when the bottle is placed back,
-    # so we use coincident timing instead of active waiting.
     integrated_mode: true
-    # How far back (seconds) from the weight event to accept a tag scan.
-    # Tag scan arrives when bottle touches reader (before weight settles),
-    # so the scan is typically 1-5s older than the weight event timestamp.
     coincident_window_seconds: 15.0
-    # Per-station MQTT command topics for scan gate control (start_scan / stop_scan).
-    # Keys must match the station ids defined in weight_sensors above.
     command_topics:
       station_1: "medication/tag/command/tag_reader_1"
       station_2: "medication/tag/command/tag_reader_2"
-    # Legacy active-wait settings (used only if integrated_mode: false)
     max_attempts: 1
     attempt_timeout_seconds: 3
 
@@ -107,26 +103,23 @@ identity:
     max_attempts: 1
 
 # Registration Configuration
-# Runs once at startup for each station with no registered medicine.
-# Detects a coincident stable weight + RFID tag scan to auto-register.
 registration:
   enabled: true
-  timeout_seconds: 120           # how long to wait before giving up
-  coincident_window_seconds: 8.0 # tag scan must be within this many seconds of the stable weight reading
-  min_bottle_weight_g: 5.0       # minimum weight to consider a bottle as present
+  timeout_seconds: 120
+  coincident_window_seconds: 8.0
+  min_bottle_weight_g: 5.0
 
 # Patient Monitoring Configuration
 patient_monitoring:
   enabled: true
-  duration_seconds: 30       # how long to watch after pill removal
-  fps: 20                    # capture frame rate
-  device_id: 0               # camera device id (must match hardware.camera.device_id)
+  duration_seconds: 30
+  fps: 20
+  device_id: 0
 
-  # MediaPipe thresholds
   mediapipe:
-    mouth_open_ratio: 0.04   # inner-lip gap / face height  (higher = harder to trigger)
-    proximity_ratio:  0.18   # fingertip-mouth dist / frame min dim (higher = wider zone)
-    cooldown_secs:    2.5    # min seconds between counted intakes
+    mouth_open_ratio: 0.04
+    proximity_ratio:  0.18
+    cooldown_secs:    2.5
 
   detection:
     swallow:
@@ -148,9 +141,6 @@ telegram:
   retry_delay_seconds: 5
 
 # Medication Schedule
-# Note: medicine_id is resolved at runtime from the database (via registration).
-# The 'name' field here is only used for the Telegram reminder text and display.
-# It does NOT need to match the tag payload exactly.
 schedule:
   medications:
     - name: "Aspirin 100mg"
@@ -163,18 +153,19 @@ schedule:
       dosage_pills: 2
       times: ["08:00", "20:00"]
 
-  reminder:
-    advance_minutes: 5   # remind 5 minutes before scheduled time
-    timeout_minutes: 30  # consider missed after 30 minutes
+
+reminder:
+    advance_minutes: 5
+    timeout_minutes: 30
 
 # Decision Engine Rules
 decision_engine:
   tolerance:
-    pill_count: 0  # 0 = exact match required; 1 = +-1 pill allowed
+    pill_count: 0
 
   verification:
-    require_ocr: false      # identity failure alone does not fail verification
-    require_weight: true    # weight verification is mandatory
+    require_ocr: false
+    require_weight: true
     require_monitoring: true
 
   alerts:
@@ -190,7 +181,7 @@ database:
 
 # Logging Configuration
 logging:
-  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO"
   console_output: true
   file_output: true
   max_file_size_mb: 10
@@ -199,7 +190,7 @@ logging:
 # Performance Configuration
 performance:
   max_cpu_percent: 80
-  max_memory_mb: 3072  # leave 1 GB for OS on 4 GB Pi
+  max_memory_mb: 3072
   enable_throttling: true
 
 # Network Configuration
