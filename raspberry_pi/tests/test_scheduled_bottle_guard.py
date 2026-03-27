@@ -205,6 +205,9 @@ class FakeStateMachine:
     def get_state(self):
         return self.state
 
+    def transition_to(self, new_state, data=None):
+        self.state = new_state
+
     def reset_to_idle(self):
         self.state = SystemState.IDLE
 
@@ -621,7 +624,7 @@ def test_monitoring_overdose_returns_to_idle_without_success(monkeypatch):
     assert ended_cycles == ["station_1"]
 
 
-def test_underdose_retry_keeps_camera_monitoring_without_waiting_for_weight_event(monkeypatch):
+def test_underdose_retry_waits_for_more_pills_then_restarts_camera_monitoring(monkeypatch):
     monkeypatch.setattr("raspberry_pi.main.time.sleep", lambda *_args, **_kwargs: None)
 
     system = make_system()
@@ -692,6 +695,7 @@ def test_underdose_retry_keeps_camera_monitoring_without_waiting_for_weight_even
     system._handle_decision = lambda decision: handled.append(decision)
     ended_cycles = []
     system._end_verification_cycle = lambda station_id: ended_cycles.append(station_id)
+    wait_calls = []
     sessions = iter([
         {
             "compliance_status": "good",
@@ -707,19 +711,29 @@ def test_underdose_retry_keeps_camera_monitoring_without_waiting_for_weight_even
         },
     ])
     system._run_monitoring_session = lambda expected_dosage: next(sessions)
-    system._wait_for_pill_removal_event = lambda *args, **kwargs: (_ for _ in ()).throw(
-        AssertionError("weight-event wait should not run during underdose retry monitoring")
-    )
+    system.state_machine = FakeStateMachine(SystemState.VERIFYING)
+
+    def wait_for_retry(*args, **kwargs):
+        wait_calls.append((args, kwargs))
+        return {
+            "station_id": "station_1",
+            "timestamp": time.time(),
+            "pills_removed": 1,
+        }
+
+    system._wait_for_pill_removal_event = wait_for_retry
 
     system._verify_medication_intake({"timestamp": time.time()})
 
     assert handled and handled[0]["verified"] is True
+    assert len(wait_calls) == 1
+    assert system.display.intake_mismatch_calls == [("Aspirin 100mg", 1, 2)]
     assert decision_calls[0]["monitoring_result"]["swallow_count"] == 2
     assert marked_taken == ["Aspirin 100mg"]
     assert ended_cycles == ["station_1"]
 
 
-def test_underdose_retry_monitoring_overdose_uses_existing_overdose_screen(monkeypatch):
+def test_underdose_retry_extra_pill_removal_uses_existing_overdose_screen(monkeypatch):
     monkeypatch.setattr("raspberry_pi.main.time.sleep", lambda *_args, **_kwargs: None)
 
     system = make_system()
@@ -795,17 +809,19 @@ def test_underdose_retry_monitoring_overdose_uses_existing_overdose_screen(monke
             "cough_count": 0,
             "hand_motion_count": 0,
         },
-        {
-            "compliance_status": "good",
-            "swallow_count": 2,
-            "cough_count": 0,
-            "hand_motion_count": 0,
-        },
     ])
     system._run_monitoring_session = lambda expected_dosage: next(sessions)
-    system._wait_for_pill_removal_event = lambda *args, **kwargs: (_ for _ in ()).throw(
-        AssertionError("weight-event wait should not run during retry overdose path")
-    )
+    system.state_machine = FakeStateMachine(SystemState.VERIFYING)
+
+    def wait_for_retry(*args, **kwargs):
+        system._dose_pills_removed["station_1"] = 3
+        return {
+            "station_id": "station_1",
+            "timestamp": time.time(),
+            "pills_removed": 2,
+        }
+
+    system._wait_for_pill_removal_event = wait_for_retry
 
     system._verify_medication_intake({"timestamp": time.time()})
 
