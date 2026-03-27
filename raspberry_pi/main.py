@@ -307,9 +307,22 @@ class MedicationSystem:
     ):
         station_id    = record.get("station_id")
         medicine_name = record.get("medicine_name") or "Unknown"
-        next_due_at, scheduled_time = self._get_next_due_datetime(
-            record.get("time_slots", "")
+        next_due_at = None
+        scheduled_time = None
+        existing_state = self.secured_medications.get(station_id, {})
+
+        existing_due_ts = float(existing_state.get("next_due_timestamp") or 0.0)
+        existing_same_medicine = (
+            existing_state.get("medicine_id") == record.get("medicine_id")
+            or existing_state.get("tag_uid") == record.get("tag_uid")
         )
+        if existing_due_ts > time.time() and existing_same_medicine:
+            next_due_at = datetime.fromtimestamp(existing_due_ts)
+            scheduled_time = existing_state.get("scheduled_time")
+        else:
+            next_due_at, scheduled_time = self._get_next_due_datetime(
+                record.get("time_slots", "")
+            )
 
         if not station_id or not next_due_at:
             self.logger.warning(
@@ -894,11 +907,6 @@ class MedicationSystem:
                 f"Expected {secure_state.get('medicine_name')} ({expected_medicine_id}), "
                 f"got {record.get('medicine_name')} ({actual_medicine_id})"
             )
-            if self.display:
-                self.display.show_error_screen(
-                    f"Wrong bottle on {station_id}. Please replace with "
-                    f"{secure_state.get('medicine_name', 'the correct medication')}."
-                )
             if self.audio:
                 self.audio.speak_async(
                     f"Wrong bottle detected. Please replace with "

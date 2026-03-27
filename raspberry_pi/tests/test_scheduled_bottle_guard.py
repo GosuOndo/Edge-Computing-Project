@@ -752,6 +752,81 @@ def test_wrong_medicine_audio_is_not_requeued_and_is_cleared_after_correction():
     assert "wrong_bottle_on_station" not in system.secured_medications["station_1"]
 
 
+def test_station_1_missing_detection_still_works_after_wrong_bottle_is_corrected():
+    record_1 = {
+        "medicine_id": "M001",
+        "medicine_name": "Aspirin 100mg",
+        "station_id": "station_1",
+        "tag_uid": "TAG123",
+        "time_slots": "08:00,20:00",
+    }
+    wrong_record = {
+        "medicine_id": "M999",
+        "medicine_name": "Vitamin C",
+        "station_id": "station_2",
+        "tag_uid": "WRONG999",
+        "time_slots": "09:00",
+    }
+
+    system = make_system()
+    system.display = FakeDisplay()
+    system.audio = FakeAudio()
+    system.database = FakeDatabase(
+        records_by_tag={"TAG123": record_1, "WRONG999": wrong_record},
+        records_by_station={"station_1": record_1},
+    )
+    system.tag_runtime_service = FakeTagRuntimeService(
+        latest_by_station={
+            "station_1": {
+                "received_at": 100.0,
+                "scan_msg": {"tag_uid": "WRONG999"},
+            }
+        }
+    )
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 42.5,
+            "event_detection_enabled": False,
+        }
+    })
+    future_ts = time.time() + 3600
+    system.secured_medications = {
+        "station_1": {
+            "medicine_id": "M001",
+            "medicine_name": "Aspirin 100mg",
+            "station_id": "station_1",
+            "tag_uid": "TAG123",
+            "next_due_timestamp": future_ts,
+            "next_due_display": "2026-03-25 20:00:00",
+            "scheduled_time": "20:00",
+            "present": True,
+            "authorized": False,
+            "early_alert_sent": False,
+        }
+    }
+    # Simulate a scan payload whose schedule would otherwise resolve badly;
+    # the existing future due window should be preserved.
+    system._get_next_due_datetime = (
+        lambda raw_slots, now=None: (datetime(2026, 3, 25, 20, 0, 0), "20:00")
+    )
+
+    system._process_secured_bottle_placements()
+    system.tag_runtime_service.latest_by_station["station_1"] = {
+        "received_at": 101.0,
+        "scan_msg": {"tag_uid": "TAG123"},
+    }
+    system._process_secured_bottle_placements()
+
+    system.weight_manager.status_by_station["station_1"]["weight_g"] = 0.0
+    system._process_secured_bottle_movements()
+
+    assert system.secured_medications["station_1"]["early_alert_sent"] is True
+    assert system.secured_medications["station_1"]["present"] is False
+    assert system.display.error_calls[-1] == "Station 1 missing bottle"
+
+
 def test_unauthorized_bottle_movement_alerts_once_before_due():
     system = make_system()
     system.display = FakeDisplay()
