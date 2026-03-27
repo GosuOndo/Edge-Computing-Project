@@ -340,6 +340,66 @@ class MedicationSystem:
             f"{next_due_at.strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
+    def _clear_pending_wrong_medicine_audio(self):
+        if not getattr(self, "audio", None):
+            return
+        clear_pending = getattr(self.audio, "clear_pending", None)
+        if callable(clear_pending):
+            clear_pending(("Wrong medicine detected", "Wrong bottle detected"))
+
+    def _flag_wrong_station_bottle(
+        self,
+        station_id: str,
+        registered: dict,
+        scan_received_at: float,
+        current_weight_g: float,
+        scanned_medicine_name: str,
+    ):
+        secure_state = self.secured_medications.get(station_id)
+        if secure_state is None:
+            next_due_at, scheduled_time = self._get_next_due_datetime(
+                registered.get("time_slots", "")
+            )
+            secure_state = {
+                "medicine_id":         registered.get("medicine_id"),
+                "medicine_name":       registered.get("medicine_name", "Unknown"),
+                "station_id":          station_id,
+                "tag_uid":             registered.get("tag_uid"),
+                "secured_at":          scan_received_at,
+                "secured_weight_g":    current_weight_g,
+                "current_weight_g":    current_weight_g,
+                "next_due_timestamp":  next_due_at.timestamp() if next_due_at else 0.0,
+                "next_due_display":    (
+                    next_due_at.strftime("%Y-%m-%d %H:%M:%S")
+                    if next_due_at else ""
+                ),
+                "scheduled_time":      scheduled_time,
+                "authorized":          False,
+                "present":             True,
+                "early_alert_sent":    False,
+            }
+            self.secured_medications[station_id] = secure_state
+
+        was_wrong = secure_state.get("wrong_bottle_on_station", False)
+        secure_state["present"] = True
+        secure_state["authorized"] = False
+        secure_state["early_alert_sent"] = False
+        secure_state["current_weight_g"] = current_weight_g
+        secure_state["wrong_bottle_on_station"] = True
+        secure_state["last_wrong_bottle_scan_at"] = scan_received_at
+
+        expected_name = registered.get("medicine_name", "the correct medicine")
+        if not was_wrong and self.audio:
+            self.audio.speak_async(
+                f"Wrong medicine detected. Please place "
+                f"{expected_name} on {station_id}"
+            )
+
+        self.logger.warning(
+            f"Security violation on {station_id}: wrong bottle present "
+            f"(expected {expected_name}, got {scanned_medicine_name or 'unknown'})"
+        )
+
     def _station_has_existing_schedule(self, station_id: str) -> bool:
         """
         Return True when this station already has a usable medication schedule,
@@ -460,6 +520,8 @@ class MedicationSystem:
             self._last_station_scan_audit[station_id] = now_ts
 
     def _process_secured_bottle_placements(self):
+        state_changed = False
+
         for station_id in self.weight_manager.station_configs:
             latest = self.tag_runtime_service.get_latest_scan(station_id)
             if not latest:
@@ -477,7 +539,15 @@ class MedicationSystem:
 
             scan_msg = latest.get("scan_msg") or {}
             record   = self._resolve_record_from_scan(scan_msg)
-            if not record or record.get("station_id") != station_id:
+            if not record:
+                continue
+
+            status = self.weight_manager.get_station_status(station_id)
+            if not status.get("connected"):
+                continue
+
+            weight_g = float(status.get("weight_g") or 0.0)
+            if weight_g < self.min_secured_bottle_weight_g:
                 continue
 
             # Only accept the medicine that is registered to this station.
@@ -494,37 +564,35 @@ class MedicationSystem:
                     (registered_medicine_id and scanned_medicine_id == registered_medicine_id)
                     or (registered_tag_uid and scanned_tag_uid == registered_tag_uid)
                 )
+                self._processed_tag_scans[station_id] = scan_received_at
                 if not match:
-                    self.logger.warning(
-                        f"Wrong medicine placed on {station_id}: "
-                        f"expected {registered.get('medicine_name')} ({registered_medicine_id}), "
-                        f"got {record.get('medicine_name')} ({scanned_medicine_id})"
+                    self._flag_wrong_station_bottle(
+                        station_id=station_id,
+                        registered=registered,
+                        scan_received_at=scan_received_at,
+                        current_weight_g=weight_g,
+                        scanned_medicine_name=record.get("medicine_name"),
                     )
-                    if self.display:
-                        self.display.show_warning_screen(
-                            "Wrong medicine detected",
-                            f"Please place {registered.get('medicine_name', 'the correct medicine')} "
-                            f"on {station_id}"
-                        )
-                    if self.audio:
-                        self.audio.speak_async(
-                            f"Wrong medicine detected. Please place "
-                            f"{registered.get('medicine_name', 'the correct medicine')} "
-                            f"on {station_id}"
-                        )
+                    state_changed = True
+                    self.tag_runtime_service.start_scanning(station_id)
                     continue
 
-            status = self.weight_manager.get_station_status(station_id)
-            if not status.get("connected"):
+            if record.get("station_id") != station_id:
                 continue
-
-            weight_g = float(status.get("weight_g") or 0.0)
             if not status.get("stable", False):
                 continue
-            if weight_g < self.min_secured_bottle_weight_g:
-                continue
+
+            was_wrong_bottle = bool(
+                self.secured_medications.get(station_id, {}).get("wrong_bottle_on_station")
+            )
 
             self._secure_bottle_until_due(record, scan_received_at, weight_g)
+            if was_wrong_bottle:
+                self._clear_pending_wrong_medicine_audio()
+            state_changed = True
+
+        if state_changed:
+            self._refresh_security_violation_screen()
 
     def _notify_unauthorized_bottle_movement(self, secure_state: dict):
         medicine_name = secure_state.get("medicine_name", "medication")

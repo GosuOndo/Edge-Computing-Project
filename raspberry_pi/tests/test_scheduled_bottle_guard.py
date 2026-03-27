@@ -261,12 +261,16 @@ class FakeDisplay:
 class FakeAudio:
     def __init__(self):
         self.messages = []
+        self.clear_requests = []
 
     def speak_async(self, message):
         self.messages.append(message)
 
     def announce_warning(self, message):
         self.messages.append(message)
+
+    def clear_pending(self, text_contains=None):
+        self.clear_requests.append(text_contains)
 
 
 def make_system():
@@ -596,6 +600,156 @@ def test_process_secured_bottle_placements_secures_both_registered_stations():
     assert system.secured_medications["station_2"]["medicine_id"] == "M002"
     assert system.secured_medications["station_1"]["secured_weight_g"] == 42.5
     assert system.secured_medications["station_2"]["secured_weight_g"] == 51.0
+
+
+def test_wrong_cross_station_bottle_on_station_2_uses_security_alert_screen():
+    record_1 = {
+        "medicine_id": "M001",
+        "medicine_name": "Aspirin 100mg",
+        "station_id": "station_1",
+        "tag_uid": "TAG123",
+        "time_slots": "08:00,20:00",
+    }
+    record_2 = {
+        "medicine_id": "M002",
+        "medicine_name": "Metformin 500mg",
+        "station_id": "station_2",
+        "tag_uid": "TAG456",
+        "time_slots": "09:00,21:00",
+    }
+
+    system = make_system()
+    system.display = FakeDisplay()
+    system.audio = FakeAudio()
+    system.database = FakeDatabase(
+        records_by_tag={"TAG123": record_1, "TAG456": record_2},
+        records_by_station={"station_1": record_1, "station_2": record_2},
+    )
+    system.tag_runtime_service = FakeTagRuntimeService(
+        latest_by_station={
+            "station_2": {
+                "received_at": 123.0,
+                "scan_msg": {"tag_uid": "TAG123"},
+            }
+        }
+    )
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 42.5,
+            "event_detection_enabled": False,
+        },
+        "station_2": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 51.0,
+            "event_detection_enabled": False,
+        },
+    })
+    future_ts = time.time() + 3600
+    system.secured_medications = {
+        "station_2": {
+            "medicine_id": "M002",
+            "medicine_name": "Metformin 500mg",
+            "station_id": "station_2",
+            "tag_uid": "TAG456",
+            "next_due_timestamp": future_ts,
+            "next_due_display": "2026-03-25 21:00:00",
+            "scheduled_time": "21:00",
+            "present": True,
+            "authorized": False,
+            "early_alert_sent": False,
+        }
+    }
+
+    system._process_secured_bottle_placements()
+
+    assert system.secured_medications["station_2"]["wrong_bottle_on_station"] is True
+    assert system.display.error_calls == ["Station 2 wrong bottle"]
+    assert system.display.warning_calls == []
+    assert system.audio.messages == [
+        "Wrong medicine detected. Please place Metformin 500mg on station_2"
+    ]
+
+
+def test_wrong_medicine_audio_is_not_requeued_and_is_cleared_after_correction():
+    record_1 = {
+        "medicine_id": "M001",
+        "medicine_name": "Aspirin 100mg",
+        "station_id": "station_1",
+        "tag_uid": "TAG123",
+        "time_slots": "08:00,20:00",
+    }
+    wrong_record = {
+        "medicine_id": "M999",
+        "medicine_name": "Vitamin C",
+        "station_id": "station_2",
+        "tag_uid": "WRONG999",
+        "time_slots": "09:00",
+    }
+
+    system = make_system()
+    system.display = FakeDisplay()
+    system.audio = FakeAudio()
+    system.database = FakeDatabase(
+        records_by_tag={"TAG123": record_1, "WRONG999": wrong_record},
+        records_by_station={"station_1": record_1},
+    )
+    system.tag_runtime_service = FakeTagRuntimeService(
+        latest_by_station={
+            "station_1": {
+                "received_at": 100.0,
+                "scan_msg": {"tag_uid": "WRONG999"},
+            }
+        }
+    )
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 42.5,
+            "event_detection_enabled": False,
+        }
+    })
+    future_ts = time.time() + 3600
+    system.secured_medications = {
+        "station_1": {
+            "medicine_id": "M001",
+            "medicine_name": "Aspirin 100mg",
+            "station_id": "station_1",
+            "tag_uid": "TAG123",
+            "next_due_timestamp": future_ts,
+            "next_due_display": "2026-03-25 20:00:00",
+            "scheduled_time": "20:00",
+            "present": True,
+            "authorized": False,
+            "early_alert_sent": False,
+        }
+    }
+    system._get_next_due_datetime = (
+        lambda raw_slots, now=None: (datetime(2026, 3, 25, 20, 0, 0), "20:00")
+    )
+
+    system._process_secured_bottle_placements()
+    system._process_secured_bottle_placements()
+
+    system.tag_runtime_service.latest_by_station["station_1"] = {
+        "received_at": 101.0,
+        "scan_msg": {"tag_uid": "TAG123"},
+    }
+
+    system._process_secured_bottle_placements()
+
+    assert system.audio.messages == [
+        "Wrong medicine detected. Please place Aspirin 100mg on station_1"
+    ]
+    assert system.audio.clear_requests == [
+        ("Wrong medicine detected", "Wrong bottle detected")
+    ]
+    assert system.display.error_calls == ["Station 1 wrong bottle"]
+    assert system.display.idle_calls != []
+    assert "wrong_bottle_on_station" not in system.secured_medications["station_1"]
 
 
 def test_unauthorized_bottle_movement_alerts_once_before_due():

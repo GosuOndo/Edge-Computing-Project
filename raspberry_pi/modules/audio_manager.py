@@ -1,5 +1,6 @@
 """Audio Manager - offline speech and alerts for Raspberry Pi"""
 
+from collections import deque
 import queue
 import subprocess
 import threading
@@ -200,6 +201,57 @@ class AudioManager:
 
     def announce_warning(self, message):
         self.speak_async(f"Warning. {message}")
+
+    def clear_pending(self, text_contains=None):
+        """
+        Remove queued speech items that have not started playing yet.
+
+        When *text_contains* is provided, only queued messages containing that
+        substring (or any substring in the iterable) are removed.
+        """
+        if not hasattr(self, "_speech_queue"):
+            return 0
+
+        if text_contains is None:
+            matchers = None
+        elif isinstance(text_contains, str):
+            matchers = (text_contains,)
+        else:
+            matchers = tuple(str(item) for item in text_contains)
+
+        removed = 0
+        retained = deque()
+
+        with self._speech_queue.mutex:
+            while self._speech_queue.queue:
+                item = self._speech_queue.queue.popleft()
+                if item is None:
+                    retained.append(item)
+                    continue
+
+                text, done_event = item
+                should_remove = (
+                    matchers is None
+                    or any(token in str(text) for token in matchers)
+                )
+                if should_remove:
+                    removed += 1
+                    self._speech_queue.unfinished_tasks = max(
+                        0, self._speech_queue.unfinished_tasks - 1
+                    )
+                    if done_event is not None:
+                        done_event.set()
+                    continue
+
+                retained.append(item)
+
+            self._speech_queue.queue.extend(retained)
+            if self._speech_queue.unfinished_tasks == 0:
+                self._speech_queue.all_tasks_done.notify_all()
+
+        if removed:
+            self.logger.info(f"Cleared {removed} pending audio message(s)")
+        return removed
 
     def set_volume(self, volume):
         pass
