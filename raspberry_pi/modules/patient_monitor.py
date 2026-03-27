@@ -309,51 +309,11 @@ class PatientMonitor:
 
     def _monitor_loop(self, duration: int, callback):
         """Background thread: open camera, run detection, collect results."""
-        # Try the configured device first, then fall back to indices 0-4.
-        cap = None
-        fallback_ids = [self._device_id] + [
-            i for i in range(5) if i != self._device_id
-        ]
-        used_device_id = self._device_id
-        for dev_id in fallback_ids:
-            test_cap = cv2.VideoCapture(dev_id)
-            if test_cap.isOpened():
-                cap = test_cap
-                used_device_id = dev_id
-                if dev_id != self._device_id:
-                    self._log(
-                        f"PatientMonitor: device {self._device_id} unavailable, "
-                        f"using device {dev_id}"
-                    )
-                break
-            test_cap.release()
-
-        if cap is None:
-            self._log(
-                f"PatientMonitor: cannot open camera (tried devices {fallback_ids})"
-            )
-            # Still honour the full monitoring duration so the monitoring phase
-            # completes properly (and the caller can evaluate the result after
-            # the timer expires rather than jumping straight to the next phase).
-            start_time = time.time()
-            while self._active and (time.time() - start_time) < duration:
-                elapsed = time.time() - start_time
-                if callback:
-                    try:
-                        callback(
-                            {
-                                "swallow_count": 0,
-                                "hand_motion":   False,
-                                "mouth_open":    False,
-                            },
-                            elapsed,
-                            duration,
-                        )
-                    except Exception:
-                        pass
-                time.sleep(0.5)
-            self._results = self._build_result(0, 0)
+        cap = cv2.VideoCapture(self._device_id)
+        if not cap.isOpened():
+            self._log(f"PatientMonitor: cannot open camera (device {self._device_id})")
             self._active  = False
+            self._results = self._build_result(0, 0)
             return
 
         self._cap = cap
