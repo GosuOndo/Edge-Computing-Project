@@ -1091,10 +1091,9 @@ class DisplayManager:
                 if issue != "tampered" and scheduled_time:
                     detail += f"   •   Due at  {scheduled_time}"
                 if issue == "tampered":
-                    delta_g   = abs(float(item.get("tamper_delta_g", 0.0) or 0.0))
+                    delta_g   = item.get("tamper_delta_g", 0.0)
                     pills_est = item.get("tamper_pills_est", "?")
-                    direction = item.get("tamper_direction", "changed")
-                    detail += f"   •   {delta_g:.1f} g {direction}  (~{pills_est} pills)"
+                    detail += f"   •   {delta_g:.1f} g lighter  (~{pills_est} pills)"
                 self._draw_text(detail, 'normal', 'text_light', left_x, row_y + 46)
 
                 # Action instruction – third line, left
@@ -1103,7 +1102,7 @@ class DisplayManager:
                 elif issue == "incorrect":
                     action = f"Replace bottle with {medicine_name} on {station_label}"
                 else:  # tampered
-                    action = "Bottle weight changed. Caregiver has been notified."
+                    action = "Caregiver has been notified. Do not take any more pills."
                 self._draw_text(action, 'normal', 'primary', left_x, row_y + 78)
 
                 # Divider between rows

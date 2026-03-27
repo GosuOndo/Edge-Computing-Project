@@ -172,7 +172,6 @@ class FakeWeightManager:
             station_id: {"id": station_id}
             for station_id in self.status_by_station
         }
-        self.saved_baselines = 0
 
     def get_station_status(self, station_id):
         return dict(self.status_by_station[station_id])
@@ -189,14 +188,9 @@ class FakeWeightManager:
         self.calls.append(("enable", station_id))
         self.status_by_station[station_id]["event_detection_enabled"] = True
 
-    def _get_min_delta_g(self, station_id):
-        return 0.2
-
-    def _get_pill_weight_g(self, station_id):
-        return 0.5
-
-    def _save_persisted_baselines(self):
-        self.saved_baselines += 1
+    def disable_event_detection(self, station_id):
+        self.calls.append(("disable", station_id))
+        self.status_by_station[station_id]["event_detection_enabled"] = False
 
 
 class FakeStateMachine:
@@ -206,18 +200,16 @@ class FakeStateMachine:
     def get_state(self):
         return self.state
 
+    def reset_to_idle(self):
+        self.state = SystemState.IDLE
+
 
 class FakeTelegram:
     def __init__(self):
         self.alerts = []
-        self.tamper_alerts = []
 
     def send_unauthorized_bottle_movement_alert(self, **kwargs):
         self.alerts.append(kwargs)
-        return True
-
-    def send_bottle_tampering_alert(self, **kwargs):
-        self.tamper_alerts.append(kwargs)
         return True
 
 
@@ -321,6 +313,50 @@ def test_process_secured_bottle_placement_tracks_next_due():
     assert secure_state["present"] is True
     assert secure_state["authorized"] is False
     assert secure_state["secured_weight_g"] == 42.5
+
+
+def test_station_with_scheduler_times_skips_onboarding():
+    system = make_system()
+    system.database = FakeDatabase(records_by_station={"station_1": None})
+    system.scheduler = types.SimpleNamespace(
+        medications=[
+            {
+                "name": "Aspirin 100mg",
+                "station_id": "station_1",
+                "dosage_pills": 1,
+                "times": ["08:00"],
+            }
+        ]
+    )
+
+    assert system._station_has_existing_schedule("station_1") is True
+
+
+def test_end_verification_cycle_keeps_continuous_scanning_active():
+    system = make_system()
+    system.state_machine = FakeStateMachine(SystemState.MONITORING_PATIENT)
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 42.5,
+            "event_detection_enabled": True,
+        }
+    })
+    system.display = FakeDisplay()
+    system.current_medication = {"station_id": "station_1"}
+    system.pending_monitoring_ui = (0, 30, "Monitoring...", 0, 1)
+    system.secured_medications = {"station_1": {"medicine_name": "Aspirin 100mg"}}
+    system._dose_pills_removed = {"station_1": 1}
+    system._dose_attempt_count = {"station_1": 1}
+
+    system._end_verification_cycle("station_1")
+
+    assert ("disable", "station_1") in system.weight_manager.calls
+    assert ("start", None) in system.tag_runtime_service.scan_commands
+    assert system.current_medication is None
+    assert system.secured_medications == {}
+    assert system.display.idle_calls != []
 
 
 def test_monitoring_overdose_returns_to_idle_without_success(monkeypatch):
@@ -731,7 +767,7 @@ def test_simultaneous_returns_are_verified_per_station():
     assert system.display.error_calls[-1] == (
         "Station 2 wrong bottle"
     )
-    assert ("stop", "station_1") in system.tag_runtime_service.scan_commands
+    assert ("start", "station_1") in system.tag_runtime_service.scan_commands
     assert ("start", "station_2") in system.tag_runtime_service.scan_commands
     assert "station_2" in system.tag_runtime_service.cleared_stations
 
@@ -897,49 +933,6 @@ def test_both_incorrect_bottles_show_combined_error_screen():
     assert system.display.error_calls[-1] == (
         "Station 1 wrong bottle | Station 2 wrong bottle"
     )
-
-
-def test_stationary_bottle_weight_change_triggers_alert_without_full_removal():
-    system = make_system()
-    system.display = FakeDisplay()
-    system.audio = FakeAudio()
-    system.weight_manager = FakeWeightManager({
-        "station_1": {
-            "connected": True,
-            "stable": True,
-            "weight_g": 41.8,
-            "event_detection_enabled": False,
-        },
-    })
-
-    now_ts = time.time()
-    system.secured_medications = {
-        "station_1": {
-            "medicine_id": "M001",
-            "medicine_name": "Aspirin 100mg",
-            "station_id": "station_1",
-            "tag_uid": "TAG123",
-            "next_due_timestamp": now_ts + 3600,
-            "next_due_display": "2026-03-25 20:00:00",
-            "scheduled_time": "20:00",
-            "present": True,
-            "authorized": False,
-            "secured_weight_g": 42.5,
-            "current_weight_g": 42.5,
-            "early_alert_sent": False,
-        }
-    }
-
-    system._process_secured_bottle_movements()
-
-    secure_state = system.secured_medications["station_1"]
-    assert secure_state["tamper_alert_sent"] is True
-    assert secure_state["tamper_direction"] == "lighter"
-    assert secure_state["current_weight_g"] == 41.8
-    assert system.display.error_calls[-1] == "Station 1 tampered bottle"
-    assert "weight has changed" in system.audio.messages[-1]
-    assert system.telegram.tamper_alerts[-1]["reference_weight_g"] == 42.5
-    assert system.telegram.tamper_alerts[-1]["returned_weight_g"] == 41.8
 
 
 def test_weight_manager_rolls_baseline_to_returned_weight(tmp_path):

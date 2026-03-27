@@ -7,17 +7,10 @@ Orchestrates all modules and handles the complete medication intake workflow.
 
 Tag scan control
 -----------------
-Scanning is gated by the firmware.  The Pi controls the gate via MQTT:
-
-  start_scanning()  - sent when the bottle is lifted (bottle_lifted_callback)
-                      so the reader is active and ready to capture the tag
-                      as the bottle is placed back on the scale.
-
-  stop_scanning()   - sent after every verification cycle (success, failure,
-                      or missed dose) so stale scans do not accumulate
-                      between dose windows.
-
-Onboarding scanning is controlled entirely by RegistrationManager.
+During normal runtime the tag readers stay enabled so the Pi can continuously
+observe which bottle is resting on each station. Onboarding still uses tighter
+per-slot scan control inside RegistrationManager to avoid capturing the
+outgoing bottle as the next slot's scan.
 """
 
 import sys
@@ -346,6 +339,31 @@ class MedicationSystem:
             f"{next_due_at.strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
+    def _station_has_existing_schedule(self, station_id: str) -> bool:
+        """
+        Return True when this station already has a usable medication schedule,
+        either from persisted registration data or from static scheduler config.
+        """
+        registered = self.database.get_registered_medicine_by_station(station_id)
+        if registered and self._parse_time_slots(registered.get("time_slots")):
+            return True
+
+        scheduler_medications = getattr(self.scheduler, "medications", [])
+        for medication in scheduler_medications:
+            if medication.get("station_id") != station_id:
+                continue
+            if medication.get("times"):
+                return True
+        return False
+
+    def _enable_continuous_tag_scanning(self, station_id: str = None):
+        """Keep NFC readers active during normal runtime."""
+        self.tag_runtime_service.start_scanning(station_id)
+        if station_id:
+            self.logger.info(f"Continuous NFC scanning active on {station_id}")
+        else:
+            self.logger.info("Continuous NFC scanning active on all stations")
+
     def _process_secured_bottle_placements(self):
         for station_id in self.weight_manager.station_configs:
             latest = self.tag_runtime_service.get_latest_scan(station_id)
@@ -656,81 +674,8 @@ class MedicationSystem:
         secure_state["tamper_alert_until"] = time.time() + 30
         secure_state["tamper_delta_g"]     = round(delta_g, 2)
         secure_state["tamper_pills_est"]   = estimated_pills
-        secure_state["tamper_direction"]   = "lighter"
-        secure_state["current_weight_g"]   = returned_weight_g
         # Immediately refresh the security screen to show the tamper alert.
         self._refresh_security_violation_screen()
-
-    def _check_stationary_bottle_weight_change(
-        self, secure_state: dict, observed_weight_g: float
-    ) -> bool:
-        """
-        Detect meaningful weight drift while the bottle is still sitting on the
-        station. This catches pills being removed without fully lifting the
-        bottle off the scale.
-        """
-        station_id    = secure_state.get("station_id", "unknown")
-        medicine_name = secure_state.get("medicine_name", "Unknown")
-        reference_g   = (
-            secure_state.get("current_weight_g")
-            or secure_state.get("secured_weight_g")
-        )
-        if not reference_g or reference_g <= 0:
-            return False
-
-        cfg         = self.weight_manager.station_configs.get(station_id, {})
-        threshold_g = float(
-            cfg.get("tamper_tolerance_g")
-            or self.weight_manager._get_min_delta_g(station_id)
-        )
-        delta_g = observed_weight_g - reference_g
-
-        if abs(delta_g) <= threshold_g:
-            return False
-
-        direction = "lighter" if delta_g < 0 else "heavier"
-        change_g  = abs(delta_g)
-        pill_weight_g = self.weight_manager._get_pill_weight_g(station_id)
-        estimated_pills = (
-            max(1, round(change_g / pill_weight_g))
-            if pill_weight_g > 0 else "unknown"
-        )
-        station_label = station_id.replace("_", " ").title()
-
-        self.logger.warning(
-            f"[{station_id}] STATIONARY WEIGHT CHANGE: {medicine_name} is "
-            f"{change_g:.2f}g {direction} while still on the station"
-        )
-
-        if self.audio:
-            self.audio.speak_async(
-                f"Warning. {medicine_name} bottle weight has changed. "
-                f"It is now {direction} by {change_g:.1f} grams. "
-                "Your caregiver has been notified."
-            )
-
-        self.telegram.send_bottle_tampering_alert(
-            medicine_name=medicine_name,
-            station_id=station_id,
-            station_label=station_label,
-            reference_weight_g=reference_g,
-            returned_weight_g=observed_weight_g,
-            delta_g=delta_g,
-            estimated_pills_removed=estimated_pills,
-        )
-
-        if observed_weight_g > 0:
-            self.weight_manager.baseline_weights[station_id] = observed_weight_g
-            self.weight_manager._save_persisted_baselines()
-
-        secure_state["tamper_alert_sent"]  = True
-        secure_state["tamper_alert_until"] = time.time() + 30
-        secure_state["tamper_delta_g"]     = round(change_g, 2)
-        secure_state["tamper_pills_est"]   = estimated_pills
-        secure_state["tamper_direction"]   = direction
-        secure_state["current_weight_g"]   = observed_weight_g
-        self._refresh_security_violation_screen()
-        return True
 
     def _verify_returned_bottle(self, secure_state: dict):
         """
@@ -797,7 +742,7 @@ class MedicationSystem:
                     f"{secure_state.get('medicine_name', 'the correct medication')}"
                 )
 
-        self.tag_runtime_service.stop_scanning(station_id)
+        self._enable_continuous_tag_scanning(station_id)
         return correct
 
     def _process_secured_bottle_movements(self):
@@ -883,6 +828,7 @@ class MedicationSystem:
                 elif not secure_state.get("wrong_bottle_on_station", False):
                     secure_state["present"] = True
                     if status.get("stable", False):
+                        secure_state["current_weight_g"] = weight_g
                         # Execute any deferred tamper check on the first stable
                         # reading after the correct bottle was returned.
                         if secure_state.get("tamper_check_pending", False):
@@ -893,12 +839,6 @@ class MedicationSystem:
                                 and not self._has_pending_security_violation()
                             ):
                                 self._show_idle_screen()
-                        elif self._check_stationary_bottle_weight_change(
-                            secure_state, weight_g
-                        ):
-                            continue
-                        else:
-                            secure_state["current_weight_g"] = weight_g
                 continue
 
             # Bottle not present - clear flags so the next placement
@@ -1052,9 +992,9 @@ class MedicationSystem:
         Fired by WeightManager when the bottle is lifted off an armed station
         (WAITING_FOR_REMOVAL ? REMOVED transition).
 
-        We start scanning immediately so the reader is active and ready to
-        capture the tag the moment the bottle is placed back on the scale.
-        This is the only time scanning is enabled outside of onboarding.
+        Scanning is already kept active during runtime, but we explicitly send
+        start_scan here as a harmless reinforcement when a dosing interaction
+        begins.
         """
         station_id = event_data.get("station_id", "unknown")
         self.logger.info(
@@ -1361,11 +1301,7 @@ class MedicationSystem:
             self.weight_manager.disable_event_detection(station_id)
             self.secured_medications.pop(station_id, None)
 
-            # Stop scanning - no verification will happen for this dose window
-            self.tag_runtime_service.stop_scanning()
-            self.logger.info(
-                f"Tag scanning STOPPED after missed dose on {station_id}"
-            )
+            self._enable_continuous_tag_scanning()
 
         self.current_medication    = None
         self.pending_monitoring_ui = None
@@ -1829,8 +1765,7 @@ class MedicationSystem:
         """
         Common teardown after every verification path (success, early-exit,
         missed dose).  Disarms the weight sensor, clears medication state,
-        and STOPS tag scanning so stale scans do not linger until the next
-        dose window.
+        and keeps continuous tag scanning enabled for normal runtime.
         """
         # Cancel firmware dosing if still active.
         if self._firmware_dosing_active:
@@ -1848,11 +1783,7 @@ class MedicationSystem:
         self._dose_pills_removed.pop(station_id, None)
         self._dose_attempt_count.pop(station_id, None)
 
-        # Stop scanning - scanning resumes the next time the bottle is lifted
-        self.tag_runtime_service.stop_scanning()
-        self.logger.info(
-            f"Tag scanning STOPPED after verification cycle on {station_id}"
-        )
+        self._enable_continuous_tag_scanning()
 
         if self.display:
             self._show_idle_screen()
@@ -2005,14 +1936,17 @@ class MedicationSystem:
         EXPECTED_MEDICINE_COUNT = 1  # one medicine per station
         STATION_IDS = list(self.weight_manager.station_configs.keys())
 
-        registered_before = self.database.list_registered_medicines()
-        registered_station_ids = {r.get("station_id") for r in registered_before}
         onboarding_was_needed = any(
-            sid not in registered_station_ids for sid in STATION_IDS
+            not self._station_has_existing_schedule(sid) for sid in STATION_IDS
         )
 
         all_registered = True
         for station_id in STATION_IDS:
+            if self._station_has_existing_schedule(station_id):
+                self.logger.info(
+                    f"Schedule already in place for {station_id}, skipping onboarding"
+                )
+                continue
             ok = self.registration_manager.run_onboarding_if_needed(
                 station_id=station_id,
                 expected_medicine_count=EXPECTED_MEDICINE_COUNT,
@@ -2024,8 +1958,7 @@ class MedicationSystem:
                     "System may have partial setup."
                 )
                 all_registered = False
-        # run_onboarding_if_needed calls stop_scanning() per station when done,
-        # so all readers are idle when we enter the main loop.
+        self._enable_continuous_tag_scanning()
 
         self._load_schedule_from_database()
 
