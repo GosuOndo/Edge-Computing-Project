@@ -74,6 +74,7 @@ class MedicationSystem:
         self.pending_monitoring_ui       = None
         self.secured_medications         = {}
         self._processed_tag_scans        = {}
+        self._last_station_scan_audit    = {}
         self.min_secured_bottle_weight_g = float(
             self.config.get("registration", {}).get("min_bottle_weight_g", 5.0)
         )
@@ -363,6 +364,47 @@ class MedicationSystem:
             self.logger.info(f"Continuous NFC scanning active on {station_id}")
         else:
             self.logger.info("Continuous NFC scanning active on all stations")
+
+    def _audit_occupied_stations_with_nfc(self, audit_interval_seconds: float = 5.0):
+        """
+        Periodically force a fresh NFC read for occupied stations so bottle
+        identity is re-verified even when the bottle has not been lifted.
+        """
+        now_ts = time.time()
+
+        for station_id in self.weight_manager.station_configs:
+            if (
+                self.current_medication
+                and self.current_medication.get("station_id") == station_id
+            ):
+                continue
+
+            status = self.weight_manager.get_station_status(station_id)
+            if not status.get("connected"):
+                continue
+
+            weight_g = float(status.get("weight_g") or 0.0)
+            if weight_g < self.min_secured_bottle_weight_g:
+                continue
+
+            latest = self.tag_runtime_service.get_latest_scan(station_id)
+            latest_ts = float(latest.get("received_at", 0.0)) if latest else 0.0
+            processed_ts = self._processed_tag_scans.get(station_id, 0.0)
+            if latest_ts > processed_ts:
+                continue
+
+            if (
+                now_ts - self._last_station_scan_audit.get(station_id, 0.0)
+                < audit_interval_seconds
+            ):
+                continue
+
+            self.logger.info(
+                f"Forcing fresh NFC audit on {station_id} while bottle remains on scale"
+            )
+            self.tag_runtime_service.clear_latest_scan(station_id)
+            self.tag_runtime_service.start_scanning(station_id)
+            self._last_station_scan_audit[station_id] = now_ts
 
     def _process_secured_bottle_placements(self):
         for station_id in self.weight_manager.station_configs:
@@ -1981,6 +2023,7 @@ class MedicationSystem:
         try:
             while self.running:
                 self._process_secured_bottle_placements()
+                self._audit_occupied_stations_with_nfc()
                 self._process_secured_bottle_movements()
                 self._process_pending_manual_reminder()
                 self._authorize_current_medication_if_ready()

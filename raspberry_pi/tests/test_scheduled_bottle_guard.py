@@ -359,6 +359,33 @@ def test_end_verification_cycle_keeps_continuous_scanning_active():
     assert system.display.idle_calls != []
 
 
+def test_nfc_audit_retriggers_scan_for_occupied_station_after_relaunch():
+    system = make_system()
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 42.5,
+            "event_detection_enabled": False,
+        }
+    })
+    system._last_station_scan_audit = {}
+    system._processed_tag_scans = {"station_1": 100.0}
+    system.tag_runtime_service = FakeTagRuntimeService(
+        latest_by_station={
+            "station_1": {
+                "received_at": 100.0,
+                "scan_msg": {"tag_uid": "TAG123"},
+            }
+        }
+    )
+
+    system._audit_occupied_stations_with_nfc(audit_interval_seconds=0.0)
+
+    assert "station_1" in system.tag_runtime_service.cleared_stations
+    assert ("start", "station_1") in system.tag_runtime_service.scan_commands
+
+
 def test_monitoring_overdose_returns_to_idle_without_success(monkeypatch):
     monkeypatch.setattr("raspberry_pi.main.time.sleep", lambda *_args, **_kwargs: None)
 
