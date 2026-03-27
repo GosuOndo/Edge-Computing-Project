@@ -342,7 +342,7 @@ class MedicationSystem:
             )
             return
 
-        self.secured_medications[station_id] = {
+        new_state = {
             "medicine_id":         record.get("medicine_id"),
             "medicine_name":       medicine_name,
             "station_id":          station_id,
@@ -357,6 +357,13 @@ class MedicationSystem:
             "present":             True,
             "early_alert_sent":    False,
         }
+        # Preserve any active tamper alert so a re-scan of the bottle does not
+        # silently clear a security violation that is still unresolved.
+        if existing_same_medicine:
+            for key in ("tamper_alert_sent", "tamper_delta_g", "tamper_pills_est"):
+                if key in existing_state:
+                    new_state[key] = existing_state[key]
+        self.secured_medications[station_id] = new_state
         self._processed_tag_scans[station_id] = scan_received_at
 
         self.logger.info(
