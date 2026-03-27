@@ -451,6 +451,49 @@ class DisplayManager:
             pygame.display.flip()
 
     # ------------------------------------------------------------------
+    # Baseline captured screen
+    # ------------------------------------------------------------------
+
+    def show_baseline_captured_screen(
+        self, medicine_name: str, baseline_g: float, dosage: int, time_str: str
+    ):
+        """
+        Shown briefly after a fresh baseline is captured at scheduled dose time.
+        Displays the new baseline weight before transitioning to the reminder screen.
+        """
+        if not self.initialized:
+            return
+        with self.screen_lock:
+            self._draw_frame("SENSOR CALIBRATED", 'success')
+            self._draw_card('success')
+
+            cy = self._card_text_y(20)
+            self._draw_text("New Baseline Weight", 'medium', 'text_light',
+                            self.width // 2, cy, center=True)
+
+            self._draw_text(f"{baseline_g:.2f} g", 'huge', 'success',
+                            self.width // 2, cy + 70, center=True)
+
+            self._draw_text("STABLE  ✓", 'medium', 'success',
+                            self.width // 2, cy + 160, center=True)
+
+            pygame.draw.line(
+                self.screen, self.colors['text_light'],
+                (self._PANEL_X + 40, cy + 210),
+                (self._PANEL_X + self._PANEL_W - 40, cy + 210), 1
+            )
+
+            self._draw_text(
+                f"Now take  {dosage}  pill(s)  of  {medicine_name}  (scheduled {time_str})",
+                'normal', 'text_dark', self.width // 2, cy + 250, center=True
+            )
+
+            self._draw_footer(
+                "Calibration complete  |  Preparing medication reminder", 'success'
+            )
+            pygame.display.flip()
+
+    # ------------------------------------------------------------------
     # Pipeline / verification progress screen
     # ------------------------------------------------------------------
 

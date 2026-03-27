@@ -1124,7 +1124,15 @@ class MedicationSystem:
         # Mark as required first so _authorize falls back to single-sample
         # capture if the recapture times out or the bottle is absent.
         self.weight_manager.baseline_capture_required[station_id] = True
-        self._recapture_fresh_baseline(station_id)
+        recaptured = self._recapture_fresh_baseline(station_id)
+
+        if recaptured and self.display:
+            new_baseline_g = self.weight_manager.baseline_weights.get(station_id, 0.0)
+            self.display.show_baseline_captured_screen(
+                medicine_name, new_baseline_g, dosage, time_str
+            )
+            time.sleep(2.5)
+            self.display.show_reminder_screen(medicine_name, dosage, time_str)
 
         self._authorize_current_medication_if_ready()
 
