@@ -1761,11 +1761,26 @@ class MedicationSystem:
                 SystemState.REMINDER_ACTIVE, self.current_medication
             )
 
-            next_event = self._wait_for_pill_removal_event(timeout_seconds=120.0)
+            next_event = self._wait_for_pill_removal_event(
+                timeout_seconds=120.0,
+                medicine_name=medicine_name,
+                swallow_count=total_swallows,
+                expected_dosage=expected_dosage,
+            )
 
             if next_event is None:
                 # Patient did not respond within the timeout window.
                 self.logger.warning("Intake retry timed out – patient did not respond")
+                if self.display:
+                    self.display.show_caregiver_notification_screen(
+                        medicine_name=medicine_name,
+                        swallow_count=total_swallows,
+                        expected_dosage=expected_dosage,
+                    )
+                if self.audio:
+                    self.audio.announce_warning(
+                        "Time is up. Your caregiver has been notified."
+                    )
                 self.telegram.send_incorrect_dosage_alert(
                     medicine_name=medicine_name,
                     expected=expected_dosage,
@@ -1910,18 +1925,27 @@ class MedicationSystem:
                 "hand_motion_count": 0,
             }
 
-    def _wait_for_pill_removal_event(self, timeout_seconds: float = 120.0):
+    def _wait_for_pill_removal_event(
+        self,
+        timeout_seconds: float = 120.0,
+        medicine_name: str = "",
+        swallow_count: int = 0,
+        expected_dosage: int = 0,
+    ):
         """
         Block until the weight sensor fires a pill-removal event or the
         timeout expires.  The caller must have already transitioned to
         REMINDER_ACTIVE so that _on_pill_removal() queues the event.
 
+        When medicine_name / swallow_count / expected_dosage are provided
+        the intake-mismatch screen is refreshed each tick with a live
+        countdown so the patient can see how much time remains.
+
         Returns the event dict on success, or None on timeout / shutdown.
-        The mismatch screen shown by the caller remains visible throughout
-        because no display call is made here.
         """
         self.pending_weight_event = None
-        deadline = time.time() + timeout_seconds
+        start    = time.time()
+        deadline = start + timeout_seconds
 
         while time.time() < deadline:
             if not self.running:
@@ -1931,6 +1955,15 @@ class MedicationSystem:
                 self.pending_weight_event = None
                 return event
             if self.display:
+                if medicine_name:
+                    elapsed = time.time() - start
+                    self.display.show_intake_mismatch_screen(
+                        medicine_name=medicine_name,
+                        swallow_count=swallow_count,
+                        expected_dosage=expected_dosage,
+                        elapsed=elapsed,
+                        duration=timeout_seconds,
+                    )
                 self.display.update()
             time.sleep(0.05)
 
