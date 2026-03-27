@@ -1733,7 +1733,7 @@ class MedicationSystem:
             self._end_verification_cycle(expected_station_id)
             return
 
-        # ---- Under-count: show countdown, no camera ----
+        # ---- Under-count: show mismatch screen then re-run monitoring ----
         if total_swallows < expected_dosage:
             remaining = expected_dosage - total_swallows
             pill_word = "pill" if remaining == 1 else "pills"
@@ -1741,29 +1741,64 @@ class MedicationSystem:
                 f"Intake mismatch: {total_swallows} swallow(s) detected, "
                 f"~{expected_dosage} expected for {medicine_name}"
             )
+            if self.display:
+                self.display.show_intake_mismatch_screen(
+                    medicine_name=medicine_name,
+                    swallow_count=total_swallows,
+                    expected_dosage=expected_dosage,
+                )
             if self.audio:
                 self.audio.announce_warning(
                     f"Only {total_swallows} swallow detected. "
                     f"Please take {remaining} more {pill_word}."
                 )
+            time.sleep(3)
 
-            # Transition to REMINDER_ACTIVE so _on_pill_removal can queue
-            # an event if the patient picks up the bottle during the window.
-            self.state_machine.transition_to(
-                SystemState.REMINDER_ACTIVE, self.current_medication
+            # Run a second monitoring session (camera on, 30-second countdown)
+            # identical in behaviour to the first monitoring phase.
+            retry_result   = self._run_monitoring_session(expected_dosage)
+            new_swallows   = int(retry_result.get("swallow_count", 0))
+            total_swallows += new_swallows
+            monitoring_result = retry_result
+            self.logger.info(
+                f"Incomplete-intake retry: +{new_swallows} swallows "
+                f"(total {total_swallows}/{expected_dosage})"
             )
 
-            # 30-second countdown (camera stays off).
-            next_event = self._wait_for_pill_removal_event(
-                timeout_seconds=30.0,
-                medicine_name=medicine_name,
-                swallow_count=total_swallows,
-                expected_dosage=expected_dosage,
-            )
+            if not self.running:
+                return
 
-            if next_event is None:
-                # Timer expired – patient did not respond.
-                self.logger.warning("Incomplete intake: countdown expired, notifying caregiver")
+            # Over-count during retry
+            if total_swallows > expected_dosage:
+                if self.display:
+                    self.display.show_overdose_screen(
+                        medicine_name, total_swallows, expected_dosage
+                    )
+                if self.audio:
+                    self.audio.announce_warning(
+                        f"Too many pills detected. "
+                        f"You took {total_swallows} but only {expected_dosage} "
+                        f"are required. Please contact your caregiver."
+                    )
+                self.telegram.send_incorrect_dosage_alert(
+                    medicine_name=medicine_name,
+                    expected=expected_dosage,
+                    actual=total_swallows
+                )
+                decision = self._build_incorrect_dosage_decision(
+                    medicine_name=medicine_name,
+                    expected_dosage=expected_dosage,
+                    actual_dosage=total_swallows,
+                    stage="incomplete_intake"
+                )
+                self.database.log_medication_event(decision)
+                time.sleep(5)
+                self._end_verification_cycle(expected_station_id)
+                return
+
+            # Still under-count after retry → notify caregiver
+            if total_swallows < expected_dosage:
+                self.logger.warning("Incomplete intake after retry – notifying caregiver")
                 if self.display:
                     self.display.show_caregiver_notification_screen(
                         medicine_name=medicine_name,
