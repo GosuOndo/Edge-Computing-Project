@@ -1518,29 +1518,34 @@ class MedicationSystem:
             # ---- Over-count ----
             if total_swallows > expected_dosage:
                 self.logger.warning(
-                    f"Intake excess: {total_swallows} swallow(s), "
-                    f"only ~{expected_dosage} expected for {medicine_name}"
+                    f"Intake excess: {total_swallows} pill(s) consumed, "
+                    f"only {expected_dosage} expected for {medicine_name}"
                 )
                 if self.display:
-                    self.display.show_warning_screen(
-                        "Too Many Intakes Detected",
-                        f"Detected {total_swallows} swallow(s) but only "
-                        f"{expected_dosage} expected for {medicine_name}.\n"
-                        "Your caregiver has been notified."
+                    self.display.show_overdose_screen(
+                        medicine_name, total_swallows, expected_dosage
                     )
                 if self.audio:
                     self.audio.announce_warning(
-                        f"Too many intakes detected. {total_swallows} swallows "
-                        f"but only {expected_dosage} expected for {medicine_name}. "
-                        "Your caregiver has been notified."
+                        f"Too many pills detected. "
+                        f"You took {total_swallows} but only {expected_dosage} "
+                        f"are required. Please contact your caregiver."
                     )
                 self.telegram.send_incorrect_dosage_alert(
                     medicine_name=medicine_name,
                     expected=expected_dosage,
                     actual=total_swallows
                 )
+                decision = self._build_incorrect_dosage_decision(
+                    medicine_name=medicine_name,
+                    expected_dosage=expected_dosage,
+                    actual_dosage=total_swallows,
+                    stage="intake_monitoring"
+                )
+                self.database.log_medication_event(decision)
                 time.sleep(5)
-                break
+                self._end_verification_cycle(expected_station_id)
+                return
 
             # ---- Under-count: prompt patient and wait for more pills ----
             remaining = expected_dosage - total_swallows
@@ -1614,6 +1619,41 @@ class MedicationSystem:
 
         time.sleep(3)
         self._end_verification_cycle(expected_station_id)
+
+    def _build_incorrect_dosage_decision(
+        self,
+        medicine_name: str,
+        expected_dosage: int,
+        actual_dosage: int,
+        stage: str,
+    ) -> dict:
+        """Create a consistent incorrect-dosage event for early-stop paths."""
+        return {
+            "timestamp":        time.time(),
+            "expected_medicine": medicine_name,
+            "expected_dosage":   expected_dosage,
+            "result":            DecisionResult.INCORRECT_DOSAGE,
+            "verified":          False,
+            "alerts": [
+                {
+                    "type":     "incorrect_dosage",
+                    "severity": "critical",
+                    "message": (
+                        f"Incorrect dosage: expected {expected_dosage}, "
+                        f"detected {actual_dosage}"
+                    ),
+                }
+            ],
+            "details": {
+                "weight_expected": expected_dosage,
+                "weight_actual":   actual_dosage,
+                "actual_dosage":   actual_dosage,
+                "dose_error_stage": stage,
+            },
+            "scores": {
+                "weight": 0.0,
+            },
+        }
 
     def _run_monitoring_session(self, expected_dosage: int) -> dict:
         """

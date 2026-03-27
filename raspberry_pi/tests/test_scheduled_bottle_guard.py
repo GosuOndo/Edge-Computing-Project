@@ -165,6 +165,9 @@ class FakeWeightManager:
             station_id: station_status.get("weight_g", 0.0)
             for station_id, station_status in self.status_by_station.items()
         }
+        self.baseline_capture_required = {
+            station_id: True for station_id in self.status_by_station
+        }
         self.station_configs = {
             station_id: {"id": station_id}
             for station_id in self.status_by_station
@@ -178,6 +181,7 @@ class FakeWeightManager:
         self.baseline_weights[station_id] = self.status_by_station[station_id].get(
             "weight_g", 0.0
         )
+        self.baseline_capture_required[station_id] = False
         return True
 
     def enable_event_detection(self, station_id):
@@ -207,6 +211,9 @@ class FakeDisplay:
         self.warning_calls = []
         self.error_calls = []
         self.idle_calls = []
+        self.pipeline_calls = []
+        self.overdose_calls = []
+        self.success_calls = []
 
     def show_warning_screen(self, title, message):
         self.warning_calls.append((title, message))
@@ -217,6 +224,27 @@ class FakeDisplay:
     def show_idle_screen(self, next_scheduled=None):
         self.idle_calls.append(next_scheduled)
 
+    def show_pipeline_screen(self, title, message):
+        self.pipeline_calls.append((title, message))
+
+    def show_overdose_screen(self, medicine_name, taken, required):
+        self.overdose_calls.append((medicine_name, taken, required))
+
+    def show_success_screen(self, medicine_name, message):
+        self.success_calls.append((medicine_name, message))
+
+    def show_security_alert_screen(self, issues):
+        label_map = {
+            "missing": "missing bottle",
+            "incorrect": "wrong bottle",
+            "tampered": "tampered bottle",
+        }
+        summary = " | ".join(
+            f"{issue.get('station_label')} {label_map.get(issue.get('issue'), issue.get('issue'))}"
+            for issue in issues
+        )
+        self.error_calls.append(summary)
+
 
 class FakeAudio:
     def __init__(self):
@@ -225,11 +253,15 @@ class FakeAudio:
     def speak_async(self, message):
         self.messages.append(message)
 
+    def announce_warning(self, message):
+        self.messages.append(message)
+
 
 def make_system():
     system = MedicationSystem.__new__(MedicationSystem)
     system.logger = DummyLogger()
     system.current_medication = None
+    system._firmware_dosing_active = False
     system.secured_medications = {}
     system._processed_tag_scans = {}
     system.min_secured_bottle_weight_g = 5.0
@@ -274,6 +306,99 @@ def test_process_secured_bottle_placement_tracks_next_due():
     assert secure_state["present"] is True
     assert secure_state["authorized"] is False
     assert secure_state["secured_weight_g"] == 42.5
+
+
+def test_monitoring_overdose_returns_to_idle_without_success(monkeypatch):
+    monkeypatch.setattr("raspberry_pi.main.time.sleep", lambda *_args, **_kwargs: None)
+
+    system = make_system()
+    system.running = True
+    system.config = {
+        "identity": {
+            "tag": {
+                "integrated_mode": True,
+                "coincident_window_seconds": 15.0,
+            }
+        }
+    }
+    system.current_medication = {
+        "medicine_name": "Aspirin 100mg",
+        "dosage_pills": 1,
+        "station_id": "station_1",
+        "medicine_id": "M001",
+    }
+    system._dose_pills_removed = {"station_1": 1}
+    system.display = FakeDisplay()
+    system.audio = FakeAudio()
+    system.telegram = types.SimpleNamespace(
+        alerts=[],
+        send_incorrect_dosage_alert=lambda **kwargs: system.telegram.alerts.append(kwargs) or True,
+    )
+    system.database = types.SimpleNamespace(
+        logged=[],
+        log_medication_event=lambda decision: system.database.logged.append(decision) or True,
+    )
+    system.scanner = types.SimpleNamespace(
+        initialize_camera=lambda: True,
+        release_camera=lambda: None,
+    )
+    system.identity_manager = types.SimpleNamespace(
+        verify_identity_integrated=lambda **_kwargs: {
+            "success": True,
+            "medicine_name": "Aspirin 100mg",
+            "confidence": 1.0,
+            "method": "tag",
+            "record": {},
+        }
+    )
+    system.weight_manager = types.SimpleNamespace(
+        verify_dosage=lambda station_id, expected_dosage: {
+            "verified": True,
+            "actual": expected_dosage,
+            "pill_weight_g": 0.5,
+        },
+        _get_pill_weight_g=lambda station_id: 0.5,
+        station_configs={"station_1": {"dose_verification_tolerance_g": 0.12}},
+        set_pill_weight_from_tag=lambda station_id, pill_weight_mg: None,
+    )
+    system.decision_engine = types.SimpleNamespace(
+        verify_medication_intake=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("decision engine should not run after intake overdose")
+        )
+    )
+    system.scheduler = types.SimpleNamespace(
+        mark_dose_taken=lambda medicine_name: (_ for _ in ()).throw(
+            AssertionError("dose should not be marked taken after intake overdose")
+        )
+    )
+    system._handle_decision = lambda decision: (_ for _ in ()).throw(
+        AssertionError("success/warning handler should not run after intake overdose")
+    )
+    ended_cycles = []
+    system._end_verification_cycle = lambda station_id: ended_cycles.append(station_id)
+    system._run_monitoring_session = lambda expected_dosage: {
+        "compliance_status": "good",
+        "swallow_count": 2,
+        "cough_count": 0,
+        "hand_motion_count": 0,
+    }
+
+    system._verify_medication_intake({"timestamp": time.time()})
+
+    assert system.display.overdose_calls == [("Aspirin 100mg", 2, 1)]
+    assert system.display.success_calls == []
+    assert system.telegram.alerts == [
+        {
+            "medicine_name": "Aspirin 100mg",
+            "expected": 1,
+            "actual": 2,
+        }
+    ]
+    assert len(system.database.logged) == 1
+    assert system.database.logged[0]["result"] == StubDecisionResult.INCORRECT_DOSAGE
+    assert system.database.logged[0]["details"]["weight_actual"] == 2
+    assert system.database.logged[0]["details"]["dose_error_stage"] == "intake_monitoring"
+    assert ended_cycles == ["station_1"]
 
 
 def test_process_secured_bottle_placements_secures_both_registered_stations():
