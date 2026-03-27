@@ -10,8 +10,14 @@ import numpy as np
 import pytesseract
 from PIL import Image
 import time
+from contextlib import nullcontext
 from typing import Dict, Any, Optional, List
 import re
+
+try:
+    from raspberry_pi.utils.profiler import profile_stage
+except ImportError:  # pragma: no cover - script execution path
+    from utils.profiler import profile_stage
 
 
 class MedicineScanner:
@@ -46,11 +52,37 @@ class MedicineScanner:
         # Camera
         self.camera = None
         self.camera_ready = False
+        self._profiler_context = None
         
         # Known medicine database (for fuzzy matching)
         self.known_medicines = []
         
         self.logger.info(f"Medicine scanner initialized (camera: {self.camera_device})")
+
+    def set_profiler_context(self, profiler, run_id: str, scenario: str, station_id: str):
+        self._profiler_context = {
+            "profiler": profiler,
+            "run_id": run_id,
+            "scenario": scenario,
+            "station_id": station_id,
+        }
+
+    def clear_profiler_context(self):
+        self._profiler_context = None
+
+    def _profile_stage(self, stage: str, notes=None):
+        if not self._profiler_context or not self._profiler_context.get("profiler"):
+            return nullcontext()
+
+        ctx = self._profiler_context
+        return profile_stage(
+            ctx["profiler"],
+            ctx["run_id"],
+            ctx["scenario"],
+            ctx["station_id"],
+            stage,
+            notes,
+        )
     
     def initialize_camera(self) -> bool:
         """
@@ -59,64 +91,81 @@ class MedicineScanner:
         Returns:
             True if successful
         """
-        try:
-            self.camera = cv2.VideoCapture(self.camera_device)
+        frame_means = []
+        with self._profile_stage(
+            "camera_init",
+            notes=lambda: {
+                "camera_device": self.camera_device,
+                "camera_ready": self.camera_ready,
+                "warmup_frames": len(frame_means),
+                "frame_means": frame_means,
+            },
+        ):
+            try:
+                self.camera = cv2.VideoCapture(self.camera_device)
 
-            if not self.camera.isOpened():
-                self.logger.error(f"Failed to open camera device {self.camera_device}")
+                if not self.camera.isOpened():
+                    self.logger.error(f"Failed to open camera device {self.camera_device}")
+                    return False
+
+                # Set resolution
+                self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
+                self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+
+                # Warm up webcam
+                time.sleep(4.0)
+
+                # Try several frames, but do NOT fail just because they are dark
+                ret = False
+                frame = None
+
+                for _ in range(20):
+                    ret, frame = self.camera.read()
+
+                    if ret and frame is not None:
+                        frame_means.append(round(float(frame.mean()), 2))
+                    else:
+                        frame_means.append(None)
+
+                    time.sleep(0.1)
+
+                self.logger.info(f"Camera init warm-up frame means: {frame_means}")
+
+                if not ret or frame is None:
+                    self.logger.error("Failed to capture test frame")
+                    return False
+
+                # Do not hard-fail on dark frame; only warn
+                if frame.mean() <= 5:
+                    self.logger.warning("Camera frame appears dark/empty, but continuing")
+
+                self.camera_ready = True
+                self.logger.info(
+                    f"Camera initialized at {self.resolution[0]}x{self.resolution[1]} "
+                    f"(device {self.camera_device})"
+                )
+                return True
+
+            except Exception as e:
+                self.logger.error(f"Camera initialization failed: {e}")
                 return False
-
-            # Set resolution
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
-            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
-
-            # Warm up webcam
-            time.sleep(4.0)
-
-            # Try several frames, but do NOT fail just because they are dark
-            ret = False
-            frame = None
-            frame_means = []
-
-            for _ in range(20):
-                ret, frame = self.camera.read()
-
-                if ret and frame is not None:
-                    frame_means.append(round(float(frame.mean()), 2))
-                else:
-                    frame_means.append(None)
-
-                time.sleep(0.1)
-
-            self.logger.info(f"Camera init warm-up frame means: {frame_means}")
-
-            if not ret or frame is None:
-                self.logger.error("Failed to capture test frame")
-                return False
-
-            # Do not hard-fail on dark frame; only warn
-            if frame.mean() <= 5:
-                self.logger.warning("Camera frame appears dark/empty, but continuing")
-
-            self.camera_ready = True
-            self.logger.info(
-                f"Camera initialized at {self.resolution[0]}x{self.resolution[1]} "
-                f"(device {self.camera_device})"
-            )
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Camera initialization failed: {e}")
-            return False
     
 
     
     def release_camera(self):
         """Release camera resources"""
-        if self.camera:
-            self.camera.release()
-            self.camera_ready = False
-            self.logger.info("Camera released")
+        with self._profile_stage(
+            "camera_release",
+            notes=lambda: {
+                "camera_device": self.camera_device,
+                "camera_ready_before_release": self.camera_ready,
+            },
+        ):
+            if self.camera:
+                self.camera.release()
+                self.camera = None
+                self.camera_ready = False
+                self.logger.info("Camera released")
             
 
     def capture_frame(self) -> Optional[np.ndarray]:
@@ -126,20 +175,33 @@ class MedicineScanner:
         Returns:
             Frame as numpy array or None if failed
         """
-        if not self.camera_ready:
-            self.logger.warning("Camera not initialized")
-            return None
+        frame = None
 
-        ret, frame = self.camera.read()
+        with self._profile_stage(
+            "frame_capture",
+            notes=lambda: {
+                "camera_ready": self.camera_ready,
+                "captured": frame is not None,
+                "frame_mean": (
+                    round(float(frame.mean()), 2)
+                    if frame is not None else None
+                ),
+            },
+        ):
+            if not self.camera_ready:
+                self.logger.warning("Camera not initialized")
+                return None
 
-        if not ret or frame is None:
-            self.logger.error("Failed to capture frame")
-            return None
+            ret, frame = self.camera.read()
 
-        if frame.mean() <= 5:
-            self.logger.warning("Captured frame is nearly black")
+            if not ret or frame is None:
+                self.logger.error("Failed to capture frame")
+                return None
 
-        return frame
+            if frame.mean() <= 5:
+                self.logger.warning("Captured frame is nearly black")
+
+            return frame
     
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:
         """
@@ -198,48 +260,63 @@ class MedicineScanner:
         Returns:
             Dictionary with OCR results
         """
-        try:
-            # Run Tesseract with detailed output
-            ocr_data = pytesseract.image_to_data(
-                image,
-                lang=self.ocr_language,
-                config=self.ocr_config,
-                output_type=pytesseract.Output.DICT
-            )
-            
-            # Extract text and confidence scores
-            words = []
-            confidences = []
-            
-            for i, text in enumerate(ocr_data['text']):
-                if text.strip():  # Non-empty text
-                    conf = float(ocr_data['conf'][i])
-                    if conf > 0:  # Valid confidence
-                        words.append(text)
-                        confidences.append(conf / 100.0)  # Normalize to 0-1
-            
-            # Combine into full text
-            full_text = ' '.join(words)
-            avg_confidence = np.mean(confidences) if confidences else 0.0
-            
-            return {
-                'text': full_text,
-                'words': words,
-                'confidence': avg_confidence,
-                'word_confidences': confidences,
-                'success': len(words) > 0
-            }
-            
-        except Exception as e:
-            self.logger.error(f"OCR extraction failed: {e}")
-            return {
-                'text': '',
-                'words': [],
-                'confidence': 0.0,
-                'word_confidences': [],
-                'success': False,
-                'error': str(e)
-            }
+        result = None
+
+        with self._profile_stage(
+            "ocr_extract",
+            notes=lambda: {
+                "success": bool(result and result.get("success")),
+                "confidence": (
+                    round(float(result.get("confidence", 0.0)), 3)
+                    if result else None
+                ),
+                "word_count": len(result.get("words", [])) if result else 0,
+            },
+        ):
+            try:
+                # Run Tesseract with detailed output
+                ocr_data = pytesseract.image_to_data(
+                    image,
+                    lang=self.ocr_language,
+                    config=self.ocr_config,
+                    output_type=pytesseract.Output.DICT
+                )
+
+                # Extract text and confidence scores
+                words = []
+                confidences = []
+
+                for i, text in enumerate(ocr_data['text']):
+                    if text.strip():  # Non-empty text
+                        conf = float(ocr_data['conf'][i])
+                        if conf > 0:  # Valid confidence
+                            words.append(text)
+                            confidences.append(conf / 100.0)  # Normalize to 0-1
+
+                # Combine into full text
+                full_text = ' '.join(words)
+                avg_confidence = np.mean(confidences) if confidences else 0.0
+
+                result = {
+                    'text': full_text,
+                    'words': words,
+                    'confidence': avg_confidence,
+                    'word_confidences': confidences,
+                    'success': len(words) > 0
+                }
+                return result
+
+            except Exception as e:
+                self.logger.error(f"OCR extraction failed: {e}")
+                result = {
+                    'text': '',
+                    'words': [],
+                    'confidence': 0.0,
+                    'word_confidences': [],
+                    'success': False,
+                    'error': str(e)
+                }
+                return result
             
     def parse_medicine_name(self, text: str) -> Optional[str]:
         """
@@ -293,82 +370,94 @@ class MedicineScanner:
         Returns:
             Scan result dictionary
         """
-        if not self.camera_ready:
-            if not self.initialize_camera():
-                return {
-                    'success': False,
-                    'error': 'Camera initialization failed',
-                    'medicine_name': None,
-                    'confidence': 0.0
-                }
-        
         best_result = None
         best_confidence = 0.0
-        
-        self.logger.info(f"Starting label scan ({num_attempts} attempts)...")
-        
-        for attempt in range(num_attempts):
-            self.logger.debug(f"Scan attempt {attempt + 1}/{num_attempts}")
-            
-            # Capture frame
-            frame = self.capture_frame()
-            if frame is None:
-                continue
-            
-            # Preprocess
-            processed = self.preprocess_image(frame)
-            
-            # Extract text
-            ocr_result = self.extract_text(processed)
-            
-            if ocr_result['success'] and ocr_result['confidence'] > best_confidence:
-                best_confidence = ocr_result['confidence']
-                best_result = ocr_result
-                
-                self.logger.debug(
-                    f"Attempt {attempt + 1}: '{ocr_result['text']}' "
-                    f"(confidence: {ocr_result['confidence']:.2f})"
-                )
-            
-            # If we got high confidence, no need for more attempts
-            if best_confidence >= 0.9:
-                self.logger.info("High confidence achieved, stopping early")
-                break
-            
-            if attempt < num_attempts - 1:
-                time.sleep(delay_between_attempts)
-        
-        # Parse medicine name from best result
-        if best_result and best_result['success']:
-            medicine_name = self.parse_medicine_name(best_result['text'])
-            
+        result = None
+
+        with self._profile_stage(
+            "scan_attempt_total",
+            notes=lambda: {
+                "num_attempts": num_attempts,
+                "best_confidence": round(float(best_confidence), 3),
+                "success": bool(result and result.get("success")),
+                "medicine_name": result.get("medicine_name") if result else None,
+            },
+        ):
+            if not self.camera_ready:
+                if not self.initialize_camera():
+                    result = {
+                        'success': False,
+                        'error': 'Camera initialization failed',
+                        'medicine_name': None,
+                        'confidence': 0.0
+                    }
+                    return result
+
+            self.logger.info(f"Starting label scan ({num_attempts} attempts)...")
+
+            for attempt in range(num_attempts):
+                self.logger.debug(f"Scan attempt {attempt + 1}/{num_attempts}")
+
+                # Capture frame
+                frame = self.capture_frame()
+                if frame is None:
+                    continue
+
+                # Preprocess
+                processed = self.preprocess_image(frame)
+
+                # Extract text
+                ocr_result = self.extract_text(processed)
+
+                if ocr_result['success'] and ocr_result['confidence'] > best_confidence:
+                    best_confidence = ocr_result['confidence']
+                    best_result = ocr_result
+
+                    self.logger.debug(
+                        f"Attempt {attempt + 1}: '{ocr_result['text']}' "
+                        f"(confidence: {ocr_result['confidence']:.2f})"
+                    )
+
+                # If we got high confidence, no need for more attempts
+                if best_confidence >= 0.9:
+                    self.logger.info("High confidence achieved, stopping early")
+                    break
+
+                if attempt < num_attempts - 1:
+                    time.sleep(delay_between_attempts)
+
+            # Parse medicine name from best result
+            if best_result and best_result['success']:
+                medicine_name = self.parse_medicine_name(best_result['text'])
+
+                result = {
+                    'success': medicine_name is not None,
+                    'medicine_name': medicine_name,
+                    'raw_text': best_result['text'],
+                    'confidence': best_confidence,
+                    'verified': best_confidence >= self.min_confidence
+                }
+
+                if result['success']:
+                    self.logger.info(
+                        f"Scan successful: '{medicine_name}' "
+                        f"(confidence: {best_confidence:.2f})"
+                    )
+                else:
+                    self.logger.warning("Could not parse medicine name from OCR text")
+
+                return result
+
+            # All attempts failed
+            self.logger.error("All scan attempts failed")
             result = {
-                'success': medicine_name is not None,
-                'medicine_name': medicine_name,
-                'raw_text': best_result['text'],
-                'confidence': best_confidence,
-                'verified': best_confidence >= self.min_confidence
+                'success': False,
+                'error': 'No readable text detected',
+                'medicine_name': None,
+                'confidence': 0.0,
+                'verified': False
             }
-            
-            if result['success']:
-                self.logger.info(
-                    f"Scan successful: '{medicine_name}' "
-                    f"(confidence: {best_confidence:.2f})"
-                )
-            else:
-                self.logger.warning("Could not parse medicine name from OCR text")
-            
             return result
-        
-        # All attempts failed
-        self.logger.error("All scan attempts failed")
-        return {
-            'success': False,
-            'error': 'No readable text detected',
-            'medicine_name': None,
-            'confidence': 0.0,
-            'verified': False
-        }
         
     def verify_medicine(self, expected_medicine: str, scanned_medicine: str) -> Dict[str, Any]:
         """

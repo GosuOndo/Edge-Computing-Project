@@ -16,6 +16,7 @@ outgoing bottle as the next slot's scan.
 import sys
 import time
 import signal
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -26,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from utils.logger import get_logger
 from utils.config_loader import get_config
+from utils.profiler import PASOProfiler, profile_stage
 
 from services.mqtt_client import MQTTClient
 from services.scheduler import MedicationScheduler
@@ -58,11 +60,17 @@ class MedicationSystem:
         self.config = get_config(config_path)
         self.logger = get_logger(self.config.get_logging_config())
         self.logger.info("Smart Medication Verification System starting")
+        self.profiler = PASOProfiler(
+            self.config.get("profiling", {}).get(
+                "paso_output_path", "data/paso_metrics.csv"
+            )
+        )
 
         self.enable_display = enable_display
         self.enable_audio   = enable_audio
         self.running        = False
         self._stop_called   = False
+        self._paso_run_sequence = 0
 
         self.state_machine    = StateMachine(self.logger)
         self.current_medication = None
@@ -1254,6 +1262,8 @@ class MedicationSystem:
                 f"{self._dose_pills_removed[station_id]} pill(s) "
                 f"(+{pills_this_event} this event)"
             )
+            event_data["queued_at"] = time.time()
+            event_data["firmware_dosing_active"] = self._firmware_dosing_active
             self.pending_weight_event = event_data
             self.logger.info("Weight event queued for main-thread processing")
 
@@ -1332,6 +1342,8 @@ class MedicationSystem:
         self._firmware_dosing_active = False
 
         # Queue for the existing main-thread verification pipeline.
+        event_data["queued_at"] = time.time()
+        event_data["firmware_dosing_active"] = True
         self.pending_weight_event = event_data
         self.logger.info("Dosing complete event queued for verification")
 
@@ -1345,13 +1357,251 @@ class MedicationSystem:
         event_data                = self.pending_weight_event
         self.pending_weight_event = None
         self.pending_weight_lock  = True
+        paso_context = self._build_paso_context(event_data)
         try:
+            processing_started_at = time.time()
+            transport_start = event_data.get("published_at")
+            transport_end = event_data.get("received_at", processing_started_at)
+
+            if transport_start is not None:
+                self._log_paso_stage_window(
+                    paso_context,
+                    "mqtt_transport",
+                    float(transport_start),
+                    float(transport_end),
+                    notes={
+                        "measured": True,
+                        "mqtt_transport_ms": event_data.get("mqtt_transport_ms"),
+                        "source": event_data.get("source"),
+                    },
+                )
+            else:
+                self._log_paso_stage_window(
+                    paso_context,
+                    "mqtt_transport",
+                    float(transport_end),
+                    float(transport_end),
+                    notes={
+                        "measured": False,
+                        "reason": "station_publish_timestamp_unavailable",
+                        "source": event_data.get("source"),
+                    },
+                )
+
+            queue_start = float(
+                event_data.get("queued_at")
+                or event_data.get("received_at")
+                or event_data.get("timestamp")
+                or processing_started_at
+            )
+            queue_start = min(queue_start, processing_started_at)
+            self._log_paso_stage_window(
+                paso_context,
+                "event_queueing",
+                queue_start,
+                processing_started_at,
+                notes={
+                    "event_type": event_data.get("event_type"),
+                    "source": event_data.get("source"),
+                    "firmware_dosing_active": event_data.get(
+                        "firmware_dosing_active",
+                        self._firmware_dosing_active,
+                    ),
+                },
+            )
+
             self.state_machine.transition_to(
                 SystemState.VERIFYING, {"event_data": event_data}
             )
-            self._verify_medication_intake(event_data)
+            with self._profile_paso_stage(
+                paso_context,
+                "pipeline_total",
+                notes=lambda: {
+                    "event_type": event_data.get("event_type"),
+                    "source": event_data.get("source"),
+                    "firmware_dosing_active": event_data.get(
+                        "firmware_dosing_active",
+                        self._firmware_dosing_active,
+                    ),
+                    "final_outcome": paso_context.get("final_outcome"),
+                    "verified": paso_context.get("verified"),
+                },
+            ):
+                self._verify_medication_intake(event_data, paso_context=paso_context)
         finally:
             self.pending_weight_lock = False
+
+    def _next_paso_run_id(self, station_id: str) -> str:
+        self._paso_run_sequence += 1
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        return f"{stamp}_{station_id}_{self._paso_run_sequence:04d}"
+
+    def _slugify(self, value: str) -> str:
+        return "".join(
+            ch.lower() if ch.isalnum() else "_"
+            for ch in (value or "unknown")
+        ).strip("_") or "unknown"
+
+    def _build_paso_context(self, weight_event: dict) -> dict:
+        station_id = (
+            weight_event.get("station_id")
+            or (self.current_medication or {}).get("station_id")
+            or "unknown_station"
+        )
+        medicine_name = (
+            (self.current_medication or {}).get("medicine_name")
+            or weight_event.get("medicine_name")
+            or "unknown_medicine"
+        )
+        source = weight_event.get("source") or weight_event.get("event_type") or "event"
+        scenario = weight_event.get("scenario_name") or (
+            f"{self._slugify(medicine_name)}_{self._slugify(source)}"
+        )
+        return {
+            "run_id": self._next_paso_run_id(station_id),
+            "scenario": scenario,
+            "station_id": station_id,
+            "medicine_name": medicine_name,
+            "final_outcome": None,
+            "verified": None,
+            "decision_source": None,
+        }
+
+    def _profile_paso_stage(self, paso_context: dict, stage: str, notes=None):
+        if not paso_context:
+            return nullcontext()
+        return profile_stage(
+            self.profiler,
+            paso_context["run_id"],
+            paso_context["scenario"],
+            paso_context["station_id"],
+            stage,
+            notes,
+        )
+
+    def _log_paso_stage_window(
+        self,
+        paso_context: dict,
+        stage: str,
+        start_ts: float,
+        end_ts: float,
+        notes=None,
+    ):
+        if not paso_context:
+            return
+        self.profiler.log_stage_window(
+            run_id=paso_context["run_id"],
+            scenario=paso_context["scenario"],
+            station_id=paso_context["station_id"],
+            stage=stage,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            notes=notes,
+        )
+
+    def _apply_runtime_profiler_context(self, paso_context: dict):
+        if not paso_context:
+            return
+        self.scanner.set_profiler_context(
+            self.profiler,
+            paso_context["run_id"],
+            paso_context["scenario"],
+            paso_context["station_id"],
+        )
+        self.patient_monitor.set_profiler_context(
+            self.profiler,
+            paso_context["run_id"],
+            paso_context["scenario"],
+            paso_context["station_id"],
+        )
+
+    def _clear_runtime_profiler_context(self):
+        self.scanner.clear_profiler_context()
+        self.patient_monitor.clear_profiler_context()
+
+    def _decision_result_value(self, decision: dict):
+        if not decision:
+            return None
+        result = decision.get("result")
+        if hasattr(result, "value"):
+            return result.value
+        return result
+
+    def _generate_profiled_decision(
+        self,
+        paso_context: dict,
+        decision_source: str,
+        builder,
+        notes=None,
+    ) -> dict:
+        decision = None
+        resolved_notes = lambda: (
+            notes() if callable(notes) else (notes or {})
+        ) or {}
+
+        with self._profile_paso_stage(
+            paso_context,
+            "decision_engine",
+            notes=lambda: {
+                **resolved_notes(),
+                "decision_source": decision_source,
+                "result": self._decision_result_value(decision),
+                "verified": decision.get("verified") if decision else None,
+            },
+        ):
+            decision = builder()
+
+        paso_context["final_outcome"] = self._decision_result_value(decision)
+        paso_context["verified"] = decision.get("verified") if decision else None
+        paso_context["decision_source"] = decision_source
+        return decision
+
+    def _execute_output_and_logging(
+        self,
+        paso_context: dict,
+        decision: dict,
+        output_callable=None,
+        medicine_name: str = None,
+    ) -> bool:
+        database_logged = False
+        scheduler_marked = False
+
+        with self._profile_paso_stage(
+            paso_context,
+            "output_logging",
+            notes=lambda: {
+                "result": self._decision_result_value(decision),
+                "verified": decision.get("verified") if decision else None,
+                "scheduler_marked": scheduler_marked,
+                "database_logged": database_logged,
+            },
+        ):
+            if output_callable:
+                with self._profile_paso_stage(
+                    paso_context,
+                    "decision_output",
+                    notes=lambda: {
+                        "result": self._decision_result_value(decision),
+                        "verified": decision.get("verified") if decision else None,
+                    },
+                ):
+                    output_callable()
+
+            if medicine_name and decision and decision.get("verified"):
+                self.scheduler.mark_dose_taken(medicine_name)
+                scheduler_marked = True
+
+            with self._profile_paso_stage(
+                paso_context,
+                "database_logging",
+                notes=lambda: {
+                    "result": self._decision_result_value(decision),
+                    "logged": database_logged,
+                },
+            ):
+                database_logged = self.database.log_medication_event(decision)
+
+        return database_logged
 
     def _render_pending_monitoring_ui(self):
         if not self.display or not self.pending_monitoring_ui:
@@ -1583,10 +1833,16 @@ class MedicationSystem:
     # Verification pipeline
     # ------------------------------------------------------------------
 
-    def _verify_medication_intake(self, weight_event: dict):
+    def _verify_medication_intake(
+        self,
+        weight_event: dict,
+        paso_context: dict = None,
+    ):
         self.logger.info("Starting medication verification...")
         if not self.running:
             return
+        paso_context = paso_context or self._build_paso_context(weight_event)
+        self._apply_runtime_profiler_context(paso_context)
 
         medicine_name       = self.current_medication["medicine_name"]
         expected_dosage     = self.current_medication["dosage_pills"]
@@ -1608,58 +1864,78 @@ class MedicationSystem:
         identity_result = None
         ocr_result      = None
 
-        try:
-            self.scanner.initialize_camera()
+        with self._profile_paso_stage(
+            paso_context,
+            "identity_check_total",
+            notes=lambda: {
+                "method": identity_result.get("method") if identity_result else None,
+                "success": identity_result.get("success") if identity_result else None,
+                "reason": identity_result.get("reason") if identity_result else None,
+                "integrated_mode": integrated_mode,
+            },
+        ):
+            try:
+                self.scanner.initialize_camera()
 
-            if integrated_mode:
-                identity_result = self.identity_manager.verify_identity_integrated(
-                    expected_medicine_id=expected_medicine_id,
-                    expected_medicine_name=medicine_name,
-                    expected_station_id=expected_station_id,
-                    weight_event_timestamp=weight_event_ts,
-                    coincident_window_seconds=coincident_window
-                )
-            else:
-                identity_result = self.identity_manager.verify_identity(
-                    expected_medicine_id=expected_medicine_id,
-                    expected_medicine_name=medicine_name,
-                    expected_station_id=expected_station_id
-                )
+                with self._profile_paso_stage(
+                    paso_context,
+                    "tag_or_identity_check",
+                    notes=lambda: {
+                        "method": identity_result.get("method") if identity_result else None,
+                        "success": identity_result.get("success") if identity_result else None,
+                        "reason": identity_result.get("reason") if identity_result else None,
+                        "integrated_mode": integrated_mode,
+                    },
+                ):
+                    if integrated_mode:
+                        identity_result = self.identity_manager.verify_identity_integrated(
+                            expected_medicine_id=expected_medicine_id,
+                            expected_medicine_name=medicine_name,
+                            expected_station_id=expected_station_id,
+                            weight_event_timestamp=weight_event_ts,
+                            coincident_window_seconds=coincident_window
+                        )
+                    else:
+                        identity_result = self.identity_manager.verify_identity(
+                            expected_medicine_id=expected_medicine_id,
+                            expected_medicine_name=medicine_name,
+                            expected_station_id=expected_station_id
+                        )
 
-            self.logger.info(f"Identity result: {identity_result}")
+                self.logger.info(f"Identity result: {identity_result}")
 
-            if identity_result.get("success"):
-                # If the verified tag carries a pill weight, keep the override
-                # up-to-date (e.g. after a system restart the override file may
-                # be stale or missing).
-                tag_record = identity_result.get("record") or {}
-                pill_weight_mg = tag_record.get("pill_weight_mg")
-                if pill_weight_mg is not None:
-                    self.weight_manager.set_pill_weight_from_tag(
-                        expected_station_id, pill_weight_mg
-                    )
+                if identity_result.get("success"):
+                    # If the verified tag carries a pill weight, keep the override
+                    # up-to-date (e.g. after a system restart the override file may
+                    # be stale or missing).
+                    tag_record = identity_result.get("record") or {}
+                    pill_weight_mg = tag_record.get("pill_weight_mg")
+                    if pill_weight_mg is not None:
+                        self.weight_manager.set_pill_weight_from_tag(
+                            expected_station_id, pill_weight_mg
+                        )
 
-                ocr_result = {
-                    "success":       True,
-                    "medicine_name": identity_result.get("medicine_name", medicine_name),
-                    "confidence":    identity_result.get("confidence", 1.0),
-                    "verified":      True,
-                    "method":        identity_result.get("method")
+                    ocr_result = {
+                        "success":       True,
+                        "medicine_name": identity_result.get("medicine_name", medicine_name),
+                        "confidence":    identity_result.get("confidence", 1.0),
+                        "verified":      True,
+                        "method":        identity_result.get("method")
+                    }
+                else:
+                    ocr_result = None
+
+            except Exception as e:
+                self.logger.warning(f"Identity verification error: {e}")
+                identity_result = {
+                    "success":  False,
+                    "method":   "none",
+                    "verified": False,
+                    "reason":   str(e)
                 }
-            else:
                 ocr_result = None
-
-        except Exception as e:
-            self.logger.warning(f"Identity verification error: {e}")
-            identity_result = {
-                "success":  False,
-                "method":   "none",
-                "verified": False,
-                "reason":   str(e)
-            }
-            ocr_result = None
-        finally:
-            self.scanner.release_camera()
+            finally:
+                self.scanner.release_camera()
 
         if not self.running:
             return
@@ -1670,48 +1946,68 @@ class MedicationSystem:
                 f"Checking pill count for {medicine_name}"
             )
 
-        # Per-event weight check (used for the raw delta / pill_weight metadata).
-        weight_result = self.weight_manager.verify_dosage(
-            expected_station_id, expected_dosage
-        )
-        self.logger.info(f"Weight verification (per-event): {weight_result}")
+        weight_result = None
+        cumulative_weight_result = None
+        cumulative_pills = 0
+        cum_delta_err = 0.0
+        tolerance_g = 0.0
 
-        # Build a cumulative weight result that reflects all pills removed
-        # during this dose window (across every lift-and-replace cycle).
-        cumulative_pills = self._dose_pills_removed.get(expected_station_id, 0)
-        pill_weight_g    = float(
-            weight_result.get("pill_weight_g")
-            or self.weight_manager._get_pill_weight_g(expected_station_id)
-        )
-        cum_delta_g      = cumulative_pills * pill_weight_g
-        exp_delta_g      = expected_dosage  * pill_weight_g
-        cum_delta_err    = abs(cum_delta_g - exp_delta_g)
-        tolerance_g      = float(
-            self.weight_manager.station_configs
-            .get(expected_station_id, {})
-            .get("dose_verification_tolerance_g", 0.12)
-        )
-        cumulative_weight_result = dict(weight_result)
-        cumulative_weight_result.update({
-            "actual":           cumulative_pills,
-            "weight_change_g":  round(cum_delta_g,  3),
-            "expected_delta_g": round(exp_delta_g,  3),
-            "delta_error_g":    round(cum_delta_err, 3),
-            "difference":       abs(cumulative_pills - expected_dosage),
-            "verified":         (
-                cumulative_pills == expected_dosage
-                and cum_delta_err <= tolerance_g
-            ),
-            "status": (
-                "correct"
-                if cumulative_pills == expected_dosage and cum_delta_err <= tolerance_g
-                else "incorrect"
-            ),
-        })
-        self.logger.info(
-            f"Cumulative dosage check: {cumulative_pills}/{expected_dosage} pills "
-            f"(delta_err={cum_delta_err:.3f}g, verified={cumulative_weight_result['verified']})"
-        )
+        with self._profile_paso_stage(
+            paso_context,
+            "dosage_check",
+            notes=lambda: {
+                "expected_dosage": expected_dosage,
+                "actual_dosage": cumulative_pills,
+                "verified": (
+                    cumulative_weight_result.get("verified")
+                    if cumulative_weight_result else None
+                ),
+                "weight_delta_error_g": round(cum_delta_err, 3),
+                "tolerance_g": round(tolerance_g, 3),
+            },
+        ):
+            # Per-event weight check (used for the raw delta / pill_weight metadata).
+            weight_result = self.weight_manager.verify_dosage(
+                expected_station_id, expected_dosage
+            )
+            self.logger.info(f"Weight verification (per-event): {weight_result}")
+
+            # Build a cumulative weight result that reflects all pills removed
+            # during this dose window (across every lift-and-replace cycle).
+            cumulative_pills = self._dose_pills_removed.get(expected_station_id, 0)
+            pill_weight_g = float(
+                weight_result.get("pill_weight_g")
+                or self.weight_manager._get_pill_weight_g(expected_station_id)
+            )
+            cum_delta_g = cumulative_pills * pill_weight_g
+            exp_delta_g = expected_dosage * pill_weight_g
+            cum_delta_err = abs(cum_delta_g - exp_delta_g)
+            tolerance_g = float(
+                self.weight_manager.station_configs
+                .get(expected_station_id, {})
+                .get("dose_verification_tolerance_g", 0.12)
+            )
+            cumulative_weight_result = dict(weight_result)
+            cumulative_weight_result.update({
+                "actual":           cumulative_pills,
+                "weight_change_g":  round(cum_delta_g,  3),
+                "expected_delta_g": round(exp_delta_g,  3),
+                "delta_error_g":    round(cum_delta_err, 3),
+                "difference":       abs(cumulative_pills - expected_dosage),
+                "verified":         (
+                    cumulative_pills == expected_dosage
+                    and cum_delta_err <= tolerance_g
+                ),
+                "status": (
+                    "correct"
+                    if cumulative_pills == expected_dosage and cum_delta_err <= tolerance_g
+                    else "incorrect"
+                ),
+            })
+            self.logger.info(
+                f"Cumulative dosage check: {cumulative_pills}/{expected_dosage} pills "
+                f"(delta_err={cum_delta_err:.3f}g, verified={cumulative_weight_result['verified']})"
+            )
 
         # ------------------------------------------------------------------
         # HARD STOP: identity failed
@@ -1720,16 +2016,27 @@ class MedicationSystem:
             self.logger.warning(
                 "Stopping pipeline early due to identity mismatch/failure"
             )
-            decision = self.decision_engine.verify_medication_intake(
-                expected_medicine=medicine_name,
-                expected_dosage=expected_dosage,
-                identity_result=identity_result,
-                ocr_result=None,
-                weight_result=cumulative_weight_result,
-                monitoring_result=None
+            decision = self._generate_profiled_decision(
+                paso_context,
+                "decision_engine_verify_identity_failure",
+                lambda: self.decision_engine.verify_medication_intake(
+                    expected_medicine=medicine_name,
+                    expected_dosage=expected_dosage,
+                    identity_result=identity_result,
+                    ocr_result=None,
+                    weight_result=cumulative_weight_result,
+                    monitoring_result=None
+                ),
+                notes=lambda: {
+                    "identity_success": False,
+                    "identity_method": identity_result.get("method"),
+                },
             )
-            self._handle_decision(decision)
-            self.database.log_medication_event(decision)
+            self._execute_output_and_logging(
+                paso_context,
+                decision,
+                output_callable=lambda: self._handle_decision(decision),
+            )
             time.sleep(3)
             self._end_verification_cycle(expected_station_id)
             return
@@ -1744,30 +2051,32 @@ class MedicationSystem:
                     f"Overdose detected: {cumulative_pills} pills taken, "
                     f"{expected_dosage} required"
                 )
-                if self.display:
-                    self.display.show_overdose_screen(
-                        medicine_name, cumulative_pills, expected_dosage
-                    )
-                if self.audio:
-                    self.audio.announce_warning(
-                        f"Too many pills detected. "
-                        f"You took {cumulative_pills} but only {expected_dosage} "
-                        f"are required. Please contact your caregiver."
-                    )
-                self.telegram.send_incorrect_dosage_alert(
-                    medicine_name=medicine_name,
-                    expected=expected_dosage,
-                    actual=cumulative_pills
+                decision = self._generate_profiled_decision(
+                    paso_context,
+                    "decision_engine_verify_weight_overdose",
+                    lambda: self.decision_engine.verify_medication_intake(
+                        expected_medicine=medicine_name,
+                        expected_dosage=expected_dosage,
+                        identity_result=identity_result,
+                        ocr_result=ocr_result,
+                        weight_result=cumulative_weight_result,
+                        monitoring_result=None
+                    ),
+                    notes=lambda: {
+                        "actual_dosage": cumulative_pills,
+                        "expected_dosage": expected_dosage,
+                        "stage": "weight_overdose",
+                    },
                 )
-                decision = self.decision_engine.verify_medication_intake(
-                    expected_medicine=medicine_name,
-                    expected_dosage=expected_dosage,
-                    identity_result=identity_result,
-                    ocr_result=ocr_result,
-                    weight_result=cumulative_weight_result,
-                    monitoring_result=None
+                self._execute_output_and_logging(
+                    paso_context,
+                    decision,
+                    output_callable=lambda: self._show_weight_overdose_feedback(
+                        medicine_name,
+                        cumulative_pills,
+                        expected_dosage,
+                    ),
                 )
-                self.database.log_medication_event(decision)
                 time.sleep(5)
                 self._end_verification_cycle(expected_station_id)
                 return
@@ -1787,10 +2096,37 @@ class MedicationSystem:
             return
 
         # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
         # Monitoring session (camera on for 30 s)
         # ------------------------------------------------------------------
-        monitoring_result = self._run_monitoring_session(expected_dosage)
+        monitoring_result = None
+        monitoring_attempt = 1
+        with self._profile_paso_stage(
+            paso_context,
+            "monitoring_session",
+            notes=lambda: {
+                "attempt": monitoring_attempt,
+                "compliance_status": (
+                    monitoring_result.get("compliance_status")
+                    if monitoring_result else None
+                ),
+                "swallow_count": (
+                    monitoring_result.get("swallow_count")
+                    if monitoring_result else None
+                ),
+                "processed_frame_count": (
+                    monitoring_result.get("processed_frame_count")
+                    if monitoring_result else None
+                ),
+                "avg_loop_ms": (
+                    monitoring_result.get("avg_loop_ms")
+                    if monitoring_result else None
+                ),
+            },
+        ):
+            monitoring_result = self._run_monitoring_session(
+                expected_dosage,
+                paso_context=paso_context,
+            )
         total_swallows    = int(monitoring_result.get("swallow_count", 0))
 
         if not self.running:
@@ -1802,28 +2138,29 @@ class MedicationSystem:
                 f"Intake excess: {total_swallows} pill(s) consumed, "
                 f"only {expected_dosage} expected for {medicine_name}"
             )
-            if self.display:
-                self.display.show_overdose_screen(
-                    medicine_name, total_swallows, expected_dosage
-                )
-            if self.audio:
-                self.audio.announce_warning(
-                    f"Too many pills detected. "
-                    f"You took {total_swallows} but only {expected_dosage} "
-                    f"are required. Please contact your caregiver."
-                )
-            self.telegram.send_incorrect_dosage_alert(
-                medicine_name=medicine_name,
-                expected=expected_dosage,
-                actual=total_swallows
+            decision = self._generate_profiled_decision(
+                paso_context,
+                "manual_incorrect_dosage_intake_monitoring",
+                lambda: self._build_incorrect_dosage_decision(
+                    medicine_name=medicine_name,
+                    expected_dosage=expected_dosage,
+                    actual_dosage=total_swallows,
+                    stage="intake_monitoring"
+                ),
+                notes=lambda: {
+                    "actual_dosage": total_swallows,
+                    "expected_dosage": expected_dosage,
+                },
             )
-            decision = self._build_incorrect_dosage_decision(
-                medicine_name=medicine_name,
-                expected_dosage=expected_dosage,
-                actual_dosage=total_swallows,
-                stage="intake_monitoring"
+            self._execute_output_and_logging(
+                paso_context,
+                decision,
+                output_callable=lambda: self._show_weight_overdose_feedback(
+                    medicine_name,
+                    total_swallows,
+                    expected_dosage,
+                ),
             )
-            self.database.log_medication_event(decision)
             time.sleep(5)
             self._end_verification_cycle(expected_station_id)
             return
@@ -1836,22 +2173,59 @@ class MedicationSystem:
                 f"Intake mismatch: {total_swallows} swallow(s) detected, "
                 f"~{expected_dosage} expected for {medicine_name}"
             )
-            if self.display:
-                self.display.show_intake_mismatch_screen(
-                    medicine_name=medicine_name,
-                    swallow_count=total_swallows,
-                    expected_dosage=expected_dosage,
-                )
-            if self.audio:
-                self.audio.announce_warning(
-                    f"Only {total_swallows} swallow detected. "
-                    f"Please take {remaining} more {pill_word}."
-                )
+            with self._profile_paso_stage(
+                paso_context,
+                "decision_output",
+                notes=lambda: {
+                    "feedback": "incomplete_intake_retry_prompt",
+                    "swallow_count": total_swallows,
+                    "expected_dosage": expected_dosage,
+                },
+            ):
+                if self.display:
+                    self.display.show_intake_mismatch_screen(
+                        medicine_name=medicine_name,
+                        swallow_count=total_swallows,
+                        expected_dosage=expected_dosage,
+                    )
+                if self.audio:
+                    self.audio.announce_warning(
+                        f"Only {total_swallows} swallow detected. "
+                        f"Please take {remaining} more {pill_word}."
+                    )
             time.sleep(3)
 
             # Run a second monitoring session (camera on, 30-second countdown)
             # identical in behaviour to the first monitoring phase.
-            retry_result   = self._run_monitoring_session(expected_dosage)
+            retry_result = None
+            monitoring_attempt = 2
+            with self._profile_paso_stage(
+                paso_context,
+                "monitoring_session",
+                notes=lambda: {
+                    "attempt": monitoring_attempt,
+                    "compliance_status": (
+                        retry_result.get("compliance_status")
+                        if retry_result else None
+                    ),
+                    "swallow_count": (
+                        retry_result.get("swallow_count")
+                        if retry_result else None
+                    ),
+                    "processed_frame_count": (
+                        retry_result.get("processed_frame_count")
+                        if retry_result else None
+                    ),
+                    "avg_loop_ms": (
+                        retry_result.get("avg_loop_ms")
+                        if retry_result else None
+                    ),
+                },
+            ):
+                retry_result = self._run_monitoring_session(
+                    expected_dosage,
+                    paso_context=paso_context,
+                )
             new_swallows   = int(retry_result.get("swallow_count", 0))
             total_swallows += new_swallows
             monitoring_result = retry_result
@@ -1865,28 +2239,29 @@ class MedicationSystem:
 
             # Over-count during retry
             if total_swallows > expected_dosage:
-                if self.display:
-                    self.display.show_overdose_screen(
-                        medicine_name, total_swallows, expected_dosage
-                    )
-                if self.audio:
-                    self.audio.announce_warning(
-                        f"Too many pills detected. "
-                        f"You took {total_swallows} but only {expected_dosage} "
-                        f"are required. Please contact your caregiver."
-                    )
-                self.telegram.send_incorrect_dosage_alert(
-                    medicine_name=medicine_name,
-                    expected=expected_dosage,
-                    actual=total_swallows
+                decision = self._generate_profiled_decision(
+                    paso_context,
+                    "manual_incorrect_dosage_incomplete_intake_over",
+                    lambda: self._build_incorrect_dosage_decision(
+                        medicine_name=medicine_name,
+                        expected_dosage=expected_dosage,
+                        actual_dosage=total_swallows,
+                        stage="incomplete_intake"
+                    ),
+                    notes=lambda: {
+                        "actual_dosage": total_swallows,
+                        "expected_dosage": expected_dosage,
+                    },
                 )
-                decision = self._build_incorrect_dosage_decision(
-                    medicine_name=medicine_name,
-                    expected_dosage=expected_dosage,
-                    actual_dosage=total_swallows,
-                    stage="incomplete_intake"
+                self._execute_output_and_logging(
+                    paso_context,
+                    decision,
+                    output_callable=lambda: self._show_weight_overdose_feedback(
+                        medicine_name,
+                        total_swallows,
+                        expected_dosage,
+                    ),
                 )
-                self.database.log_medication_event(decision)
                 time.sleep(5)
                 self._end_verification_cycle(expected_station_id)
                 return
@@ -1894,28 +2269,29 @@ class MedicationSystem:
             # Still under-count after retry → notify caregiver
             if total_swallows < expected_dosage:
                 self.logger.warning("Incomplete intake after retry – notifying caregiver")
-                if self.display:
-                    self.display.show_caregiver_notification_screen(
+                decision = self._generate_profiled_decision(
+                    paso_context,
+                    "manual_incorrect_dosage_incomplete_intake_under",
+                    lambda: self._build_incorrect_dosage_decision(
                         medicine_name=medicine_name,
-                        swallow_count=total_swallows,
                         expected_dosage=expected_dosage,
-                    )
-                if self.audio:
-                    self.audio.announce_warning(
-                        "Time is up. Your caregiver has been notified."
-                    )
-                self.telegram.send_incorrect_dosage_alert(
-                    medicine_name=medicine_name,
-                    expected=expected_dosage,
-                    actual=total_swallows
+                        actual_dosage=total_swallows,
+                        stage="incomplete_intake"
+                    ),
+                    notes=lambda: {
+                        "actual_dosage": total_swallows,
+                        "expected_dosage": expected_dosage,
+                    },
                 )
-                decision = self._build_incorrect_dosage_decision(
-                    medicine_name=medicine_name,
-                    expected_dosage=expected_dosage,
-                    actual_dosage=total_swallows,
-                    stage="incomplete_intake"
+                self._execute_output_and_logging(
+                    paso_context,
+                    decision,
+                    output_callable=lambda: self._show_incomplete_intake_feedback(
+                        medicine_name,
+                        total_swallows,
+                        expected_dosage,
+                    ),
                 )
-                self.database.log_medication_event(decision)
                 time.sleep(5)
                 self._end_verification_cycle(expected_station_id)
                 return
@@ -1927,24 +2303,76 @@ class MedicationSystem:
         if not self.running:
             return
 
-        decision = self.decision_engine.verify_medication_intake(
-            expected_medicine=medicine_name,
-            expected_dosage=expected_dosage,
-            identity_result=identity_result,
-            ocr_result=ocr_result,
-            weight_result=weight_result,
-            monitoring_result=monitoring_result
+        decision = self._generate_profiled_decision(
+            paso_context,
+            "decision_engine_verify_final",
+            lambda: self.decision_engine.verify_medication_intake(
+                expected_medicine=medicine_name,
+                expected_dosage=expected_dosage,
+                identity_result=identity_result,
+                ocr_result=ocr_result,
+                weight_result=weight_result,
+                monitoring_result=monitoring_result
+            ),
+            notes=lambda: {
+                "swallow_count": total_swallows,
+                "expected_dosage": expected_dosage,
+            },
         )
 
-        self._handle_decision(decision)
-
-        if decision["verified"]:
-            self.scheduler.mark_dose_taken(medicine_name)
-
-        self.database.log_medication_event(decision)
+        self._execute_output_and_logging(
+            paso_context,
+            decision,
+            output_callable=lambda: self._handle_decision(decision),
+            medicine_name=medicine_name,
+        )
 
         time.sleep(3)
         self._end_verification_cycle(expected_station_id)
+
+    def _show_weight_overdose_feedback(
+        self,
+        medicine_name: str,
+        actual_dosage: int,
+        expected_dosage: int,
+    ):
+        if self.display:
+            self.display.show_overdose_screen(
+                medicine_name, actual_dosage, expected_dosage
+            )
+        if self.audio:
+            self.audio.announce_warning(
+                f"Too many pills detected. "
+                f"You took {actual_dosage} but only {expected_dosage} "
+                f"are required. Please contact your caregiver."
+            )
+        self.telegram.send_incorrect_dosage_alert(
+            medicine_name=medicine_name,
+            expected=expected_dosage,
+            actual=actual_dosage,
+        )
+
+    def _show_incomplete_intake_feedback(
+        self,
+        medicine_name: str,
+        actual_dosage: int,
+        expected_dosage: int,
+    ):
+        if self.display:
+            self.display.show_caregiver_notification_screen(
+                medicine_name=medicine_name,
+                swallow_count=actual_dosage,
+                expected_dosage=expected_dosage,
+            )
+        if self.audio:
+            self.audio.announce_warning(
+                "Time is up. Your caregiver has been notified."
+            )
+        self.telegram.send_incorrect_dosage_alert(
+            medicine_name=medicine_name,
+            expected=expected_dosage,
+            actual=actual_dosage,
+        )
 
     def _build_incorrect_dosage_decision(
         self,
@@ -1981,7 +2409,11 @@ class MedicationSystem:
             },
         }
 
-    def _run_monitoring_session(self, expected_dosage: int) -> dict:
+    def _run_monitoring_session(
+        self,
+        expected_dosage: int,
+        paso_context: dict = None,
+    ) -> dict:
         """
         Run a single 30-second patient monitoring session and return the
         results dict.  Handles display updates, state transition, and all
@@ -2015,6 +2447,10 @@ class MedicationSystem:
                     "swallow_count":     0,
                     "cough_count":       0,
                     "hand_motion_count": 0,
+                    "processed_frame_count": 0,
+                    "monitoring_duration_s": 0.0,
+                    "avg_loop_ms": 0.0,
+                    "peak_loop_ms": 0.0,
                 }
 
             while self.patient_monitor.is_monitoring_active():
@@ -2025,6 +2461,10 @@ class MedicationSystem:
                         "swallow_count":     0,
                         "cough_count":       0,
                         "hand_motion_count": 0,
+                        "processed_frame_count": 0,
+                        "monitoring_duration_s": 0.0,
+                        "avg_loop_ms": 0.0,
+                        "peak_loop_ms": 0.0,
                     }
                 if self.display:
                     self._render_pending_monitoring_ui()
@@ -2045,6 +2485,10 @@ class MedicationSystem:
                 "swallow_count":     0,
                 "cough_count":       0,
                 "hand_motion_count": 0,
+                "processed_frame_count": 0,
+                "monitoring_duration_s": 0.0,
+                "avg_loop_ms": 0.0,
+                "peak_loop_ms": 0.0,
             }
 
     def _wait_for_pill_removal_event(self, timeout_seconds: float = 120.0):
@@ -2094,6 +2538,7 @@ class MedicationSystem:
         self._dose_attempt_count.pop(station_id, None)
 
         self._enable_continuous_tag_scanning()
+        self._clear_runtime_profiler_context()
 
         if self.display:
             self._show_idle_screen()

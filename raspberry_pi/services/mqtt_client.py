@@ -49,6 +49,31 @@ class MQTTClient:
 
         self.logger.info(f"MQTT client initialized: {self.broker_host}:{self.broker_port}")
 
+    def _extract_published_at(self, data: Dict[str, Any]):
+        """
+        Best-effort extraction of a wall-clock publish timestamp from the payload.
+
+        The edge station firmware historically used millis(), which is not
+        comparable to Pi wall-clock time. We therefore only accept values that
+        look like Unix epoch timestamps in seconds or milliseconds.
+        """
+        for key in ("published_at", "published_at_s", "unix_ts", "epoch_ts", "timestamp"):
+            raw_value = data.get(key)
+            if raw_value is None:
+                continue
+
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+
+            if value >= 946684800000:  # Unix epoch in milliseconds
+                return value / 1000.0
+            if value >= 946684800:  # Unix epoch in seconds
+                return value
+
+        return None
+
     def _on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
         if rc == 0:
@@ -103,7 +128,16 @@ class MQTTClient:
             self.logger.debug(f"MQTT message received: {topic}")
 
             data = json.loads(payload)
-            data['received_at'] = time.time()
+            received_at = time.time()
+            data['received_at'] = received_at
+
+            published_at = self._extract_published_at(data)
+            if published_at is not None:
+                data['published_at'] = published_at
+                data['mqtt_transport_ms'] = round(
+                    max(0.0, received_at - published_at) * 1000.0,
+                    3,
+                )
 
             if 'weight' in topic:
                 if self.weight_callback:

@@ -278,6 +278,9 @@ class WeightManager:
             "current_weight_g":      round(new_weight_g, 3),
             "pill_weight_g":         round(pill_weight_g, 3),
             "timestamp":             time.time(),
+            "received_at":           float(data.get("received_at", time.time())),
+            "published_at":          data.get("published_at"),
+            "mqtt_transport_ms":     data.get("mqtt_transport_ms"),
             "source":                "firmware_dosing",
         }
 
@@ -553,6 +556,10 @@ class WeightManager:
             "current_weight_g":      round(new_weight_g, 3),
             "pill_weight_g":         round(pill_weight, 3),
             "timestamp":             time.time(),
+            "received_at":           received_at,
+            "published_at":          self.weight_data.get(station_id, {}).get("published_at"),
+            "mqtt_transport_ms":     self.weight_data.get(station_id, {}).get("mqtt_transport_ms"),
+            "source":                "weight_event",
         }
 
         self.last_event_data[station_id] = event_data

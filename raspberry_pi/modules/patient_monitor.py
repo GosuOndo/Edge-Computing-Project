@@ -21,12 +21,18 @@ import time
 import numpy as np
 import sys
 from collections import deque
+from contextlib import nullcontext
 from typing import Dict, Any, Optional
 
 import mediapipe as mp
 from mediapipe.python.solutions import face_mesh as _mp_face_mod
 from mediapipe.python.solutions import hands as _mp_hands_mod
 from mediapipe.python.solutions import drawing_utils as _mp_draw
+
+try:
+    from raspberry_pi.utils.profiler import profile_stage
+except ImportError:  # pragma: no cover - script execution path
+    from utils.profiler import profile_stage
 
 
 # FaceMesh landmark indices used for mouth and face height measurement
@@ -233,8 +239,34 @@ class PatientMonitor:
         self._results: Optional[dict] = None
         self._detector: Optional[_IntakeDetector] = None
         self._cap: Optional[cv2.VideoCapture] = None
+        self._profiler_context = None
 
         self._log("Patient monitor initialized with MediaPipe")
+
+    def set_profiler_context(self, profiler, run_id: str, scenario: str, station_id: str):
+        self._profiler_context = {
+            "profiler": profiler,
+            "run_id": run_id,
+            "scenario": scenario,
+            "station_id": station_id,
+        }
+
+    def clear_profiler_context(self):
+        self._profiler_context = None
+
+    def _profile_stage(self, stage: str, notes=None):
+        if not self._profiler_context or not self._profiler_context.get("profiler"):
+            return nullcontext()
+
+        ctx = self._profiler_context
+        return profile_stage(
+            ctx["profiler"],
+            ctx["run_id"],
+            ctx["scenario"],
+            ctx["station_id"],
+            stage,
+            notes,
+        )
 
     def start_monitoring(self, duration: int = 30, callback=None) -> bool:
         """
@@ -288,6 +320,10 @@ class PatientMonitor:
                 "swallow_count":     0,
                 "cough_count":       0,
                 "hand_motion_count": 0,
+                "processed_frame_count": 0,
+                "monitoring_duration_s": 0.0,
+                "avg_loop_ms": 0.0,
+                "peak_loop_ms": 0.0,
             }
         return self._results
 
@@ -309,21 +345,35 @@ class PatientMonitor:
 
     def _monitor_loop(self, duration: int, callback):
         """Background thread: open camera, run detection, collect results."""
-        cap = cv2.VideoCapture(self._device_id)
-        if not cap.isOpened():
-            self._log(f"PatientMonitor: cannot open camera (device {self._device_id})")
-            self._active  = False
-            self._results = self._build_result(0, 0)
-            return
+        cap = None
+        frame_count = 0
+        loop_duration_total = 0.0
+        loop_duration_peak = 0.0
+        monitoring_duration_s = 0.0
 
-        self._cap = cap
-        cap.set(cv2.CAP_PROP_FPS, self._fps)
+        with self._profile_stage(
+            "monitoring_camera_init",
+            notes=lambda: {
+                "device_id": self._device_id,
+                "fps": self._fps,
+                "camera_opened": bool(cap and cap.isOpened()),
+            },
+        ):
+            cap = cv2.VideoCapture(self._device_id)
+            if not cap.isOpened():
+                self._log(f"PatientMonitor: cannot open camera (device {self._device_id})")
+                self._active = False
+                self._results = self._build_result(0, 0)
+                return
 
-        # Warm up the camera - Pi USB cameras need a few seconds before producing valid frames
-        self._log("PatientMonitor: warming up camera...")
-        warm_start = time.time()
-        while time.time() - warm_start < 3.0:
-            cap.read()
+            self._cap = cap
+            cap.set(cv2.CAP_PROP_FPS, self._fps)
+
+            # Warm up the camera - Pi USB cameras need a few seconds before producing valid frames
+            self._log("PatientMonitor: warming up camera...")
+            warm_start = time.time()
+            while time.time() - warm_start < 3.0:
+                cap.read()
 
         start_time      = time.time()
         hand_motion_cnt = 0
@@ -331,45 +381,80 @@ class PatientMonitor:
         next_frame_time = time.time()
 
         self._log("PatientMonitor: monitoring loop started")
-        
+
         try:
-            while self._active:
-                elapsed = time.time() - start_time
-                if elapsed >= duration:
-                    break
+            with self._profile_stage(
+                "monitoring_frame_loop",
+                notes=lambda: {
+                    "processed_frame_count": frame_count,
+                    "hand_motion_count": hand_motion_cnt,
+                    "swallow_count": (
+                        self._detector.intake_count if self._detector else 0
+                    ),
+                    "avg_loop_ms": round(
+                        (loop_duration_total / frame_count) * 1000.0, 3
+                    ) if frame_count else 0.0,
+                    "peak_loop_ms": round(loop_duration_peak * 1000.0, 3),
+                    "monitoring_duration_s": round(monitoring_duration_s, 3),
+                },
+            ):
+                while self._active:
+                    elapsed = time.time() - start_time
+                    if elapsed >= duration:
+                        break
 
-                now = time.time()
-                if now < next_frame_time:
-                    time.sleep(max(0, next_frame_time - now))
-                next_frame_time += frame_interval
+                    now = time.time()
+                    if now < next_frame_time:
+                        time.sleep(max(0, next_frame_time - now))
+                    next_frame_time += frame_interval
 
-                ret, frame = cap.read()
-                if not ret:
-                    continue
+                    loop_start = time.perf_counter()
 
-                frame = cv2.flip(frame, 1)
-                self._detector.process_frame(frame)
+                    ret, frame = cap.read()
+                    if not ret:
+                        continue
 
-                if self._detector.hands_near:
-                    hand_motion_cnt += 1
+                    frame = cv2.flip(frame, 1)
+                    self._detector.process_frame(frame)
+                    frame_count += 1
 
-                # Fire callback approximately once per second
-                if callback and int(elapsed) != int(elapsed - frame_interval):
-                    detections = {
-                        "swallow_count":    self._detector.intake_count,
-                        "hand_motion":      self._detector.hands_near,
-                        "mouth_open":       self._detector.mouth_open,
-                    }
-                    try:
-                        callback(detections, elapsed, duration)
-                    except Exception as cb_err:
-                        self._log(f"PatientMonitor callback error: {cb_err}")
+                    if self._detector.hands_near:
+                        hand_motion_cnt += 1
+
+                    loop_duration = time.perf_counter() - loop_start
+                    loop_duration_total += loop_duration
+                    loop_duration_peak = max(loop_duration_peak, loop_duration)
+                    monitoring_duration_s = time.time() - start_time
+
+                    # Fire callback approximately once per second
+                    if callback and int(elapsed) != int(elapsed - frame_interval):
+                        detections = {
+                            "swallow_count":    self._detector.intake_count,
+                            "hand_motion":      self._detector.hands_near,
+                            "mouth_open":       self._detector.mouth_open,
+                        }
+                        try:
+                            callback(detections, elapsed, duration)
+                        except Exception as cb_err:
+                            self._log(f"PatientMonitor callback error: {cb_err}")
 
         except Exception as e:
             self._log(f"PatientMonitor: error in monitoring loop: {e}")
         finally:
             intake_count = self._detector.intake_count if self._detector else 0
-            self._results = self._build_result(intake_count, hand_motion_cnt)
+            monitoring_duration_s = time.time() - start_time
+            self._results = self._build_result(
+                intake_count,
+                hand_motion_cnt,
+                metrics={
+                    "processed_frame_count": frame_count,
+                    "monitoring_duration_s": round(monitoring_duration_s, 3),
+                    "avg_loop_ms": round(
+                        (loop_duration_total / frame_count) * 1000.0, 3
+                    ) if frame_count else 0.0,
+                    "peak_loop_ms": round(loop_duration_peak * 1000.0, 3),
+                },
+            )
             self._release_resources()
             self._active = False
             self._log(
@@ -378,7 +463,12 @@ class PatientMonitor:
                 f"status={self._results['compliance_status']}"
             )
 
-    def _build_result(self, intake_count: int, hand_motion_count: int) -> dict:
+    def _build_result(
+        self,
+        intake_count: int,
+        hand_motion_count: int,
+        metrics: Optional[dict] = None,
+    ) -> dict:
         """
         Map raw counts to compliance_status values expected by decision_engine.py.
 
@@ -393,14 +483,21 @@ class PatientMonitor:
         else:
             status = "no_intake"
 
-        return {
+        result = {
             "compliance_status": status,
             # swallow_count maps to intake events for decision engine compatibility
             "swallow_count":     intake_count,
             # cough detection is not used in the new approach - always 0
             "cough_count":       0,
             "hand_motion_count": hand_motion_count,
+            "processed_frame_count": 0,
+            "monitoring_duration_s": 0.0,
+            "avg_loop_ms": 0.0,
+            "peak_loop_ms": 0.0,
         }
+        if metrics:
+            result.update(metrics)
+        return result
         
 # Standalone test - run directly to verify detection with a live camera feed
 if __name__ == "__main__":
