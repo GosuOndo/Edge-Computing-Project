@@ -554,6 +554,17 @@ class MedicationSystem:
             ):
                 continue
 
+            # Skip stations that are in the middle of verifying a returned bottle
+            # or waiting for a stable weight reading for a tamper check.
+            # _process_secured_bottle_movements owns this state transition; calling
+            # _secure_bottle_until_due here would wipe the pre-removal weight
+            # snapshot and early-alert flags before the tamper check can run.
+            _existing = self.secured_medications.get(station_id, {})
+            if _existing.get("early_alert_sent", False) or _existing.get(
+                "tamper_check_pending", False
+            ):
+                continue
+
             scan_msg = latest.get("scan_msg") or {}
             record   = self._resolve_record_from_scan(scan_msg)
             if not record:
@@ -641,6 +652,8 @@ class MedicationSystem:
                 and self.current_medication.get("station_id") == station_id
             ):
                 continue
+            if secure_state.get("tamper_check_pending", False):
+                return True
             if secure_state.get("early_alert_sent", False):
                 return True
             if secure_state.get("wrong_bottle_on_station", False):
@@ -657,6 +670,8 @@ class MedicationSystem:
         if secure_state.get("wrong_bottle_on_station", False):
             return "incorrect"
         if secure_state.get("early_alert_sent", False):
+            return "missing"
+        if secure_state.get("tamper_check_pending", False):
             return "missing"
         if (
             secure_state.get("tamper_alert_sent", False)
