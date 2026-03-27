@@ -1742,9 +1742,15 @@ class MedicationSystem:
             remaining = expected_dosage - total_swallows
             pill_word = "pill" if remaining == 1 else "pills"
             self.logger.warning(
-                f"Incomplete intake: {total_swallows} swallow(s) detected, "
-                f"{expected_dosage} expected for {medicine_name}"
+                f"Incomplete intake after monitoring: {total_swallows}/{expected_dosage} "
+                f"swallow(s) for {medicine_name} – starting incomplete intake phase"
             )
+
+            # ----------------------------------------------------------------
+            # Phase 2: Incomplete intake phase
+            # Prompt the patient, then run a full monitoring session so they
+            # can take the remaining pills while the camera watches.
+            # ----------------------------------------------------------------
             if self.display:
                 self.display.show_intake_mismatch_screen(
                     medicine_name=medicine_name,
@@ -1754,18 +1760,84 @@ class MedicationSystem:
             if self.audio:
                 self.audio.announce_warning(
                     f"Only {total_swallows} swallow detected. "
-                    f"Please take {remaining} more {pill_word}. "
+                    f"Please take {remaining} more {pill_word} now."
+                )
+            # Brief pause so the patient can read the screen before the
+            # incomplete-intake monitoring session starts.
+            time.sleep(3)
+
+            if not self.running:
+                return
+
+            incomplete_result = self._run_monitoring_session(
+                expected_dosage,
+                message=f"Incomplete Intake – Please take {remaining} more {pill_word}...",
+            )
+            incomplete_swallows  = int(incomplete_result.get("swallow_count", 0))
+            total_swallows_final = total_swallows + incomplete_swallows
+
+            self.logger.info(
+                f"Incomplete intake phase complete: +{incomplete_swallows} swallow(s), "
+                f"total={total_swallows_final}/{expected_dosage}"
+            )
+
+            # ---- Overdose during incomplete intake phase ----
+            if total_swallows_final > expected_dosage:
+                self.logger.warning(
+                    f"Overdose during incomplete intake phase: "
+                    f"{total_swallows_final} swallows, only {expected_dosage} expected"
+                )
+                if self.display:
+                    self.display.show_overdose_screen(
+                        medicine_name, total_swallows_final, expected_dosage
+                    )
+                if self.audio:
+                    self.audio.announce_warning(
+                        f"Too many pills detected. "
+                        f"You took {total_swallows_final} but only {expected_dosage} "
+                        f"are required. Please contact your caregiver."
+                    )
+                self.telegram.send_incorrect_dosage_alert(
+                    medicine_name=medicine_name,
+                    expected=expected_dosage,
+                    actual=total_swallows_final
+                )
+                decision = self._build_incorrect_dosage_decision(
+                    medicine_name=medicine_name,
+                    expected_dosage=expected_dosage,
+                    actual_dosage=total_swallows_final,
+                    stage="incomplete_intake_overdose"
+                )
+                self.database.log_medication_event(decision)
+                time.sleep(5)
+                self._end_verification_cycle(expected_station_id)
+                return
+
+            # ---- Still under-dosing after incomplete intake phase ----
+            self.logger.warning(
+                f"Still under-dose after incomplete intake phase: "
+                f"{total_swallows_final}/{expected_dosage} for {medicine_name}"
+            )
+            if self.display:
+                self.display.show_intake_mismatch_screen(
+                    medicine_name=medicine_name,
+                    swallow_count=total_swallows_final,
+                    expected_dosage=expected_dosage,
+                )
+            if self.audio:
+                self.audio.announce_warning(
+                    f"Only {total_swallows_final} swallow(s) detected. "
                     f"Your caregiver has been notified."
                 )
             self.telegram.send_incorrect_dosage_alert(
                 medicine_name=medicine_name,
                 expected=expected_dosage,
-                actual=total_swallows
+                actual=total_swallows_final
             )
             decision = self._build_incorrect_dosage_decision(
                 medicine_name=medicine_name,
                 expected_dosage=expected_dosage,
-                actual_dosage=total_swallows,
+                actual_dosage=total_swallows_final,
                 stage="incomplete_intake"
             )
             self.database.log_medication_event(decision)
