@@ -850,9 +850,9 @@ def test_simultaneous_returns_are_verified_per_station():
     assert station_2["early_alert_sent"] is True
     assert station_2["wrong_bottle_on_station"] is True
     assert system.display.idle_calls == []
-    assert system.display.error_calls[-1] == (
+    assert system.display.error_calls == [
         "Station 2 wrong bottle"
-    )
+    ]
     assert ("start", "station_1") in system.tag_runtime_service.scan_commands
     assert ("start", "station_2") in system.tag_runtime_service.scan_commands
     assert "station_2" in system.tag_runtime_service.cleared_stations

@@ -826,11 +826,6 @@ class MedicationSystem:
                 f"Expected {secure_state.get('medicine_name')} ({expected_medicine_id}), "
                 f"got {record.get('medicine_name')} ({actual_medicine_id})"
             )
-            if self.display:
-                self.display.show_error_screen(
-                    f"Wrong bottle on {station_id}. Please replace with "
-                    f"{secure_state.get('medicine_name', 'the correct medication')}."
-                )
             if self.audio:
                 self.audio.speak_async(
                     f"Wrong bottle detected. Please replace with "
