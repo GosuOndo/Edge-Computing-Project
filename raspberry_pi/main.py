@@ -224,9 +224,16 @@ class MedicationSystem:
                 logger=self.logger
             )
 
-            schedule_cfg = dict(self.config.get("schedule", {}) or {})
-            if "reminder" not in schedule_cfg:
-                schedule_cfg["reminder"] = dict(self.config.get("reminder", {}) or {})
+            reminder_cfg = dict(self.config.get("reminder", {}) or {})
+            if not reminder_cfg:
+                reminder_cfg = dict(
+                    ((self.config.get("schedule", {}) or {}).get("reminder", {}) or {})
+                )
+
+            schedule_cfg = {
+                "medications": [],
+                "reminder": reminder_cfg,
+            }
 
             self.scheduler = MedicationScheduler(
                 schedule_cfg, self.logger
@@ -419,20 +426,13 @@ class MedicationSystem:
 
     def _station_has_existing_schedule(self, station_id: str) -> bool:
         """
-        Return True when this station already has a usable medication schedule,
-        either from persisted registration data or from static scheduler config.
+        Return True when this station already has a usable medication schedule
+        in the database.
         """
         registered = self.database.get_registered_medicine_by_station(station_id)
-        if registered and self._parse_time_slots(registered.get("time_slots")):
-            return True
-
-        scheduler_medications = getattr(self.scheduler, "medications", [])
-        for medication in scheduler_medications:
-            if medication.get("station_id") != station_id:
-                continue
-            if medication.get("times"):
-                return True
-        return False
+        return bool(
+            registered and self._parse_time_slots(registered.get("time_slots"))
+        )
 
     def _enable_continuous_tag_scanning(self, station_id: str = None):
         """Keep NFC readers active during normal runtime."""

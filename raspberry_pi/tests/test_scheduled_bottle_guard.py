@@ -378,7 +378,7 @@ def test_bootstrap_from_registration_marks_missing_bottles_and_shows_alert():
     )
 
 
-def test_station_with_scheduler_times_skips_onboarding():
+def test_station_with_scheduler_times_does_not_skip_onboarding_without_db_schedule():
     system = make_system()
     system.database = FakeDatabase(records_by_station={"station_1": None})
     system.scheduler = types.SimpleNamespace(
@@ -392,7 +392,7 @@ def test_station_with_scheduler_times_skips_onboarding():
         ]
     )
 
-    assert system._station_has_existing_schedule("station_1") is True
+    assert system._station_has_existing_schedule("station_1") is False
 
 
 def test_database_schedule_replaces_placeholder_scheduler_for_idle_screen():

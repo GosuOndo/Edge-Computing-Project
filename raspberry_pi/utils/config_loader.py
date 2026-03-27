@@ -59,7 +59,7 @@ class ConfigLoader:
         """Validate critical configuration parameters"""
         required_sections = [
             'system', 'hardware', 'mqtt', 'weight_sensors',
-            'telegram', 'schedule', 'database', 'logging'
+            'telegram', 'database', 'logging'
         ]
         
         for section in required_sections:
@@ -144,8 +144,14 @@ class ConfigLoader:
         return self.config['weight_sensors'].get(station_id, {})
     
     def get_schedule(self) -> Dict[str, Any]:
-        """Get medication schedule"""
-        return self.config['schedule']
+        """
+        Legacy helper for schedule config access.
+
+        Runtime medication schedules are sourced from the database after
+        onboarding, so this now returns an empty dict when no legacy schedule
+        section exists.
+        """
+        return self.config.get('schedule', {})
     
     def get_logging_config(self) -> Dict[str, Any]:
         """Get logging configuration"""
