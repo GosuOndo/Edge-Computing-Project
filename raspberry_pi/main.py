@@ -90,7 +90,6 @@ class MedicationSystem:
         self._MAX_DOSAGE_ATTEMPTS  = 3
         self._dose_pills_removed: dict = {}   # station_id -> int cumulative
         self._dose_attempt_count: dict = {}   # station_id -> int attempts used
-        self._underdose_retry_monitoring_active = False
 
         # True while the station firmware is handling dosing (pill counting
         # on-device).  Prevents the old lift/replace FSM from interfering.
@@ -1143,14 +1142,7 @@ class MedicationSystem:
             f"Pill removal detected: {pills_this_event} pill(s) "
             f"from {event_data['station_id']}"
         )
-        state = self.state_machine.get_state()
-        if (
-            state != SystemState.REMINDER_ACTIVE
-            and not (
-                state == SystemState.MONITORING_PATIENT
-                and self._underdose_retry_monitoring_active
-            )
-        ):
+        if self.state_machine.get_state() != SystemState.REMINDER_ACTIVE:
             return
         station_id = event_data["station_id"]
         if (
@@ -1708,8 +1700,7 @@ class MedicationSystem:
         monitoring_result = self._run_monitoring_session(expected_dosage)
         total_swallows    = int(monitoring_result.get("swallow_count", 0))
 
-        retry_time_remaining = 120.0
-        retry_session_seconds = 30.0
+        retry_deadline = time.time() + 120.0
 
         while total_swallows != expected_dosage:
             if not self.running:
@@ -1766,10 +1757,14 @@ class MedicationSystem:
                     f"Please take {remaining} more {pill_word}."
                 )
 
-            # Underdose retry begins only after the initial monitoring window
-            # ends. During this retry phase we run another camera monitoring
-            # pass using the same intake logic, rather than waiting silently.
-            if retry_time_remaining <= 0:
+            # Underdose retry begins only after the monitoring window ends.
+            # Wait for the patient to remove more pills before starting the
+            # next camera-based monitoring pass.
+            self.state_machine.transition_to(
+                SystemState.REMINDER_ACTIVE, self.current_medication
+            )
+
+            if time.time() >= retry_deadline:
                 self.logger.warning("Intake retry timed out – patient did not respond")
                 self.telegram.send_incorrect_dosage_alert(
                     medicine_name=medicine_name,
@@ -1778,16 +1773,18 @@ class MedicationSystem:
                 )
                 break
 
-            self._underdose_retry_monitoring_active = True
-            try:
-                retry_result = self._run_monitoring_session(
-                    expected_dosage,
-                    message="Incomplete intake detected. Continue taking your medication.",
-                )
-            finally:
-                self._underdose_retry_monitoring_active = False
+            next_event = self._wait_for_pill_removal_event(
+                timeout_seconds=max(0.0, retry_deadline - time.time())
+            )
 
-            retry_time_remaining -= retry_session_seconds
+            if next_event is None:
+                self.logger.warning("Intake retry timed out – patient did not respond")
+                self.telegram.send_incorrect_dosage_alert(
+                    medicine_name=medicine_name,
+                    expected=expected_dosage,
+                    actual=total_swallows
+                )
+                break
 
             cumulative_pills = self._dose_pills_removed.get(expected_station_id, 0)
             if cumulative_pills > expected_dosage:
@@ -1821,7 +1818,10 @@ class MedicationSystem:
                 self._end_verification_cycle(expected_station_id)
                 return
 
-            new_swallows = int(retry_result.get("swallow_count", 0))
+            # Patient removed more pills, so start another camera-based
+            # monitoring pass using the same intake logic as the initial phase.
+            retry_result    = self._run_monitoring_session(expected_dosage)
+            new_swallows    = int(retry_result.get("swallow_count", 0))
             total_swallows += new_swallows
             monitoring_result = retry_result
             self.logger.info(
@@ -1890,11 +1890,7 @@ class MedicationSystem:
             },
         }
 
-    def _run_monitoring_session(
-        self,
-        expected_dosage: int,
-        message: str = "Monitoring intake...",
-    ) -> dict:
+    def _run_monitoring_session(self, expected_dosage: int) -> dict:
         """
         Run a single 30-second patient monitoring session and return the
         results dict.  Handles display updates, state transition, and all
@@ -1902,18 +1898,18 @@ class MedicationSystem:
         """
         self.logger.info("Starting patient monitoring (30 seconds)...")
         self.state_machine.transition_to(SystemState.MONITORING_PATIENT)
-        self.pending_monitoring_ui = (0, 30, message, 0, expected_dosage)
+        self.pending_monitoring_ui = (0, 30, "Monitoring intake...", 0, expected_dosage)
 
         if self.display:
             self.display.show_monitoring_screen(
-                0, 30, message, 0, expected_dosage
+                0, 30, "Monitoring intake...", 0, expected_dosage
             )
 
         try:
             def progress_callback(detections, elapsed, duration):
                 live_count = int(detections.get("swallow_count", 0))
                 self.pending_monitoring_ui = (
-                    elapsed, duration, message,
+                    elapsed, duration, "Monitoring intake...",
                     live_count, expected_dosage
                 )
 

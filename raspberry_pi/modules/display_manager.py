@@ -662,19 +662,15 @@ class DisplayManager:
             cy = self._card_text_y(8)
 
             # Instruction line
-            instruction = message or "Monitoring intake..."
-            instruction_y = cy
-            for line in self._wrap_text(instruction, 'normal', max_width=760)[:2]:
-                self._draw_text(
-                    line, 'normal', 'text_light',
-                    self.width // 2, instruction_y, center=True
-                )
-                instruction_y += 28
+            self._draw_text(
+                "Bring your hand to your mouth and swallow naturally",
+                'normal', 'text_light', self.width // 2, cy, center=True
+            )
 
             # ----------------------------------------------------------
             # Live swallow counter row
             # ----------------------------------------------------------
-            counter_y = instruction_y + 16
+            counter_y = cy + 44
 
             if expected_dosage > 0:
                 # Dot indicators – filled (success) for detected, hollow for pending
