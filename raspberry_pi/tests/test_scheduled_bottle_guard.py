@@ -225,6 +225,7 @@ class FakeDisplay:
         self.idle_calls = []
         self.pipeline_calls = []
         self.overdose_calls = []
+        self.intake_mismatch_calls = []
         self.success_calls = []
 
     def show_warning_screen(self, title, message):
@@ -241,6 +242,11 @@ class FakeDisplay:
 
     def show_overdose_screen(self, medicine_name, taken, required):
         self.overdose_calls.append((medicine_name, taken, required))
+
+    def show_intake_mismatch_screen(self, medicine_name, swallow_count, expected_dosage):
+        self.intake_mismatch_calls.append(
+            (medicine_name, swallow_count, expected_dosage)
+        )
 
     def show_success_screen(self, medicine_name, message):
         self.success_calls.append((medicine_name, message))
@@ -612,6 +618,207 @@ def test_monitoring_overdose_returns_to_idle_without_success(monkeypatch):
     assert system.database.logged[0]["result"] == StubDecisionResult.INCORRECT_DOSAGE
     assert system.database.logged[0]["details"]["weight_actual"] == 2
     assert system.database.logged[0]["details"]["dose_error_stage"] == "intake_monitoring"
+    assert ended_cycles == ["station_1"]
+
+
+def test_underdose_retry_keeps_camera_monitoring_without_waiting_for_weight_event(monkeypatch):
+    monkeypatch.setattr("raspberry_pi.main.time.sleep", lambda *_args, **_kwargs: None)
+
+    system = make_system()
+    system.running = True
+    system.config = {
+        "identity": {
+            "tag": {
+                "integrated_mode": True,
+                "coincident_window_seconds": 15.0,
+            }
+        }
+    }
+    system.current_medication = {
+        "medicine_name": "Aspirin 100mg",
+        "dosage_pills": 2,
+        "station_id": "station_1",
+        "medicine_id": "M001",
+    }
+    system._dose_pills_removed = {"station_1": 2}
+    system.display = FakeDisplay()
+    system.audio = FakeAudio()
+    system.telegram = types.SimpleNamespace(
+        alerts=[],
+        send_incorrect_dosage_alert=lambda **kwargs: system.telegram.alerts.append(kwargs) or True,
+    )
+    system.database = types.SimpleNamespace(
+        logged=[],
+        log_medication_event=lambda decision: system.database.logged.append(decision) or True,
+    )
+    system.scanner = types.SimpleNamespace(
+        initialize_camera=lambda: True,
+        release_camera=lambda: None,
+    )
+    system.identity_manager = types.SimpleNamespace(
+        verify_identity_integrated=lambda **_kwargs: {
+            "success": True,
+            "medicine_name": "Aspirin 100mg",
+            "confidence": 1.0,
+            "method": "tag",
+            "record": {},
+        }
+    )
+    system.weight_manager = types.SimpleNamespace(
+        verify_dosage=lambda station_id, expected_dosage: {
+            "verified": True,
+            "actual": expected_dosage,
+            "pill_weight_g": 0.5,
+        },
+        _get_pill_weight_g=lambda station_id: 0.5,
+        station_configs={"station_1": {"dose_verification_tolerance_g": 0.12}},
+        set_pill_weight_from_tag=lambda station_id, pill_weight_mg: None,
+        disable_event_detection=lambda station_id: None,
+    )
+    decision_calls = []
+    system.decision_engine = types.SimpleNamespace(
+        verify_medication_intake=lambda **kwargs: decision_calls.append(kwargs) or {
+            "verified": True,
+            "result": StubDecisionResult.SUCCESS,
+            "details": {},
+            "scores": {},
+        }
+    )
+    marked_taken = []
+    system.scheduler = types.SimpleNamespace(
+        mark_dose_taken=lambda medicine_name: marked_taken.append(medicine_name)
+    )
+    handled = []
+    system._handle_decision = lambda decision: handled.append(decision)
+    ended_cycles = []
+    system._end_verification_cycle = lambda station_id: ended_cycles.append(station_id)
+    sessions = iter([
+        {
+            "compliance_status": "good",
+            "swallow_count": 1,
+            "cough_count": 0,
+            "hand_motion_count": 0,
+        },
+        {
+            "compliance_status": "good",
+            "swallow_count": 1,
+            "cough_count": 0,
+            "hand_motion_count": 0,
+        },
+    ])
+    system._run_monitoring_session = lambda expected_dosage: next(sessions)
+    system._wait_for_pill_removal_event = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("weight-event wait should not run during underdose retry monitoring")
+    )
+
+    system._verify_medication_intake({"timestamp": time.time()})
+
+    assert handled and handled[0]["verified"] is True
+    assert decision_calls[0]["monitoring_result"]["swallow_count"] == 2
+    assert marked_taken == ["Aspirin 100mg"]
+    assert ended_cycles == ["station_1"]
+
+
+def test_underdose_retry_monitoring_overdose_uses_existing_overdose_screen(monkeypatch):
+    monkeypatch.setattr("raspberry_pi.main.time.sleep", lambda *_args, **_kwargs: None)
+
+    system = make_system()
+    system.running = True
+    system.config = {
+        "identity": {
+            "tag": {
+                "integrated_mode": True,
+                "coincident_window_seconds": 15.0,
+            }
+        }
+    }
+    system.current_medication = {
+        "medicine_name": "Aspirin 100mg",
+        "dosage_pills": 2,
+        "station_id": "station_1",
+        "medicine_id": "M001",
+    }
+    system._dose_pills_removed = {"station_1": 2}
+    system.display = FakeDisplay()
+    system.audio = FakeAudio()
+    system.telegram = types.SimpleNamespace(
+        alerts=[],
+        send_incorrect_dosage_alert=lambda **kwargs: system.telegram.alerts.append(kwargs) or True,
+    )
+    system.database = types.SimpleNamespace(
+        logged=[],
+        log_medication_event=lambda decision: system.database.logged.append(decision) or True,
+    )
+    system.scanner = types.SimpleNamespace(
+        initialize_camera=lambda: True,
+        release_camera=lambda: None,
+    )
+    system.identity_manager = types.SimpleNamespace(
+        verify_identity_integrated=lambda **_kwargs: {
+            "success": True,
+            "medicine_name": "Aspirin 100mg",
+            "confidence": 1.0,
+            "method": "tag",
+            "record": {},
+        }
+    )
+    system.weight_manager = types.SimpleNamespace(
+        verify_dosage=lambda station_id, expected_dosage: {
+            "verified": True,
+            "actual": expected_dosage,
+            "pill_weight_g": 0.5,
+        },
+        _get_pill_weight_g=lambda station_id: 0.5,
+        station_configs={"station_1": {"dose_verification_tolerance_g": 0.12}},
+        set_pill_weight_from_tag=lambda station_id, pill_weight_mg: None,
+        disable_event_detection=lambda station_id: None,
+    )
+    system.decision_engine = types.SimpleNamespace(
+        verify_medication_intake=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("decision engine should not run after retry overdose")
+        )
+    )
+    system.scheduler = types.SimpleNamespace(
+        mark_dose_taken=lambda medicine_name: (_ for _ in ()).throw(
+            AssertionError("dose should not be marked taken after retry overdose")
+        )
+    )
+    system._handle_decision = lambda decision: (_ for _ in ()).throw(
+        AssertionError("success handler should not run after retry overdose")
+    )
+    ended_cycles = []
+    system._end_verification_cycle = lambda station_id: ended_cycles.append(station_id)
+    sessions = iter([
+        {
+            "compliance_status": "good",
+            "swallow_count": 1,
+            "cough_count": 0,
+            "hand_motion_count": 0,
+        },
+        {
+            "compliance_status": "good",
+            "swallow_count": 2,
+            "cough_count": 0,
+            "hand_motion_count": 0,
+        },
+    ])
+    system._run_monitoring_session = lambda expected_dosage: next(sessions)
+    system._wait_for_pill_removal_event = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("weight-event wait should not run during retry overdose path")
+    )
+
+    system._verify_medication_intake({"timestamp": time.time()})
+
+    assert system.display.overdose_calls == [("Aspirin 100mg", 3, 2)]
+    assert system.telegram.alerts == [
+        {
+            "medicine_name": "Aspirin 100mg",
+            "expected": 2,
+            "actual": 3,
+        }
+    ]
+    assert system.database.logged[0]["result"] == StubDecisionResult.INCORRECT_DOSAGE
+    assert system.database.logged[0]["details"]["weight_actual"] == 3
     assert ended_cycles == ["station_1"]
 
 
