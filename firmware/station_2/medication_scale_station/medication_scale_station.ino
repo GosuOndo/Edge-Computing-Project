@@ -34,7 +34,11 @@ const unsigned long MQTT_PUBLISH_STABLE_MS = 500;
 const unsigned long MQTT_PUBLISH_CHANGING_MS = 2000;
 const unsigned long DISPLAY_UPDATE_MS = 200;
 
-const float STABILITY_THRESHOLD_G = 0.15;
+const int FILTER_WINDOW_SIZE = 9;
+const float FAST_SMOOTH_ALPHA = 0.30f;
+const float SLOW_SMOOTH_ALPHA = 0.12f;
+const float CHANGE_THRESHOLD_G = 1.0f;
+const float STABILITY_RANGE_G = 0.20f;
 const float ZERO_CLAMP_G = 0.20;
 
 // -------------------- Preferences --------------------
@@ -57,16 +61,25 @@ PubSubClient mqttClient(wifiClient);
 
 // Live state
 float currentWeight = 0.0f;
-float smoothedWeight = 0.0f;
-bool smoothInit = false;
+float filteredWeight = 0.0f;
+bool filterInit = false;
 bool isStable = false;
 
-float history[10];
-int historyIndex = 0;
-int historyCount = 0;
+float sampleWindow[FILTER_WINDOW_SIZE];
+int sampleIndex = 0;
+int sampleCount = 0;
 
 unsigned long lastPublish = 0;
 unsigned long lastDisplayUpdate = 0;
+
+// -------------------- Dosing State --------------------
+bool dosingActive = false;
+float bottleBaseline = 0.0f;
+int requiredPills = 0;
+float pillWeightG = 0.0f;
+unsigned long dosingCorrectSince = 0;
+bool dosingCompletePublished = false;
+const unsigned long DOSING_CONFIRM_MS = 2000;
 
 // =====================================================
 // DISPLAY / HELPER FUNCTIONS
@@ -117,30 +130,62 @@ float getStableReading(int samples = 30, int spacingMs = 20) {
   return (count > 0) ? (sum / count) : 0.0f;
 }
 
-void resetHistory(float value = 0.0f) {
-  for (int i = 0; i < 10; i++) {
-    history[i] = value;
+void resetFilter(float value = 0.0f) {
+  for (int i = 0; i < FILTER_WINDOW_SIZE; i++) {
+    sampleWindow[i] = value;
   }
-  historyIndex = 0;
-  historyCount = 10;
+  sampleIndex = 0;
+  sampleCount = 0;
+  filteredWeight = value;
+  filterInit = false;
+  currentWeight = (fabs(value) < ZERO_CLAMP_G) ? 0.0f : value;
+  isStable = false;
 }
 
-bool computeStability(float value) {
-  history[historyIndex] = value;
-  historyIndex = (historyIndex + 1) % 10;
-  if (historyCount < 10) historyCount++;
+void pushSample(float value) {
+  sampleWindow[sampleIndex] = value;
+  sampleIndex = (sampleIndex + 1) % FILTER_WINDOW_SIZE;
+  if (sampleCount < FILTER_WINDOW_SIZE) sampleCount++;
+}
 
-  if (historyCount < 10) return false;
+float getWindowMedian() {
+  if (sampleCount == 0) return 0.0f;
 
-  float sum = 0.0f;
-  for (int i = 0; i < 10; i++) sum += history[i];
-  float mean = sum / 10.0f;
-
-  for (int i = 0; i < 10; i++) {
-    if (fabs(history[i] - mean) > STABILITY_THRESHOLD_G) {
-      return false;
-    }
+  float sorted[FILTER_WINDOW_SIZE];
+  for (int i = 0; i < sampleCount; i++) {
+    sorted[i] = sampleWindow[i];
   }
+
+  for (int i = 1; i < sampleCount; i++) {
+    float key = sorted[i];
+    int j = i - 1;
+    while (j >= 0 && sorted[j] > key) {
+      sorted[j + 1] = sorted[j];
+      j--;
+    }
+    sorted[j + 1] = key;
+  }
+
+  if ((sampleCount % 2) == 0) {
+    return (sorted[sampleCount / 2 - 1] + sorted[sampleCount / 2]) * 0.5f;
+  }
+
+  return sorted[sampleCount / 2];
+}
+
+bool getStableWindowWeight(float* stableWeight) {
+  if (sampleCount < FILTER_WINDOW_SIZE) return false;
+
+  float minValue = sampleWindow[0];
+  float maxValue = sampleWindow[0];
+  for (int i = 1; i < FILTER_WINDOW_SIZE; i++) {
+    if (sampleWindow[i] < minValue) minValue = sampleWindow[i];
+    if (sampleWindow[i] > maxValue) maxValue = sampleWindow[i];
+  }
+
+  if ((maxValue - minValue) > STABILITY_RANGE_G) return false;
+
+  *stableWeight = getWindowMedian();
   return true;
 }
 
@@ -284,9 +329,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     pumpUpdates(1200);
 
     currentWeight = 0.0f;
-    smoothedWeight = 0.0f;
-    smoothInit = false;
-    resetHistory(0.0f);
+    resetFilter(0.0f);
 
     publishStatus("tare_complete");
     showMsg("Tare complete", "", "", TFT_GREEN);
@@ -305,6 +348,28 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     publishStatus("calibration_cleared");
     showMsg("Calibration", "cleared", "", TFT_YELLOW);
     delay(1000);
+  }
+  else if (strcmp(command, "start_dosing") == 0) {
+    requiredPills = doc["params"]["dosage_pills"] | 1;
+    float pillWeightMg = doc["params"]["pill_weight_mg"] | 290.0f;
+    pillWeightG = pillWeightMg / 1000.0f;
+    bottleBaseline = currentWeight;
+    dosingActive = true;
+    dosingCompletePublished = false;
+    dosingCorrectSince = 0;
+    Serial.print("Dosing started. Baseline: ");
+    Serial.print(bottleBaseline);
+    Serial.print("g, Need: ");
+    Serial.print(requiredPills);
+    Serial.print(" pills @ ");
+    Serial.print(pillWeightG, 3);
+    Serial.println("g each");
+    publishStatus("dosing_started");
+  }
+  else if (strcmp(command, "stop_dosing") == 0) {
+    dosingActive = false;
+    dosingCompletePublished = false;
+    publishStatus("dosing_stopped");
   }
 }
 
@@ -416,9 +481,7 @@ void runCalibrationWorkflow() {
   delay(2500);
 
   currentWeight = 0.0f;
-  smoothedWeight = 0.0f;
-  smoothInit = false;
-  resetHistory(0.0f);
+  resetFilter(0.0f);
 
   M5.Lcd.fillScreen(BLACK);
 }
@@ -464,6 +527,51 @@ void updateLiveDisplay() {
 }
 
 // =====================================================
+// DOSING DISPLAY
+// =====================================================
+void updateDosingDisplay() {
+  float weightDelta = bottleBaseline - currentWeight;
+  int pillsRemoved = (int)round(weightDelta / pillWeightG);
+  if (pillsRemoved < 0) pillsRemoved = 0;
+  int pillsDiff = pillsRemoved - requiredPills;
+
+  M5.Lcd.fillScreen(BLACK);
+
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setTextColor(TFT_CYAN);
+  M5.Lcd.setCursor(5, 5);
+  M5.Lcd.println(STATION_ID);
+
+  char infoLine[32];
+  snprintf(infoLine, sizeof(infoLine), "Removed:%d  Need:%d", pillsRemoved, requiredPills);
+  M5.Lcd.setTextColor(TFT_WHITE);
+  M5.Lcd.setCursor(5, 18);
+  M5.Lcd.println(infoLine);
+
+  M5.Lcd.setTextSize(2);
+  M5.Lcd.setCursor(5, 38);
+
+  if (pillsDiff < 0) {
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Take %d more", -pillsDiff);
+    M5.Lcd.setTextColor(TFT_YELLOW);
+    M5.Lcd.println(msg);
+  } else if (pillsDiff > 0) {
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Put back %d", pillsDiff);
+    M5.Lcd.setTextColor(TFT_RED);
+    M5.Lcd.println(msg);
+  } else {
+    M5.Lcd.setTextColor(TFT_GREEN);
+    M5.Lcd.println("Correct!");
+    M5.Lcd.setCursor(5, 63);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.println("Hold still...");
+  }
+}
+
+// =====================================================
 // SETUP
 // =====================================================
 void setup() {
@@ -492,10 +600,7 @@ void setup() {
 
   scale.setCalFactor(calibrationFactor);
 
-  currentWeight = 0.0f;
-  smoothedWeight = 0.0f;
-  smoothInit = false;
-  resetHistory(0.0f);
+  resetFilter(0.0f);
 
   connectWiFi();
 
@@ -534,21 +639,60 @@ void loop() {
 
   if (scale.update()) {
     float raw = scale.getData();
+    pushSample(raw);
 
-    if (!smoothInit) {
-      smoothedWeight = raw;
-      smoothInit = true;
+    float median = getWindowMedian();
+    if (!filterInit) {
+      filteredWeight = median;
+      filterInit = true;
     }
 
-    smoothedWeight = (smoothedWeight * 0.85f) + (raw * 0.15f);
+    float delta = fabs(median - filteredWeight);
+    float alpha = (delta > CHANGE_THRESHOLD_G) ? FAST_SMOOTH_ALPHA : SLOW_SMOOTH_ALPHA;
+    filteredWeight += (median - filteredWeight) * alpha;
 
-    if (fabs(smoothedWeight) < ZERO_CLAMP_G) {
-      currentWeight = 0.0f;
+    float stableWeight = 0.0f;
+    if (getStableWindowWeight(&stableWeight)) {
+      currentWeight = stableWeight;
+      isStable = true;
     } else {
-      currentWeight = smoothedWeight;
+      currentWeight = filteredWeight;
+      isStable = false;
     }
 
-    isStable = computeStability(currentWeight);
+    if (fabs(currentWeight) < ZERO_CLAMP_G) {
+      currentWeight = 0.0f;
+    }
+  }
+
+  // Dosing completion check
+  if (dosingActive && isStable && !dosingCompletePublished && mqttClient.connected()) {
+    float weightDelta = bottleBaseline - currentWeight;
+    int pillsRemoved = (int)round(weightDelta / pillWeightG);
+    if (pillsRemoved < 0) pillsRemoved = 0;
+
+    if (pillsRemoved == requiredPills) {
+      if (dosingCorrectSince == 0) {
+        dosingCorrectSince = millis();
+      } else if (millis() - dosingCorrectSince >= DOSING_CONFIRM_MS) {
+        // Confirmed — publish detailed dosing_complete status
+        StaticJsonDocument<256> statusDoc;
+        statusDoc["station_id"] = STATION_ID;
+        statusDoc["status"] = "dosing_complete";
+        statusDoc["pills_removed"] = pillsRemoved;
+        statusDoc["weight_delta_g"] = round(weightDelta * 100.0f) / 100.0f;
+        statusDoc["baseline_g"] = round(bottleBaseline * 100.0f) / 100.0f;
+        statusDoc["timestamp"] = millis();
+        char statusBuf[256];
+        serializeJson(statusDoc, statusBuf);
+        mqttClient.publish(topic_status, statusBuf);
+        Serial.println("Dosing complete published");
+        dosingCompletePublished = true;
+        dosingActive = false;
+      }
+    } else {
+      dosingCorrectSince = 0;
+    }
   }
 
   if (M5.BtnA.wasPressed()) {
@@ -558,9 +702,7 @@ void loop() {
     pumpUpdates(1200);
 
     currentWeight = 0.0f;
-    smoothedWeight = 0.0f;
-    smoothInit = false;
-    resetHistory(0.0f);
+    resetFilter(0.0f);
 
     publishStatus("tare_complete");
   }
@@ -581,7 +723,11 @@ void loop() {
 
   if (now - lastDisplayUpdate >= DISPLAY_UPDATE_MS) {
     lastDisplayUpdate = now;
-    updateLiveDisplay();
+    if (dosingActive) {
+      updateDosingDisplay();
+    } else {
+      updateLiveDisplay();
+    }
   }
 
   delay(20);
