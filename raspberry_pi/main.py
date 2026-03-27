@@ -365,8 +365,6 @@ class MedicationSystem:
             scan_msg = latest.get("scan_msg") or {}
             record   = self._resolve_record_from_scan(scan_msg)
             if not record or record.get("station_id") != station_id:
-                self._processed_tag_scans[station_id] = scan_received_at
-                self.tag_runtime_service.clear_latest_scan(station_id)
                 continue
 
             # Only accept the medicine that is registered to this station.
@@ -401,8 +399,6 @@ class MedicationSystem:
                             f"{registered.get('medicine_name', 'the correct medicine')} "
                             f"on {station_id}"
                         )
-                    self._processed_tag_scans[station_id] = scan_received_at
-                    self.tag_runtime_service.clear_latest_scan(station_id)
                     continue
 
             status = self.weight_manager.get_station_status(station_id)
@@ -416,65 +412,6 @@ class MedicationSystem:
                 continue
 
             self._secure_bottle_until_due(record, scan_received_at, weight_g)
-            self.tag_runtime_service.stop_scanning(station_id)
-
-    def _revalidate_registered_bottles_on_startup(
-        self, wait_timeout_seconds: float = 4.0
-    ):
-        """
-        On app relaunch, force a fresh NFC read for any occupied registered
-        station so the bottle currently resting on the scale is re-verified.
-
-        Stations that do not produce a valid fresh scan within the short
-        startup window remain untrusted; scanning stays active so the main
-        loop can complete verification as soon as a new tag read arrives.
-        """
-        pending_station_ids = []
-
-        for station_id in self.weight_manager.station_configs:
-            registered = self.database.get_registered_medicine_by_station(station_id)
-            if not registered:
-                continue
-
-            status = self.weight_manager.get_station_status(station_id)
-            if not status.get("connected"):
-                continue
-
-            weight_g = float(status.get("weight_g") or 0.0)
-            if weight_g < self.min_secured_bottle_weight_g:
-                continue
-
-            self.logger.info(
-                f"Startup NFC revalidation requested for {station_id} "
-                f"({registered.get('medicine_name', 'registered medicine')})"
-            )
-            self.tag_runtime_service.clear_latest_scan(station_id)
-            self.tag_runtime_service.start_scanning(station_id)
-            pending_station_ids.append(station_id)
-
-        if not pending_station_ids:
-            return
-
-        deadline = time.time() + max(0.0, wait_timeout_seconds)
-        while pending_station_ids and time.time() < deadline and self.running:
-            self._process_secured_bottle_placements()
-            pending_station_ids = [
-                station_id
-                for station_id in pending_station_ids
-                if station_id not in self.secured_medications
-            ]
-            if not pending_station_ids:
-                break
-            if self.display:
-                self.display.update()
-            time.sleep(0.1)
-
-        for station_id in pending_station_ids:
-            registered = self.database.get_registered_medicine_by_station(station_id) or {}
-            self.logger.warning(
-                f"Startup NFC revalidation still pending on {station_id} for "
-                f"{registered.get('medicine_name', 'registered medicine')}"
-            )
 
     def _notify_unauthorized_bottle_movement(self, secure_state: dict):
         medicine_name = secure_state.get("medicine_name", "medication")
@@ -719,8 +656,81 @@ class MedicationSystem:
         secure_state["tamper_alert_until"] = time.time() + 30
         secure_state["tamper_delta_g"]     = round(delta_g, 2)
         secure_state["tamper_pills_est"]   = estimated_pills
+        secure_state["tamper_direction"]   = "lighter"
+        secure_state["current_weight_g"]   = returned_weight_g
         # Immediately refresh the security screen to show the tamper alert.
         self._refresh_security_violation_screen()
+
+    def _check_stationary_bottle_weight_change(
+        self, secure_state: dict, observed_weight_g: float
+    ) -> bool:
+        """
+        Detect meaningful weight drift while the bottle is still sitting on the
+        station. This catches pills being removed without fully lifting the
+        bottle off the scale.
+        """
+        station_id    = secure_state.get("station_id", "unknown")
+        medicine_name = secure_state.get("medicine_name", "Unknown")
+        reference_g   = (
+            secure_state.get("current_weight_g")
+            or secure_state.get("secured_weight_g")
+        )
+        if not reference_g or reference_g <= 0:
+            return False
+
+        cfg         = self.weight_manager.station_configs.get(station_id, {})
+        threshold_g = float(
+            cfg.get("tamper_tolerance_g")
+            or self.weight_manager._get_min_delta_g(station_id)
+        )
+        delta_g = observed_weight_g - reference_g
+
+        if abs(delta_g) <= threshold_g:
+            return False
+
+        direction = "lighter" if delta_g < 0 else "heavier"
+        change_g  = abs(delta_g)
+        pill_weight_g = self.weight_manager._get_pill_weight_g(station_id)
+        estimated_pills = (
+            max(1, round(change_g / pill_weight_g))
+            if pill_weight_g > 0 else "unknown"
+        )
+        station_label = station_id.replace("_", " ").title()
+
+        self.logger.warning(
+            f"[{station_id}] STATIONARY WEIGHT CHANGE: {medicine_name} is "
+            f"{change_g:.2f}g {direction} while still on the station"
+        )
+
+        if self.audio:
+            self.audio.speak_async(
+                f"Warning. {medicine_name} bottle weight has changed. "
+                f"It is now {direction} by {change_g:.1f} grams. "
+                "Your caregiver has been notified."
+            )
+
+        self.telegram.send_bottle_tampering_alert(
+            medicine_name=medicine_name,
+            station_id=station_id,
+            station_label=station_label,
+            reference_weight_g=reference_g,
+            returned_weight_g=observed_weight_g,
+            delta_g=delta_g,
+            estimated_pills_removed=estimated_pills,
+        )
+
+        if observed_weight_g > 0:
+            self.weight_manager.baseline_weights[station_id] = observed_weight_g
+            self.weight_manager._save_persisted_baselines()
+
+        secure_state["tamper_alert_sent"]  = True
+        secure_state["tamper_alert_until"] = time.time() + 30
+        secure_state["tamper_delta_g"]     = round(change_g, 2)
+        secure_state["tamper_pills_est"]   = estimated_pills
+        secure_state["tamper_direction"]   = direction
+        secure_state["current_weight_g"]   = observed_weight_g
+        self._refresh_security_violation_screen()
+        return True
 
     def _verify_returned_bottle(self, secure_state: dict):
         """
@@ -873,7 +883,6 @@ class MedicationSystem:
                 elif not secure_state.get("wrong_bottle_on_station", False):
                     secure_state["present"] = True
                     if status.get("stable", False):
-                        secure_state["current_weight_g"] = weight_g
                         # Execute any deferred tamper check on the first stable
                         # reading after the correct bottle was returned.
                         if secure_state.get("tamper_check_pending", False):
@@ -884,6 +893,12 @@ class MedicationSystem:
                                 and not self._has_pending_security_violation()
                             ):
                                 self._show_idle_screen()
+                        elif self._check_stationary_bottle_weight_change(
+                            secure_state, weight_g
+                        ):
+                            continue
+                        else:
+                            secure_state["current_weight_g"] = weight_g
                 continue
 
             # Bottle not present - clear flags so the next placement
@@ -2027,8 +2042,6 @@ class MedicationSystem:
 
         if self.display:
             self._show_idle_screen()
-
-        self._revalidate_registered_bottles_on_startup()
 
         self.logger.info("System ready")
 

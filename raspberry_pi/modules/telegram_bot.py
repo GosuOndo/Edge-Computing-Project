@@ -321,21 +321,24 @@ class TelegramBot:
         sid   = self._escape_md(station_label or station_id)
         ref_w = self._escape_md(f"{reference_weight_g:.1f}")
         ret_w = self._escape_md(f"{returned_weight_g:.1f}")
-        delta = self._escape_md(f"{delta_g:.1f}")
+        delta_abs = abs(float(delta_g))
+        direction = "lighter" if delta_g > 0 else "heavier"
+        delta = self._escape_md(f"{delta_abs:.1f}")
+        change = self._escape_md(f"{delta_abs:.1f} g {direction}")
         pills = self._escape_md(str(estimated_pills_removed))
         ts    = self._escape_md(time.strftime("%Y-%m-%d %H:%M:%S"))
 
         message = (
-            f"*ALERT - Bottle Tampering Detected*\n\n"
+            f"*ALERT - Bottle Weight Changed*\n\n"
             f"Medicine: {name}\n"
             f"Station: {sid}\n\n"
-            f"Weight before removal: {ref_w} g\n"
-            f"Weight on return: {ret_w} g\n"
-            f"Discrepancy: {delta} g\n"
-            f"Estimated pills removed: ~{pills}\n\n"
+            f"Reference weight: {ref_w} g\n"
+            f"Current weight: {ret_w} g\n"
+            f"Change detected: {change}\n"
+            f"Estimated pills affected: ~{pills}\n\n"
             f"Time: {ts}\n\n"
-            f"The bottle was returned lighter than expected. "
-            f"Pills may have been taken outside the scheduled dose window."
+            f"The bottle weight changed unexpectedly outside the scheduled "
+            f"dose window."
         )
         return self.send_message(self.caregiver_chat_id, message)
 
