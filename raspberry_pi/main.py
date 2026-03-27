@@ -1737,41 +1737,109 @@ class MedicationSystem:
             self._end_verification_cycle(expected_station_id)
             return
 
-        # ---- Under-count after monitoring phase: incomplete intake phase ----
+        # ---- Under-count after monitoring phase: enter incomplete intake phase ----
         if total_swallows < expected_dosage:
-            remaining = expected_dosage - total_swallows
-            pill_word = "pill" if remaining == 1 else "pills"
+            if not self.running:
+                return
+
+            # ------------------------------------------------------------------
+            # Phase 2: Incomplete intake phase
+            # Camera stays on with a timer – patient is prompted to take the
+            # remaining pills.  This runs exactly once.
+            # ------------------------------------------------------------------
             self.logger.warning(
-                f"Incomplete intake: {total_swallows} swallow(s) detected, "
-                f"{expected_dosage} expected for {medicine_name}"
+                f"Intake mismatch after monitoring: {total_swallows} swallow(s) "
+                f"detected, {expected_dosage} expected. Starting incomplete intake phase."
             )
-            if self.display:
-                self.display.show_intake_mismatch_screen(
+            self._underdose_retry_monitoring_active = True
+            try:
+                retry_result = self._run_monitoring_session(
+                    expected_dosage,
+                    message="Incomplete intake detected. Continue taking your medication.",
+                )
+            finally:
+                self._underdose_retry_monitoring_active = False
+
+            new_swallows = int(retry_result.get("swallow_count", 0))
+            total_swallows += new_swallows
+            monitoring_result = retry_result
+            monitoring_result["swallow_count"] = total_swallows
+            self.logger.info(
+                f"Incomplete intake phase: +{new_swallows} swallows "
+                f"(total {total_swallows}/{expected_dosage})"
+            )
+
+            # Check cumulative pill removal via weight sensor for overdose
+            cumulative_pills = self._dose_pills_removed.get(expected_station_id, 0)
+            overdose_count = max(total_swallows, cumulative_pills)
+
+            # ---- Over-count during/after incomplete intake phase ----
+            if total_swallows > expected_dosage or cumulative_pills > expected_dosage:
+                self.logger.warning(
+                    f"Intake excess during incomplete intake phase: "
+                    f"{overdose_count} pill(s), only {expected_dosage} expected"
+                )
+                if self.display:
+                    self.display.show_overdose_screen(
+                        medicine_name, overdose_count, expected_dosage
+                    )
+                if self.audio:
+                    self.audio.announce_warning(
+                        f"Too many pills detected. "
+                        f"You took {overdose_count} but only {expected_dosage} "
+                        f"are required. Please contact your caregiver."
+                    )
+                self.telegram.send_incorrect_dosage_alert(
                     medicine_name=medicine_name,
-                    swallow_count=total_swallows,
+                    expected=expected_dosage,
+                    actual=overdose_count
+                )
+                decision = self._build_incorrect_dosage_decision(
+                    medicine_name=medicine_name,
                     expected_dosage=expected_dosage,
+                    actual_dosage=overdose_count,
+                    stage="incomplete_intake_phase"
                 )
-            if self.audio:
-                self.audio.announce_warning(
-                    f"Only {total_swallows} swallow detected. "
-                    f"Please take {remaining} more {pill_word}. "
-                    f"Your caregiver has been notified."
+                self.database.log_medication_event(decision)
+                time.sleep(5)
+                self._end_verification_cycle(expected_station_id)
+                return
+
+            # ---- Still under-dosing after incomplete intake phase ----
+            if total_swallows < expected_dosage:
+                remaining = expected_dosage - total_swallows
+                pill_word = "pill" if remaining == 1 else "pills"
+                self.logger.warning(
+                    f"Still underdosing after incomplete intake phase: "
+                    f"{total_swallows}/{expected_dosage} swallows for {medicine_name}"
                 )
-            self.telegram.send_incorrect_dosage_alert(
-                medicine_name=medicine_name,
-                expected=expected_dosage,
-                actual=total_swallows
-            )
-            decision = self._build_incorrect_dosage_decision(
-                medicine_name=medicine_name,
-                expected_dosage=expected_dosage,
-                actual_dosage=total_swallows,
-                stage="incomplete_intake"
-            )
-            self.database.log_medication_event(decision)
-            time.sleep(5)
-            self._end_verification_cycle(expected_station_id)
-            return
+                if self.display:
+                    self.display.show_intake_mismatch_screen(
+                        medicine_name=medicine_name,
+                        swallow_count=total_swallows,
+                        expected_dosage=expected_dosage,
+                    )
+                if self.audio:
+                    self.audio.announce_warning(
+                        f"Only {total_swallows} swallow detected. "
+                        f"Please take {remaining} more {pill_word}. "
+                        f"Your caregiver has been notified."
+                    )
+                self.telegram.send_incorrect_dosage_alert(
+                    medicine_name=medicine_name,
+                    expected=expected_dosage,
+                    actual=total_swallows
+                )
+                decision = self._build_incorrect_dosage_decision(
+                    medicine_name=medicine_name,
+                    expected_dosage=expected_dosage,
+                    actual_dosage=total_swallows,
+                    stage="incomplete_intake_phase"
+                )
+                self.database.log_medication_event(decision)
+                time.sleep(5)
+                self._end_verification_cycle(expected_station_id)
+                return
 
         # Propagate the final cumulative count so the decision engine and
         # the database record see the accurate total.
