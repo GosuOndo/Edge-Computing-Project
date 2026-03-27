@@ -1278,117 +1278,96 @@ class MedicationSystem:
         if not self.running:
             return
 
-        self.logger.info("Starting patient monitoring (30 seconds)...")
-        self.state_machine.transition_to(SystemState.MONITORING_PATIENT)
-        # Tuple: (elapsed, duration, message, live_swallow_count, expected_dosage)
-        self.pending_monitoring_ui = (0, 30, "Monitoring intake...", 0, expected_dosage)
-        monitoring_result = None
-
-        if self.display:
-            self.display.show_monitoring_screen(
-                0, 30, "Monitoring intake...", 0, expected_dosage
-            )
-
-        try:
-            def progress_callback(detections, elapsed, duration):
-                live_count = int(detections.get("swallow_count", 0))
-                self.pending_monitoring_ui = (
-                    elapsed, duration, "Monitoring intake...",
-                    live_count, expected_dosage
-                )
-
-            started = self.patient_monitor.start_monitoring(
-                duration=30, callback=progress_callback
-            )
-
-            if not started:
-                self.logger.warning("Patient monitoring could not start")
-                monitoring_result = {
-                    "compliance_status": "no_intake",
-                    "swallow_count":     0,
-                    "cough_count":       0,
-                    "hand_motion_count": 0
-                }
-            else:
-                while self.patient_monitor.is_monitoring_active():
-                    if not self.running:
-                        self.patient_monitor.cleanup()
-                        return
-                    if self.display:
-                        self._render_pending_monitoring_ui()
-                        self.display.update()
-                    time.sleep(0.1)
-
-                monitoring_result = self.patient_monitor.get_results()
-                self.logger.info(
-                    f"Monitoring complete: "
-                    f"status={monitoring_result['compliance_status']}  "
-                    f"swallows={monitoring_result.get('swallow_count', 0)}"
-                )
-
-        except Exception as e:
-            self.logger.error(f"Patient monitoring failed: {e}")
-            monitoring_result = {
-                "compliance_status": "unclear",
-                "swallow_count":     0,
-                "cough_count":       0,
-                "hand_motion_count": 0
-            }
-
         # ------------------------------------------------------------------
-        # Intake count vs expected dosage check
+        # Monitoring + intake retry loop
         # ------------------------------------------------------------------
-        final_swallow_count = int(monitoring_result.get("swallow_count", 0))
-        if final_swallow_count < expected_dosage:
-            remaining = expected_dosage - final_swallow_count
+        # Run the first monitoring session then keep looping until the
+        # cumulative swallow count matches the expected dosage, the patient
+        # times out, or an over-count is detected.
+        monitoring_result = self._run_monitoring_session(expected_dosage)
+        total_swallows    = int(monitoring_result.get("swallow_count", 0))
+
+        while total_swallows != expected_dosage:
+            if not self.running:
+                return
+
+            # ---- Over-count ----
+            if total_swallows > expected_dosage:
+                self.logger.warning(
+                    f"Intake excess: {total_swallows} swallow(s), "
+                    f"only ~{expected_dosage} expected for {medicine_name}"
+                )
+                if self.display:
+                    self.display.show_warning_screen(
+                        "Too Many Intakes Detected",
+                        f"Detected {total_swallows} swallow(s) but only "
+                        f"{expected_dosage} expected for {medicine_name}.\n"
+                        "Your caregiver has been notified."
+                    )
+                if self.audio:
+                    self.audio.announce_warning(
+                        f"Too many intakes detected. {total_swallows} swallows "
+                        f"but only {expected_dosage} expected for {medicine_name}. "
+                        "Your caregiver has been notified."
+                    )
+                self.telegram.send_incorrect_dosage_alert(
+                    medicine_name=medicine_name,
+                    expected=expected_dosage,
+                    actual=total_swallows
+                )
+                time.sleep(5)
+                break
+
+            # ---- Under-count: prompt patient and wait for more pills ----
+            remaining = expected_dosage - total_swallows
             pill_word = "pill" if remaining == 1 else "pills"
             self.logger.warning(
-                f"Intake mismatch: {final_swallow_count} swallow(s) detected, "
+                f"Intake mismatch: {total_swallows} swallow(s) detected, "
                 f"~{expected_dosage} expected for {medicine_name}"
             )
             if self.display:
                 self.display.show_intake_mismatch_screen(
                     medicine_name=medicine_name,
-                    swallow_count=final_swallow_count,
+                    swallow_count=total_swallows,
                     expected_dosage=expected_dosage,
                 )
             if self.audio:
                 self.audio.announce_warning(
-                    f"Only {final_swallow_count} swallow detected "
-                    f"out of approximately {expected_dosage} expected for {medicine_name}. "
+                    f"Only {total_swallows} swallow detected. "
                     f"Please take {remaining} more {pill_word}."
                 )
-            self.telegram.send_incorrect_dosage_alert(
-                medicine_name=medicine_name,
-                expected=expected_dosage,
-                actual=final_swallow_count
-            )
-            time.sleep(4)
 
-        elif final_swallow_count > expected_dosage:
-            self.logger.warning(
-                f"Intake excess: {final_swallow_count} swallow(s) detected, "
-                f"only ~{expected_dosage} expected for {medicine_name}"
+            # Return to REMINDER_ACTIVE so _on_pill_removal queues the
+            # next event.  The mismatch screen stays visible while we wait.
+            self.state_machine.transition_to(
+                SystemState.REMINDER_ACTIVE, self.current_medication
             )
-            if self.display:
-                self.display.show_warning_screen(
-                    "Too Many Intakes Detected",
-                    f"Detected {final_swallow_count} swallow(s) but only "
-                    f"{expected_dosage} expected for {medicine_name}.\n"
-                    "Your caregiver has been notified."
+
+            next_event = self._wait_for_pill_removal_event(timeout_seconds=120.0)
+
+            if next_event is None:
+                # Patient did not respond within the timeout window.
+                self.logger.warning("Intake retry timed out – patient did not respond")
+                self.telegram.send_incorrect_dosage_alert(
+                    medicine_name=medicine_name,
+                    expected=expected_dosage,
+                    actual=total_swallows
                 )
-            if self.audio:
-                self.audio.announce_warning(
-                    f"Too many intakes detected. {final_swallow_count} swallows detected "
-                    f"but only {expected_dosage} expected for {medicine_name}. "
-                    "Your caregiver has been notified."
-                )
-            self.telegram.send_incorrect_dosage_alert(
-                medicine_name=medicine_name,
-                expected=expected_dosage,
-                actual=final_swallow_count
+                break
+
+            # Patient removed more pills – monitor the additional intake.
+            retry_result    = self._run_monitoring_session(expected_dosage)
+            new_swallows    = int(retry_result.get("swallow_count", 0))
+            total_swallows += new_swallows
+            monitoring_result = retry_result
+            self.logger.info(
+                f"Retry monitoring: +{new_swallows} swallows "
+                f"(total {total_swallows}/{expected_dosage})"
             )
-            time.sleep(4)
+
+        # Propagate the final cumulative count so the decision engine and
+        # the database record see the accurate total.
+        monitoring_result["swallow_count"] = total_swallows
 
         if not self.running:
             return
@@ -1411,6 +1390,98 @@ class MedicationSystem:
 
         time.sleep(3)
         self._end_verification_cycle(expected_station_id)
+
+    def _run_monitoring_session(self, expected_dosage: int) -> dict:
+        """
+        Run a single 30-second patient monitoring session and return the
+        results dict.  Handles display updates, state transition, and all
+        error cases.  Safe to call multiple times within one intake cycle.
+        """
+        self.logger.info("Starting patient monitoring (30 seconds)...")
+        self.state_machine.transition_to(SystemState.MONITORING_PATIENT)
+        self.pending_monitoring_ui = (0, 30, "Monitoring intake...", 0, expected_dosage)
+
+        if self.display:
+            self.display.show_monitoring_screen(
+                0, 30, "Monitoring intake...", 0, expected_dosage
+            )
+
+        try:
+            def progress_callback(detections, elapsed, duration):
+                live_count = int(detections.get("swallow_count", 0))
+                self.pending_monitoring_ui = (
+                    elapsed, duration, "Monitoring intake...",
+                    live_count, expected_dosage
+                )
+
+            started = self.patient_monitor.start_monitoring(
+                duration=30, callback=progress_callback
+            )
+
+            if not started:
+                self.logger.warning("Patient monitoring could not start")
+                return {
+                    "compliance_status": "no_intake",
+                    "swallow_count":     0,
+                    "cough_count":       0,
+                    "hand_motion_count": 0,
+                }
+
+            while self.patient_monitor.is_monitoring_active():
+                if not self.running:
+                    self.patient_monitor.cleanup()
+                    return {
+                        "compliance_status": "unclear",
+                        "swallow_count":     0,
+                        "cough_count":       0,
+                        "hand_motion_count": 0,
+                    }
+                if self.display:
+                    self._render_pending_monitoring_ui()
+                    self.display.update()
+                time.sleep(0.1)
+
+            result = self.patient_monitor.get_results()
+            self.logger.info(
+                f"Monitoring complete: status={result['compliance_status']} "
+                f"swallows={result.get('swallow_count', 0)}"
+            )
+            return result
+
+        except Exception as e:
+            self.logger.error(f"Patient monitoring failed: {e}")
+            return {
+                "compliance_status": "unclear",
+                "swallow_count":     0,
+                "cough_count":       0,
+                "hand_motion_count": 0,
+            }
+
+    def _wait_for_pill_removal_event(self, timeout_seconds: float = 120.0):
+        """
+        Block until the weight sensor fires a pill-removal event or the
+        timeout expires.  The caller must have already transitioned to
+        REMINDER_ACTIVE so that _on_pill_removal() queues the event.
+
+        Returns the event dict on success, or None on timeout / shutdown.
+        The mismatch screen shown by the caller remains visible throughout
+        because no display call is made here.
+        """
+        self.pending_weight_event = None
+        deadline = time.time() + timeout_seconds
+
+        while time.time() < deadline:
+            if not self.running:
+                return None
+            if self.pending_weight_event:
+                event = self.pending_weight_event
+                self.pending_weight_event = None
+                return event
+            if self.display:
+                self.display.update()
+            time.sleep(0.05)
+
+        return None
 
     def _end_verification_cycle(self, station_id: str):
         """
