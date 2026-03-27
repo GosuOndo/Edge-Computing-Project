@@ -1142,7 +1142,10 @@ class MedicationSystem:
             f"Pill removal detected: {pills_this_event} pill(s) "
             f"from {event_data['station_id']}"
         )
-        if self.state_machine.get_state() != SystemState.REMINDER_ACTIVE:
+        if self.state_machine.get_state() not in {
+            SystemState.REMINDER_ACTIVE,
+            SystemState.MONITORING_PATIENT,
+        }:
             return
         station_id = event_data["station_id"]
         if (
@@ -1706,6 +1709,40 @@ class MedicationSystem:
             if not self.running:
                 return
 
+            cumulative_pills = self._dose_pills_removed.get(expected_station_id, 0)
+
+            # ---- Over-count by pill removal ----
+            if cumulative_pills > expected_dosage:
+                self.logger.warning(
+                    f"Intake excess: {cumulative_pills} pill(s) removed, "
+                    f"only {expected_dosage} expected for {medicine_name}"
+                )
+                if self.display:
+                    self.display.show_overdose_screen(
+                        medicine_name, cumulative_pills, expected_dosage
+                    )
+                if self.audio:
+                    self.audio.announce_warning(
+                        f"Too many pills detected. "
+                        f"You took {cumulative_pills} but only {expected_dosage} "
+                        f"are required. Please contact your caregiver."
+                    )
+                self.telegram.send_incorrect_dosage_alert(
+                    medicine_name=medicine_name,
+                    expected=expected_dosage,
+                    actual=cumulative_pills
+                )
+                decision = self._build_incorrect_dosage_decision(
+                    medicine_name=medicine_name,
+                    expected_dosage=expected_dosage,
+                    actual_dosage=cumulative_pills,
+                    stage="intake_monitoring"
+                )
+                self.database.log_medication_event(decision)
+                time.sleep(5)
+                self._end_verification_cycle(expected_station_id)
+                return
+
             # ---- Over-count ----
             if total_swallows > expected_dosage:
                 self.logger.warning(
@@ -1757,13 +1794,6 @@ class MedicationSystem:
                     f"Please take {remaining} more {pill_word}."
                 )
 
-            # Underdose retry begins only after the monitoring window ends.
-            # Wait for the patient to remove more pills before starting the
-            # next camera-based monitoring pass.
-            self.state_machine.transition_to(
-                SystemState.REMINDER_ACTIVE, self.current_medication
-            )
-
             if time.time() >= retry_deadline:
                 self.logger.warning("Intake retry timed out – patient did not respond")
                 self.telegram.send_incorrect_dosage_alert(
@@ -1773,53 +1803,10 @@ class MedicationSystem:
                 )
                 break
 
-            next_event = self._wait_for_pill_removal_event(
-                timeout_seconds=max(0.0, retry_deadline - time.time())
-            )
-
-            if next_event is None:
-                self.logger.warning("Intake retry timed out – patient did not respond")
-                self.telegram.send_incorrect_dosage_alert(
-                    medicine_name=medicine_name,
-                    expected=expected_dosage,
-                    actual=total_swallows
-                )
-                break
-
-            cumulative_pills = self._dose_pills_removed.get(expected_station_id, 0)
-            if cumulative_pills > expected_dosage:
-                self.logger.warning(
-                    f"Intake excess: {cumulative_pills} pill(s) removed, "
-                    f"only {expected_dosage} expected for {medicine_name}"
-                )
-                if self.display:
-                    self.display.show_overdose_screen(
-                        medicine_name, cumulative_pills, expected_dosage
-                    )
-                if self.audio:
-                    self.audio.announce_warning(
-                        f"Too many pills detected. "
-                        f"You took {cumulative_pills} but only {expected_dosage} "
-                        f"are required. Please contact your caregiver."
-                    )
-                self.telegram.send_incorrect_dosage_alert(
-                    medicine_name=medicine_name,
-                    expected=expected_dosage,
-                    actual=cumulative_pills
-                )
-                decision = self._build_incorrect_dosage_decision(
-                    medicine_name=medicine_name,
-                    expected_dosage=expected_dosage,
-                    actual_dosage=cumulative_pills,
-                    stage="intake_monitoring"
-                )
-                self.database.log_medication_event(decision)
-                time.sleep(5)
-                self._end_verification_cycle(expected_station_id)
-                return
-
-            # Patient removed more pills, so start another camera-based
-            # monitoring pass using the same intake logic as the initial phase.
+            # Keep the camera-based intake logic running during the retry
+            # window so delayed swallows are still counted, while pill-removal
+            # callbacks continue to update _dose_pills_removed in the
+            # background.
             retry_result    = self._run_monitoring_session(expected_dosage)
             new_swallows    = int(retry_result.get("swallow_count", 0))
             total_swallows += new_swallows
