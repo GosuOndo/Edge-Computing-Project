@@ -96,6 +96,10 @@ class MedicationSystem:
         self._MAX_DOSAGE_ATTEMPTS  = 3
         self._dose_pills_removed: dict = {}   # station_id -> int cumulative
         self._dose_attempt_count: dict = {}   # station_id -> int attempts used
+
+        # True while the station firmware is handling dosing (pill counting
+        # on-device).  Prevents the old lift/replace FSM from interfering.
+        self._firmware_dosing_active = False
         
         self._initialize_modules()
 
@@ -114,15 +118,20 @@ class MedicationSystem:
 
             self.mqtt = MQTTClient(self.config.get_mqtt_config(), self.logger)
             self.mqtt.set_weight_callback(self._on_weight_data)
+            self.mqtt.set_status_callback(self._on_status_data)
             self.mqtt.connect()
 
             self.weight_manager = WeightManager(
                 self.config["weight_sensors"], self.logger
             )
             self.weight_manager.set_pill_removal_callback(self._on_pill_removal)
-            # NEW: start scanning when the bottle is lifted so the reader
+            # Start scanning when the bottle is lifted so the reader
             # is ready to capture the tag when the bottle is placed back.
             self.weight_manager.set_bottle_lifted_callback(self._on_bottle_lifted)
+            # Fired when station firmware reports dosing_complete.
+            self.weight_manager.set_dosing_complete_callback(
+                self._on_dosing_complete
+            )
 
             scanner_config = dict(self.config["ocr"])
             scanner_config.update(self.config["hardware"].get("camera", {}))
@@ -847,6 +856,11 @@ class MedicationSystem:
         if not self.current_medication:
             return False
 
+        # Firmware-driven dosing: the M5StickC handles pill counting.
+        # The weight FSM does not need to be armed.
+        if self._firmware_dosing_active:
+            return True
+
         if self.state_machine.get_state() != SystemState.REMINDER_ACTIVE:
             return False
 
@@ -969,6 +983,69 @@ class MedicationSystem:
             f"Bottle lifted from {station_id} - starting tag scanning"
         )
         self.tag_runtime_service.start_scanning(station_id)
+
+    def _on_status_data(self, data: dict):
+        """
+        Callback for MQTT station status messages (arrives on MQTT thread).
+
+        Routes ``dosing_complete`` events from the station firmware into
+        the weight manager, which in turn fires ``_on_dosing_complete``.
+        """
+        status     = data.get("status", "")
+        station_id = data.get("station_id", "")
+
+        if status == "dosing_complete":
+            self.logger.info(
+                f"Firmware reports dosing_complete on {station_id}"
+            )
+            if hasattr(self, "weight_manager"):
+                self.weight_manager.process_dosing_complete(data)
+        elif status == "dosing_started":
+            self.logger.info(
+                f"Firmware confirmed dosing_started on {station_id}"
+            )
+        else:
+            self.logger.debug(f"Station status: {station_id} -> {status}")
+
+    def _on_dosing_complete(self, event_data: dict):
+        """
+        Fired by WeightManager.process_dosing_complete when the station
+        firmware confirms that the correct number of pills has been
+        removed from the bottle (while it remains on the scale).
+
+        Sets the cumulative pill count and queues the event for the
+        existing main-thread verification pipeline.
+        """
+        station_id    = event_data.get("station_id")
+        pills_removed = int(event_data.get("pills_removed", 0))
+
+        self.logger.info(
+            f"Dosing complete callback: {pills_removed} pill(s) from {station_id}"
+        )
+
+        if self.state_machine.get_state() != SystemState.REMINDER_ACTIVE:
+            self.logger.warning(
+                "Dosing complete received but system is not in REMINDER_ACTIVE"
+            )
+            return
+
+        if (
+            not self.current_medication
+            or self.current_medication.get("station_id") != station_id
+        ):
+            self.logger.warning(
+                f"Dosing complete from {station_id} does not match "
+                f"current medication station"
+            )
+            return
+
+        # Record the firmware-counted pills for the cumulative dosage check.
+        self._dose_pills_removed[station_id] = pills_removed
+        self._firmware_dosing_active = False
+
+        # Queue for the existing main-thread verification pipeline.
+        self.pending_weight_event = event_data
+        self.logger.info("Dosing complete event queued for verification")
 
     # ------------------------------------------------------------------
     # Main-thread event processing
@@ -1132,12 +1209,41 @@ class MedicationSystem:
                 medicine_name, new_baseline_g, dosage, time_str
             )
             time.sleep(2.5)
-            self.display.show_reminder_screen(medicine_name, dosage, time_str)
 
-        self._authorize_current_medication_if_ready()
+        # Send dosing command to the station firmware.  The M5StickC will
+        # guide the patient through pill removal (take more / put back)
+        # and report dosing_complete when the correct count is confirmed.
+        pill_weight_mg = self.weight_manager.get_pill_weight_mg(station_id)
+        self.mqtt.send_start_dosing(station_id, dosage, pill_weight_mg)
+        self._firmware_dosing_active = True
+        self.logger.info(
+            f"Sent start_dosing to {station_id}: "
+            f"{dosage} pills @ {pill_weight_mg:.0f} mg each"
+        )
+
+        # Mark bottle as authorized so security system doesn't interfere.
+        secure_state = self.secured_medications.get(station_id)
+        if secure_state:
+            secure_state["authorized"] = True
+
+        # Start tag scanning so identity data is captured while the bottle
+        # sits on the scale (tag faces the reader underneath).
+        self.tag_runtime_service.start_scanning(station_id)
+
+        if self.display:
+            self.display.show_dosing_in_progress_screen(
+                medicine_name, dosage, station_id
+            )
 
     def _on_missed_dose(self, missed_data: dict):
         self.logger.warning(f"Missed dose: {missed_data}")
+
+        # Cancel firmware dosing if still active.
+        if self._firmware_dosing_active and self.current_medication:
+            station_id = self.current_medication.get("station_id")
+            if station_id:
+                self.mqtt.send_stop_dosing(station_id)
+            self._firmware_dosing_active = False
 
         self.telegram.send_missed_dose_alert(
             missed_data["medicine_name"],
@@ -1608,6 +1714,11 @@ class MedicationSystem:
         and STOPS tag scanning so stale scans do not linger until the next
         dose window.
         """
+        # Cancel firmware dosing if still active.
+        if self._firmware_dosing_active:
+            self.mqtt.send_stop_dosing(station_id)
+            self._firmware_dosing_active = False
+
         self.state_machine.reset_to_idle()
         self.weight_manager.disable_event_detection(station_id)
         self.secured_medications.pop(station_id, None)

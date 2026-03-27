@@ -75,6 +75,10 @@ class WeightManager:
         # is ready to capture the tag when the bottle is placed back.
         self.bottle_lifted_callback: Optional[Callable] = None
 
+        # Fired when the station firmware reports dosing_complete.
+        # Signature: callback(event_data: dict)
+        self.dosing_complete_callback: Optional[Callable] = None
+
         # Per-station pill weight overrides read from NFC tags.
         # These take priority over the hard-coded config pill_weight_mg values.
         self._pill_weight_override_mg: Dict[str, Optional[int]] = {}
@@ -147,6 +151,17 @@ class WeightManager:
         self.bottle_lifted_callback = callback
         self.logger.info("Bottle lifted callback registered")
 
+    def set_dosing_complete_callback(self, callback: Callable):
+        """
+        Register a callback fired when the station firmware publishes
+        ``dosing_complete`` after the patient removes the correct number
+        of pills while the bottle remains on the scale.
+
+        Signature: callback(event_data: dict)
+        """
+        self.dosing_complete_callback = callback
+        self.logger.info("Dosing complete callback registered")
+
     # --------------------------------------------------------------------------
     # Baseline persistence
     # --------------------------------------------------------------------------
@@ -216,6 +231,74 @@ class WeightManager:
         self.logger.info(
             f"[{station_id}] Pill weight updated from tag: {pill_weight_mg} mg"
         )
+
+    def get_pill_weight_mg(self, station_id: str) -> float:
+        """Return the per-pill weight in milligrams (tag override or config)."""
+        return self._get_pill_weight_g(station_id) * 1000.0
+
+    # --------------------------------------------------------------------------
+    # Firmware-driven dosing complete
+    # --------------------------------------------------------------------------
+
+    def process_dosing_complete(self, data: dict):
+        """
+        Process a ``dosing_complete`` status message from station firmware.
+
+        The firmware handles real-time pill counting on the M5StickC.  When the
+        correct number of pills has been removed and the weight is stable, the
+        firmware publishes a status message with the pill count and weight delta.
+        This method records the event and fires the dosing_complete_callback so
+        main.py can proceed to identity verification and patient monitoring.
+        """
+        station_id = data.get("station_id")
+        if not station_id or station_id not in self.station_configs:
+            self.logger.warning(
+                f"dosing_complete from unknown station: {station_id}"
+            )
+            return
+
+        pills_removed  = int(data.get("pills_removed", 0))
+        weight_delta_g = float(data.get("weight_delta_g", 0.0))
+        baseline_g     = float(data.get("baseline_g", 0.0))
+        pill_weight_g  = self._get_pill_weight_g(station_id)
+
+        new_weight_g = baseline_g - weight_delta_g
+
+        event_data = {
+            "event_type":            "removal",
+            "station_id":            station_id,
+            "pills_removed":         pills_removed,
+            "estimated_pills_float": round(
+                weight_delta_g / pill_weight_g, 3
+            ) if pill_weight_g > 0 else 0.0,
+            "estimation_error_g":    0.0,
+            "weight_change_g":       round(weight_delta_g, 3),
+            "delta_g":               round(weight_delta_g, 3),
+            "previous_baseline_g":   round(baseline_g, 3),
+            "current_weight_g":      round(new_weight_g, 3),
+            "pill_weight_g":         round(pill_weight_g, 3),
+            "timestamp":             time.time(),
+            "source":                "firmware_dosing",
+        }
+
+        self.last_event_data[station_id] = event_data
+
+        # Update baseline to reflect the new bottle weight after pill removal.
+        if new_weight_g > 0:
+            self.baseline_weights[station_id]          = new_weight_g
+            self.baseline_capture_required[station_id] = False
+            self._save_persisted_baselines()
+
+        self.logger.info(
+            f"[{station_id}] Firmware dosing complete: {pills_removed} pill(s), "
+            f"delta={weight_delta_g:.2f}g, new_weight={new_weight_g:.2f}g"
+        )
+
+        if self.dosing_complete_callback:
+            try:
+                self.dosing_complete_callback(event_data)
+            except Exception as e:
+                self.logger.error(f"Error in dosing_complete_callback: {e}")
 
     # --------------------------------------------------------------------------
     # Arm / disarm event detection

@@ -354,12 +354,77 @@ class DisplayManager:
             )
 
             self._draw_text(
-                "Lift the bottle, remove your pills, then place the bottle back on the scale",
+                "Remove the correct number of pills from the bottle on the scale",
                 'small', 'text_light', self.width // 2, cy + 260, center=True
             )
 
             self._draw_footer(
-                "Remove pills from bottle  |  Place bottle back on scale",
+                "Follow the instructions on the station display",
+                'warning'
+            )
+            pygame.display.flip()
+
+    # ------------------------------------------------------------------
+    # Dosing in progress screen (firmware-driven pill counting)
+    # ------------------------------------------------------------------
+
+    def show_dosing_in_progress_screen(
+        self,
+        medicine_name: str,
+        dosage: int,
+        station_id: str,
+    ):
+        """
+        Shown while the station firmware is guiding the patient through pill
+        removal.  The bottle stays on the scale and the M5StickC display
+        provides real-time feedback.  This screen remains visible until the
+        firmware reports ``dosing_complete``.
+        """
+        if not self.initialized:
+            return
+        with self.screen_lock:
+            self._draw_frame("DOSING IN PROGRESS", 'warning')
+            self._draw_card('warning')
+
+            station_label = station_id.replace('_', ' ').title()
+            cy = self._card_text_y(10)
+
+            self._draw_text(medicine_name, 'huge', 'primary',
+                            self.width // 2, cy, center=True)
+
+            pill_word = "pill" if dosage == 1 else "pills"
+            self._draw_text(
+                f"Remove  {dosage}  {pill_word}  from the bottle",
+                'large', 'text_dark',
+                self.width // 2, cy + 110, center=True
+            )
+
+            self._draw_text(
+                f"Follow the instructions on the {station_label} display",
+                'medium', 'text_light',
+                self.width // 2, cy + 190, center=True
+            )
+
+            pygame.draw.line(
+                self.screen, self.colors['text_light'],
+                (self._PANEL_X + 40, cy + 240),
+                (self._PANEL_X + self._PANEL_W - 40, cy + 240), 1
+            )
+
+            self._draw_text(
+                "The scale is counting your pills automatically",
+                'normal', 'text_dark',
+                self.width // 2, cy + 270, center=True
+            )
+
+            self._draw_text(
+                "Do not remove the bottle from the scale",
+                'normal', 'text_light',
+                self.width // 2, cy + 310, center=True
+            )
+
+            self._draw_footer(
+                f"Waiting for correct dosage on {station_label}...",
                 'warning'
             )
             pygame.display.flip()
@@ -864,7 +929,7 @@ class DisplayManager:
             )
 
             self._draw_footer(
-                "Lift the bottle  |  Take the correct number  |  Replace the bottle",
+                "Remove the correct number of pills  |  Follow the station display",
                 'warning'
             )
             pygame.display.flip()

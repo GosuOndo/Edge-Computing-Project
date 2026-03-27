@@ -79,6 +79,7 @@ float pillWeightG = 0.0f;
 unsigned long dosingCorrectSince = 0;
 bool dosingCompletePublished = false;
 const unsigned long DOSING_CONFIRM_MS = 2000;
+const float BOTTLE_MIN_WEIGHT_G = 5.0f;
 
 // =====================================================
 // DISPLAY / HELPER FUNCTIONS
@@ -529,17 +530,28 @@ void updateLiveDisplay() {
 // DOSING DISPLAY
 // =====================================================
 void updateDosingDisplay() {
-  float weightDelta = bottleBaseline - currentWeight;
-  int pillsRemoved = (int)round(weightDelta / pillWeightG);
-  if (pillsRemoved < 0) pillsRemoved = 0;
-  int pillsDiff = pillsRemoved - requiredPills;
-
   M5.Lcd.fillScreen(BLACK);
 
   M5.Lcd.setTextSize(1);
   M5.Lcd.setTextColor(TFT_CYAN);
   M5.Lcd.setCursor(5, 5);
   M5.Lcd.println(STATION_ID);
+
+  // Bottle removed — weight dropped far below any reasonable pill-removal delta
+  if (currentWeight < BOTTLE_MIN_WEIGHT_G) {
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setTextColor(TFT_RED);
+    M5.Lcd.setCursor(5, 35);
+    M5.Lcd.println("Put bottle");
+    M5.Lcd.setCursor(5, 60);
+    M5.Lcd.println("back!");
+    return;
+  }
+
+  float weightDelta = bottleBaseline - currentWeight;
+  int pillsRemoved = (int)round(weightDelta / pillWeightG);
+  if (pillsRemoved < 0) pillsRemoved = 0;
+  int pillsDiff = pillsRemoved - requiredPills;
 
   char infoLine[32];
   snprintf(infoLine, sizeof(infoLine), "Removed:%d  Need:%d", pillsRemoved, requiredPills);
@@ -666,31 +678,36 @@ void loop() {
 
   // Dosing completion check
   if (dosingActive && isStable && !dosingCompletePublished && mqttClient.connected()) {
-    float weightDelta = bottleBaseline - currentWeight;
-    int pillsRemoved = (int)round(weightDelta / pillWeightG);
-    if (pillsRemoved < 0) pillsRemoved = 0;
-
-    if (pillsRemoved == requiredPills) {
-      if (dosingCorrectSince == 0) {
-        dosingCorrectSince = millis();
-      } else if (millis() - dosingCorrectSince >= DOSING_CONFIRM_MS) {
-        // Confirmed — publish detailed dosing_complete status
-        StaticJsonDocument<256> statusDoc;
-        statusDoc["station_id"] = STATION_ID;
-        statusDoc["status"] = "dosing_complete";
-        statusDoc["pills_removed"] = pillsRemoved;
-        statusDoc["weight_delta_g"] = round(weightDelta * 100.0f) / 100.0f;
-        statusDoc["baseline_g"] = round(bottleBaseline * 100.0f) / 100.0f;
-        statusDoc["timestamp"] = millis();
-        char statusBuf[256];
-        serializeJson(statusDoc, statusBuf);
-        mqttClient.publish(topic_status, statusBuf);
-        Serial.println("Dosing complete published");
-        dosingCompletePublished = true;
-        dosingActive = false;
-      }
-    } else {
+    // If bottle is off the scale, reset the confirmation timer and skip
+    if (currentWeight < BOTTLE_MIN_WEIGHT_G) {
       dosingCorrectSince = 0;
+    } else {
+      float weightDelta = bottleBaseline - currentWeight;
+      int pillsRemoved = (int)round(weightDelta / pillWeightG);
+      if (pillsRemoved < 0) pillsRemoved = 0;
+
+      if (pillsRemoved == requiredPills) {
+        if (dosingCorrectSince == 0) {
+          dosingCorrectSince = millis();
+        } else if (millis() - dosingCorrectSince >= DOSING_CONFIRM_MS) {
+          // Confirmed — publish detailed dosing_complete status
+          StaticJsonDocument<256> statusDoc;
+          statusDoc["station_id"] = STATION_ID;
+          statusDoc["status"] = "dosing_complete";
+          statusDoc["pills_removed"] = pillsRemoved;
+          statusDoc["weight_delta_g"] = round(weightDelta * 100.0f) / 100.0f;
+          statusDoc["baseline_g"] = round(bottleBaseline * 100.0f) / 100.0f;
+          statusDoc["timestamp"] = millis();
+          char statusBuf[256];
+          serializeJson(statusDoc, statusBuf);
+          mqttClient.publish(topic_status, statusBuf);
+          Serial.println("Dosing complete published");
+          dosingCompletePublished = true;
+          dosingActive = false;
+        }
+      } else {
+        dosingCorrectSince = 0;
+      }
     }
   }
 

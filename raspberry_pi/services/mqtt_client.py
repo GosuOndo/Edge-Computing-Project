@@ -192,6 +192,24 @@ class MQTTClient:
         """
         self.send_command(station_id, 'calibrate', {'known_weight_g': known_weight_g})
 
+    def send_start_dosing(self, station_id: str, dosage_pills: int, pill_weight_mg: float):
+        """
+        Send start_dosing command to station firmware.
+
+        The firmware captures the current weight as the bottle baseline and
+        enters dosing mode — guiding the patient via the M5StickC display
+        to remove the correct number of pills.  It publishes a
+        ``dosing_complete`` status when the correct count is confirmed.
+        """
+        self.send_command(station_id, 'start_dosing', {
+            'dosage_pills': int(dosage_pills),
+            'pill_weight_mg': float(pill_weight_mg),
+        })
+
+    def send_stop_dosing(self, station_id: str):
+        """Send stop_dosing command to cancel firmware dosing mode."""
+        self.send_command(station_id, 'stop_dosing')
+
     def set_weight_callback(self, callback: Callable[[Dict[str, Any]], None]):
         """Set callback for weight data"""
         self.weight_callback = callback
