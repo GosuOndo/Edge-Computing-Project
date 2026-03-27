@@ -224,8 +224,12 @@ class MedicationSystem:
                 logger=self.logger
             )
 
+            schedule_cfg = dict(self.config.get("schedule", {}) or {})
+            if "reminder" not in schedule_cfg:
+                schedule_cfg["reminder"] = dict(self.config.get("reminder", {}) or {})
+
             self.scheduler = MedicationScheduler(
-                self.config["schedule"], self.logger
+                schedule_cfg, self.logger
             )
             self.scheduler.set_reminder_callback(self.queue_manual_reminder)
             self.scheduler.set_missed_dose_callback(self._on_missed_dose)

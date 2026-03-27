@@ -72,3 +72,22 @@ def test_get_todays_schedule_returns_sorted_timetable():
     assert [item["time"] for item in timetable] == ["08:00", "09:30", "20:00", "21:00"]
     assert timetable[0]["medicine_name"] == "Aspirin 100mg"
     assert timetable[1]["medicine_name"] == "Metformin 500mg"
+
+
+def test_scheduler_defaults_when_reminder_block_is_missing():
+    config = {
+        "medications": [
+            {
+                "name": "Aspirin 100mg",
+                "station_id": "station_1",
+                "dosage_pills": 1,
+                "times": ["08:00"],
+            }
+        ]
+    }
+
+    scheduler = MedicationScheduler(config, DummyLogger())
+
+    assert scheduler.reminder_advance_minutes == 5
+    assert scheduler.timeout_minutes == 30
+    assert scheduler.get_scheduled_medicines() == ["Aspirin 100mg"]

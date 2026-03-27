@@ -24,10 +24,11 @@ class MedicationScheduler:
         """
         self.config = config
         self.logger = logger
-        
-        self.medications = config['medications']
-        self.reminder_advance_minutes = config['reminder'].get('advance_minutes', 5)
-        self.timeout_minutes = config['reminder'].get('timeout_minutes', 30)
+
+        self.medications = list(config.get('medications', []))
+        reminder_cfg = config.get('reminder', {})
+        self.reminder_advance_minutes = reminder_cfg.get('advance_minutes', 5)
+        self.timeout_minutes = reminder_cfg.get('timeout_minutes', 30)
         
         # Callbacks
         self.reminder_callback = None
