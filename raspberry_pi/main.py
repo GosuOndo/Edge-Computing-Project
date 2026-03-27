@@ -505,6 +505,93 @@ class MedicationSystem:
                     "awaiting NFC verification"
                 )
 
+    def _run_startup_station_security_sync(
+        self,
+        scan_timeout_seconds: float = 2.0,
+        poll_interval_seconds: float = 0.1,
+    ):
+        """
+        Immediately classify registered stations at startup.
+
+        Missing bottles are flagged right away from weight data. Occupied
+        stations are also given a short NFC verification window so incorrect
+        bottles can be surfaced on the initial security screen instead of
+        waiting for the normal periodic audit cycle.
+        """
+        self._process_secured_bottle_movements()
+        self._process_secured_bottle_placements()
+
+        stations_to_scan = []
+        now_ts = time.time()
+        for station_id, secure_state in self.secured_medications.items():
+            if now_ts >= secure_state.get("next_due_timestamp", 0):
+                continue
+            if secure_state.get("authorized", False):
+                continue
+            if self._station_has_active_medication_flow(station_id):
+                continue
+
+            status = self.weight_manager.get_station_status(station_id)
+            weight_g = float(status.get("weight_g") or 0.0)
+            bottle_present = (
+                bool(status.get("connected"))
+                and weight_g >= self.min_secured_bottle_weight_g
+            )
+            if not bottle_present:
+                continue
+            if secure_state.get("wrong_bottle_on_station", False):
+                continue
+
+            latest = self.tag_runtime_service.get_latest_scan(station_id)
+            latest_ts = float(latest.get("received_at", 0.0)) if latest else 0.0
+            processed_ts = self._processed_tag_scans.get(station_id, 0.0)
+            if latest_ts > processed_ts:
+                continue
+
+            stations_to_scan.append(station_id)
+
+        for station_id in stations_to_scan:
+            self.tag_runtime_service.clear_latest_scan(station_id)
+            self.tag_runtime_service.start_scanning(station_id)
+            self._last_station_scan_audit[station_id] = time.time()
+
+        deadline = time.time() + max(0.0, scan_timeout_seconds)
+        unresolved = list(stations_to_scan)
+        while unresolved and time.time() < deadline:
+            self._process_secured_bottle_placements()
+            self._process_secured_bottle_movements()
+
+            next_unresolved = []
+            for station_id in unresolved:
+                secure_state = self.secured_medications.get(station_id, {})
+                if secure_state.get("wrong_bottle_on_station", False):
+                    continue
+
+                status = self.weight_manager.get_station_status(station_id)
+                weight_g = float(status.get("weight_g") or 0.0)
+                bottle_present = (
+                    bool(status.get("connected"))
+                    and weight_g >= self.min_secured_bottle_weight_g
+                )
+                if not bottle_present:
+                    continue
+
+                latest = self.tag_runtime_service.get_latest_scan(station_id)
+                latest_ts = float(latest.get("received_at", 0.0)) if latest else 0.0
+                processed_ts = self._processed_tag_scans.get(station_id, 0.0)
+                if latest_ts <= processed_ts:
+                    next_unresolved.append(station_id)
+
+            if not next_unresolved:
+                break
+
+            unresolved = next_unresolved
+            time.sleep(poll_interval_seconds)
+
+        self._process_secured_bottle_placements()
+        self._process_secured_bottle_movements()
+        self._refresh_security_violation_screen()
+
     def _audit_occupied_stations_with_nfc(self, audit_interval_seconds: float = 5.0):
         """
         Periodically force a fresh NFC read for occupied stations so bottle
@@ -2143,6 +2230,7 @@ class MedicationSystem:
 
         self.scheduler.start()
         self._bootstrap_registered_station_security_state()
+        self._run_startup_station_security_sync()
 
         if self.display:
             self._show_idle_screen()
