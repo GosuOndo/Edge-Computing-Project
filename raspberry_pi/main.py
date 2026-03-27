@@ -857,29 +857,6 @@ class MedicationSystem:
         if not status.get("connected"):
             return False
 
-        # ---- Fast path -------------------------------------------------------
-        # _recapture_fresh_baseline() already captured a settle-verified
-        # baseline for this dose window.  Skip the single-sample capture and
-        # arm the sensor immediately.
-        if not self.weight_manager.baseline_capture_required.get(station_id, True):
-            self.weight_manager.enable_event_detection(station_id)
-            secure_state = self.secured_medications.get(station_id)
-            if secure_state:
-                secure_state["authorized"]            = True
-                secure_state["authorized_at"]         = time.time()
-                secure_state["authorized_baseline_g"] = (
-                    self.weight_manager.baseline_weights.get(station_id)
-                )
-            self.logger.info(
-                f"Authorized bottle removal for {station_id} (fresh baseline="
-                f"{self.weight_manager.baseline_weights.get(station_id):.2f}g)"
-            )
-            return True
-
-        # ---- Slow path -------------------------------------------------------
-        # Fresh recapture was not possible (bottle absent, sensor offline, or
-        # timeout).  Fall back to the single-sample stable check so the system
-        # is never stuck waiting for authorization.
         weight_g = float(status.get("weight_g") or 0.0)
         if weight_g < self.min_secured_bottle_weight_g:
             return False
@@ -900,8 +877,8 @@ class MedicationSystem:
             )
 
         self.logger.info(
-            f"Authorized bottle removal for {station_id} (fallback baseline="
-            f"{self.weight_manager.baseline_weights.get(station_id):.2f}g)"
+            f"Authorized bottle removal for {station_id} at scheduled time "
+            f"with baseline={self.weight_manager.baseline_weights.get(station_id):.2f}g"
         )
         return True
         
@@ -1005,98 +982,6 @@ class MedicationSystem:
     # Reminder / missed-dose callbacks
     # ------------------------------------------------------------------
 
-    def _recapture_fresh_baseline(self, station_id: str, timeout: float = 15.0) -> bool:
-        """
-        Wait for a genuinely stable weight reading and capture it as the fresh
-        baseline for station_id.  Uses the same settle-time logic as the
-        pill-removal FSM: the sensor must report stable continuously for
-        event_settle_seconds before the capture is accepted.  This rejects
-        transient 'stable' blips caused by load-cell thermal creep so the
-        dose-window delta is always computed against an accurate full-bottle
-        weight, not the (potentially drifted) registration-time value.
-
-        Blocks up to `timeout` seconds.  Returns True on success, False if
-        the bottle is absent, the sensor is offline, or the timeout expires.
-        """
-        cfg         = self.weight_manager.station_configs.get(station_id, {})
-        settle_time = float(cfg.get("event_settle_seconds", 1.5))
-        medicine    = (
-            self.current_medication.get("medicine_name", station_id)
-            if self.current_medication else station_id
-        )
-
-        self.logger.info(
-            f"[{station_id}] Recapturing fresh baseline "
-            f"(settle={settle_time}s, timeout={timeout}s)..."
-        )
-
-        if self.display:
-            self.display.show_pipeline_screen(
-                "Calibrating Sensor",
-                f"Re-calibrating weight sensor for {medicine}.\n"
-                "Please keep the bottle still..."
-            )
-
-        deadline     = time.time() + timeout
-        stable_since = None   # wall-clock time when current stable streak began
-
-        while time.time() < deadline:
-            if not self.running:
-                return False
-
-            if self.display:
-                self.display.update()
-
-            status    = self.weight_manager.get_station_status(station_id)
-            weight_g  = float(status.get("weight_g") or 0.0)
-            is_stable = bool(status.get("stable", False))
-
-            if not status.get("connected", False):
-                stable_since = None
-                time.sleep(0.2)
-                continue
-
-            if weight_g < self.min_secured_bottle_weight_g:
-                # Bottle not on scale.
-                stable_since = None
-                time.sleep(0.2)
-                continue
-
-            if not is_stable:
-                # Reading still fluctuating – reset the streak.
-                stable_since = None
-                time.sleep(0.1)
-                continue
-
-            # Bottle present and reading is stable.
-            if stable_since is None:
-                stable_since = time.time()
-
-            if time.time() - stable_since < settle_time:
-                # Not stable long enough yet.
-                time.sleep(0.1)
-                continue
-
-            # Stable for the full settle period – capture.
-            ok = self.weight_manager.capture_current_baseline(station_id)
-            if ok:
-                self.logger.info(
-                    f"[{station_id}] Fresh baseline captured: {weight_g:.2f}g "
-                    f"(stable for ≥{settle_time:.1f}s)"
-                )
-                return True
-
-            # capture_current_baseline can fail if weight_data changed between
-            # the status poll and the capture call (MQTT race).  Retry.
-            stable_since = None
-            time.sleep(0.1)
-
-        self.logger.warning(
-            f"[{station_id}] Baseline recapture timed out after {timeout:.0f}s – "
-            "proceeding with last known baseline"
-        )
-        return False
-
     def _on_medication_reminder(self, reminder_data: dict):
         self.logger.info(f"Medication reminder triggered: {reminder_data}")
         self.current_medication = reminder_data
@@ -1121,13 +1006,6 @@ class MedicationSystem:
             )
 
         self.state_machine.transition_to(SystemState.REMINDER_ACTIVE, reminder_data)
-
-        # Force a fresh baseline capture for this dose window so load-cell
-        # creep since the last capture does not skew pill-count accuracy.
-        # Mark as required first so _authorize_current_medication_if_ready
-        # uses the slow-path fallback if recapture fails.
-        self.weight_manager.baseline_capture_required[station_id] = True
-        self._recapture_fresh_baseline(station_id)
 
         medicine_name = reminder_data["medicine_name"]
         dosage        = reminder_data["dosage_pills"]
