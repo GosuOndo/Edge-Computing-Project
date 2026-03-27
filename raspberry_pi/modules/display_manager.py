@@ -784,7 +784,7 @@ class DisplayManager:
                     )
 
             self._draw_text(
-                f"Swallows detected:  {swallow_count}  /  ~{expected_dosage}  expected",
+                f"Swallows detected:  {swallow_count}  /  {expected_dosage}  expected",
                 'medium', 'warning',
                 self.width // 2, dot_y + dot_r + 30, center=True
             )
