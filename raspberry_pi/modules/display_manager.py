@@ -681,13 +681,22 @@ class DisplayManager:
                 self.width // 2, dot_y + dot_r + 30, center=True
             )
 
+            remaining = max(0, expected_dosage - swallow_count)
+            if remaining > 0:
+                pill_word = "pill" if remaining == 1 else "pills"
+                self._draw_text(
+                    f"Please take  {remaining}  more {pill_word}.",
+                    'medium', 'primary',
+                    self.width // 2, dot_y + dot_r + 82, center=True
+                )
+            else:
+                self._draw_text(
+                    "Medication intake may be incomplete.",
+                    'normal', 'text_dark',
+                    self.width // 2, dot_y + dot_r + 82, center=True
+                )
             self._draw_text(
-                "Medication intake may be incomplete.",
-                'normal', 'text_dark',
-                self.width // 2, dot_y + dot_r + 82, center=True
-            )
-            self._draw_text(
-                "Caregiver will review the monitoring record.",
+                "Your caregiver has been notified.",
                 'normal', 'text_light',
                 self.width // 2, dot_y + dot_r + 118, center=True
             )
