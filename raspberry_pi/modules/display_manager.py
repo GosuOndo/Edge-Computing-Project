@@ -748,7 +748,7 @@ class DisplayManager:
         swallow_count: int,
         expected_dosage: int,
         elapsed: float = 0,
-        duration: float = 120,
+        duration: float = 30,
     ):
         """
         Shown when the detected swallow count is less than the expected
@@ -788,7 +788,7 @@ class DisplayManager:
                     )
 
             self._draw_text(
-                f"Swallows detected:  {swallow_count}  /  ~{expected_dosage}  expected",
+                f"Swallows detected:  {swallow_count}  /  {expected_dosage}  expected",
                 'medium', 'warning',
                 self.width // 2, dot_y + dot_r + 28, center=True
             )
