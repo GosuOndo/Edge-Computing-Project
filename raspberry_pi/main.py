@@ -360,6 +360,20 @@ class MedicationSystem:
         if callable(clear_pending):
             clear_pending(("Wrong medicine detected", "Wrong bottle detected"))
 
+    def _station_has_active_medication_flow(self, station_id: str) -> bool:
+        current = getattr(self, "current_medication", None)
+        if not current or current.get("station_id") != station_id:
+            return False
+
+        state_machine = getattr(self, "state_machine", None)
+        if not state_machine:
+            return False
+
+        try:
+            return state_machine.get_state() != SystemState.IDLE
+        except Exception:
+            return False
+
     def _flag_wrong_station_bottle(
         self,
         station_id: str,
@@ -499,10 +513,7 @@ class MedicationSystem:
         now_ts = time.time()
 
         for station_id in self.weight_manager.station_configs:
-            if (
-                self.current_medication
-                and self.current_medication.get("station_id") == station_id
-            ):
+            if self._station_has_active_medication_flow(station_id):
                 continue
 
             status = self.weight_manager.get_station_status(station_id)
@@ -544,10 +555,7 @@ class MedicationSystem:
             if scan_received_at <= self._processed_tag_scans.get(station_id, 0.0):
                 continue
 
-            if (
-                self.current_medication
-                and self.current_medication.get("station_id") == station_id
-            ):
+            if self._station_has_active_medication_flow(station_id):
                 continue
 
             scan_msg = latest.get("scan_msg") or {}
@@ -632,10 +640,7 @@ class MedicationSystem:
                 continue
             if secure_state.get("authorized", False):
                 continue
-            if (
-                self.current_medication
-                and self.current_medication.get("station_id") == station_id
-            ):
+            if self._station_has_active_medication_flow(station_id):
                 continue
             if secure_state.get("early_alert_sent", False):
                 return True
@@ -710,10 +715,7 @@ class MedicationSystem:
                 continue
             if secure_state.get("authorized", False):
                 continue
-            if (
-                self.current_medication
-                and self.current_medication.get("station_id") == station_id
-            ):
+            if self._station_has_active_medication_flow(station_id):
                 continue
 
             issue = self._get_station_security_issue(secure_state)
@@ -926,10 +928,7 @@ class MedicationSystem:
             if secure_state.get("authorized", False):
                 continue
 
-            if (
-                self.current_medication
-                and self.current_medication.get("station_id") == station_id
-            ):
+            if self._station_has_active_medication_flow(station_id):
                 continue
 
             status   = self.weight_manager.get_station_status(station_id)
