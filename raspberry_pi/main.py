@@ -365,6 +365,8 @@ class MedicationSystem:
             scan_msg = latest.get("scan_msg") or {}
             record   = self._resolve_record_from_scan(scan_msg)
             if not record or record.get("station_id") != station_id:
+                self._processed_tag_scans[station_id] = scan_received_at
+                self.tag_runtime_service.clear_latest_scan(station_id)
                 continue
 
             # Only accept the medicine that is registered to this station.
@@ -399,6 +401,8 @@ class MedicationSystem:
                             f"{registered.get('medicine_name', 'the correct medicine')} "
                             f"on {station_id}"
                         )
+                    self._processed_tag_scans[station_id] = scan_received_at
+                    self.tag_runtime_service.clear_latest_scan(station_id)
                     continue
 
             status = self.weight_manager.get_station_status(station_id)
@@ -412,6 +416,65 @@ class MedicationSystem:
                 continue
 
             self._secure_bottle_until_due(record, scan_received_at, weight_g)
+            self.tag_runtime_service.stop_scanning(station_id)
+
+    def _revalidate_registered_bottles_on_startup(
+        self, wait_timeout_seconds: float = 4.0
+    ):
+        """
+        On app relaunch, force a fresh NFC read for any occupied registered
+        station so the bottle currently resting on the scale is re-verified.
+
+        Stations that do not produce a valid fresh scan within the short
+        startup window remain untrusted; scanning stays active so the main
+        loop can complete verification as soon as a new tag read arrives.
+        """
+        pending_station_ids = []
+
+        for station_id in self.weight_manager.station_configs:
+            registered = self.database.get_registered_medicine_by_station(station_id)
+            if not registered:
+                continue
+
+            status = self.weight_manager.get_station_status(station_id)
+            if not status.get("connected"):
+                continue
+
+            weight_g = float(status.get("weight_g") or 0.0)
+            if weight_g < self.min_secured_bottle_weight_g:
+                continue
+
+            self.logger.info(
+                f"Startup NFC revalidation requested for {station_id} "
+                f"({registered.get('medicine_name', 'registered medicine')})"
+            )
+            self.tag_runtime_service.clear_latest_scan(station_id)
+            self.tag_runtime_service.start_scanning(station_id)
+            pending_station_ids.append(station_id)
+
+        if not pending_station_ids:
+            return
+
+        deadline = time.time() + max(0.0, wait_timeout_seconds)
+        while pending_station_ids and time.time() < deadline and self.running:
+            self._process_secured_bottle_placements()
+            pending_station_ids = [
+                station_id
+                for station_id in pending_station_ids
+                if station_id not in self.secured_medications
+            ]
+            if not pending_station_ids:
+                break
+            if self.display:
+                self.display.update()
+            time.sleep(0.1)
+
+        for station_id in pending_station_ids:
+            registered = self.database.get_registered_medicine_by_station(station_id) or {}
+            self.logger.warning(
+                f"Startup NFC revalidation still pending on {station_id} for "
+                f"{registered.get('medicine_name', 'registered medicine')}"
+            )
 
     def _notify_unauthorized_bottle_movement(self, secure_state: dict):
         medicine_name = secure_state.get("medicine_name", "medication")
@@ -1964,6 +2027,8 @@ class MedicationSystem:
 
         if self.display:
             self._show_idle_screen()
+
+        self._revalidate_registered_bottles_on_startup()
 
         self.logger.info("System ready")
 

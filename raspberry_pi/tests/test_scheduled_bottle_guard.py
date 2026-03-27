@@ -308,6 +308,79 @@ def test_process_secured_bottle_placement_tracks_next_due():
     assert secure_state["secured_weight_g"] == 42.5
 
 
+def test_startup_revalidation_requests_fresh_scan_for_registered_occupied_station():
+    record = {
+        "medicine_id": "M001",
+        "medicine_name": "Aspirin 100mg",
+        "station_id": "station_1",
+        "tag_uid": "TAG123",
+        "time_slots": "08:00,20:00",
+    }
+
+    system = make_system()
+    system.running = True
+    system.database = FakeDatabase(records_by_station={"station_1": record})
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 42.5,
+            "event_detection_enabled": False,
+        }
+    })
+
+    system._revalidate_registered_bottles_on_startup(wait_timeout_seconds=0.0)
+
+    assert ("start", "station_1") in system.tag_runtime_service.scan_commands
+    assert "station_1" in system.tag_runtime_service.cleared_stations
+    assert system.secured_medications == {}
+
+
+def test_startup_revalidation_secures_matching_bottle_and_stops_scan(monkeypatch):
+    record = {
+        "medicine_id": "M001",
+        "medicine_name": "Aspirin 100mg",
+        "station_id": "station_1",
+        "tag_uid": "TAG123",
+        "time_slots": "08:00,20:00",
+    }
+
+    monkeypatch.setattr("raspberry_pi.main.time.sleep", lambda *_args, **_kwargs: None)
+
+    system = make_system()
+    system.running = True
+    system.database = FakeDatabase(
+        records_by_tag={"TAG123": record},
+        records_by_station={"station_1": record},
+    )
+    system.weight_manager = FakeWeightManager({
+        "station_1": {
+            "connected": True,
+            "stable": True,
+            "weight_g": 42.5,
+            "event_detection_enabled": False,
+        }
+    })
+    system._get_next_due_datetime = (
+        lambda raw_slots, now=None: (datetime(2026, 3, 25, 20, 0, 0), "20:00")
+    )
+
+    def start_scanning(station_id=None):
+        system.tag_runtime_service.scan_commands.append(("start", station_id))
+        system.tag_runtime_service.latest_by_station[station_id] = {
+            "received_at": 123.0,
+            "scan_msg": {"tag_uid": "TAG123"},
+        }
+
+    system.tag_runtime_service.start_scanning = start_scanning
+
+    system._revalidate_registered_bottles_on_startup(wait_timeout_seconds=0.2)
+
+    assert system.secured_medications["station_1"]["medicine_id"] == "M001"
+    assert system.secured_medications["station_1"]["present"] is True
+    assert ("stop", "station_1") in system.tag_runtime_service.scan_commands
+
+
 def test_monitoring_overdose_returns_to_idle_without_success(monkeypatch):
     monkeypatch.setattr("raspberry_pi.main.time.sleep", lambda *_args, **_kwargs: None)
 
