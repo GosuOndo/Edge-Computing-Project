@@ -1230,10 +1230,7 @@ class MedicationSystem:
         # DOSAGE CHECK with retry
         # ------------------------------------------------------------------
         if not cumulative_weight_result.get("verified", False):
-            attempt = self._dose_attempt_count.get(expected_station_id, 0) + 1
-            self._dose_attempt_count[expected_station_id] = attempt
-
-            # ---- Overdose: took more pills than required ----
+            # ---- Overdose: too many pills physically removed – stop immediately ----
             if cumulative_pills > expected_dosage:
                 self.logger.warning(
                     f"Overdose detected: {cumulative_pills} pills taken, "
@@ -1267,88 +1264,11 @@ class MedicationSystem:
                 self._end_verification_cycle(expected_station_id)
                 return
 
-            # ---- Under-dose: took fewer pills than required ----
-            remaining = expected_dosage - cumulative_pills
-            self.logger.warning(
-                f"Under-dose: {cumulative_pills}/{expected_dosage} pills detected "
-                f"(attempt {attempt}/{self._MAX_DOSAGE_ATTEMPTS})"
-            )
-
-            # Exhausted all retries – log and abort.
-            if attempt >= self._MAX_DOSAGE_ATTEMPTS:
-                self.logger.error(
-                    f"Dosage not corrected after {self._MAX_DOSAGE_ATTEMPTS} attempts"
-                )
-                if self.display:
-                    self.display.show_warning_screen(
-                        "Incorrect Dosage",
-                        f"You took {cumulative_pills} pill(s) but "
-                        f"{expected_dosage} are required.\n"
-                        "Maximum attempts reached. Your caregiver has been notified."
-                    )
-                if self.audio:
-                    self.audio.announce_warning(
-                        f"Incorrect dosage after {self._MAX_DOSAGE_ATTEMPTS} attempts. "
-                        "Your caregiver has been notified."
-                    )
-                self.telegram.send_incorrect_dosage_alert(
-                    medicine_name=medicine_name,
-                    expected=expected_dosage,
-                    actual=cumulative_pills
-                )
-                decision = self.decision_engine.verify_medication_intake(
-                    expected_medicine=medicine_name,
-                    expected_dosage=expected_dosage,
-                    identity_result=identity_result,
-                    ocr_result=ocr_result,
-                    weight_result=cumulative_weight_result,
-                    monitoring_result=None
-                )
-                self.database.log_medication_event(decision)
-                time.sleep(5)
-                self._end_verification_cycle(expected_station_id)
-                return
-
-            # Still have retries left – guide the patient to correct the dose.
-            if self.display:
-                self.display.show_dosage_retry_screen(
-                    medicine_name=medicine_name,
-                    taken=cumulative_pills,
-                    required=expected_dosage,
-                    attempt=attempt,
-                    max_attempts=self._MAX_DOSAGE_ATTEMPTS,
-                )
-            if self.audio:
-                pill_word = "pill" if remaining == 1 else "pills"
-                self.audio.announce_warning(
-                    f"Incorrect dosage. You have taken {cumulative_pills} "
-                    f"out of {expected_dosage} pills. "
-                    f"Please take {remaining} more {pill_word}."
-                )
-
+            # ---- Under-dose: defer to intake phase – fall through to monitoring ----
             self.logger.info(
-                f"Returning to REMINDER_ACTIVE for retry "
-                f"(attempt {attempt}/{self._MAX_DOSAGE_ATTEMPTS})"
+                f"Under-dose on weight ({cumulative_pills}/{expected_dosage}) "
+                "- deferring dosage check to intake phase"
             )
-
-            # Hold the retry screen briefly so the patient can read it,
-            # then return to the reminder screen and re-arm for the next event.
-            time.sleep(4)
-
-            # Reset state so the next pill-removal event is accepted.
-            self.state_machine.transition_to(
-                SystemState.REMINDER_ACTIVE,
-                self.current_medication
-            )
-            time_str = self.current_medication.get("scheduled_time", "")
-            if self.display:
-                self.display.show_reminder_screen(
-                    medicine_name, expected_dosage, time_str
-                )
-            # Weight detection stays armed (already enabled); tag scanning
-            # re-starts automatically via _on_bottle_lifted when the patient
-            # lifts the bottle for their next attempt.
-            return
 
         # Cumulative dosage is correct – proceed to patient monitoring.
         # Replace the per-event weight_result with the cumulative one so the
@@ -1420,6 +1340,8 @@ class MedicationSystem:
         # ------------------------------------------------------------------
         final_swallow_count = int(monitoring_result.get("swallow_count", 0))
         if final_swallow_count < expected_dosage:
+            remaining = expected_dosage - final_swallow_count
+            pill_word = "pill" if remaining == 1 else "pills"
             self.logger.warning(
                 f"Intake mismatch: {final_swallow_count} swallow(s) detected, "
                 f"~{expected_dosage} expected for {medicine_name}"
@@ -1431,14 +1353,42 @@ class MedicationSystem:
                     expected_dosage=expected_dosage,
                 )
             if self.audio:
-                pill_word = "pill" if expected_dosage == 1 else "pills"
                 self.audio.announce_warning(
                     f"Only {final_swallow_count} swallow detected "
-                    f"out of approximately {expected_dosage} expected for "
-                    f"{expected_dosage} {pill_word} of {medicine_name}. "
-                    "Medication intake may be incomplete."
+                    f"out of approximately {expected_dosage} expected for {medicine_name}. "
+                    f"Please take {remaining} more {pill_word}."
                 )
-            time.sleep(4)   # hold mismatch screen briefly before verdict
+            self.telegram.send_incorrect_dosage_alert(
+                medicine_name=medicine_name,
+                expected=expected_dosage,
+                actual=final_swallow_count
+            )
+            time.sleep(4)
+
+        elif final_swallow_count > expected_dosage:
+            self.logger.warning(
+                f"Intake excess: {final_swallow_count} swallow(s) detected, "
+                f"only ~{expected_dosage} expected for {medicine_name}"
+            )
+            if self.display:
+                self.display.show_warning_screen(
+                    "Too Many Intakes Detected",
+                    f"Detected {final_swallow_count} swallow(s) but only "
+                    f"{expected_dosage} expected for {medicine_name}.\n"
+                    "Your caregiver has been notified."
+                )
+            if self.audio:
+                self.audio.announce_warning(
+                    f"Too many intakes detected. {final_swallow_count} swallows detected "
+                    f"but only {expected_dosage} expected for {medicine_name}. "
+                    "Your caregiver has been notified."
+                )
+            self.telegram.send_incorrect_dosage_alert(
+                medicine_name=medicine_name,
+                expected=expected_dosage,
+                actual=final_swallow_count
+            )
+            time.sleep(4)
 
         if not self.running:
             return
