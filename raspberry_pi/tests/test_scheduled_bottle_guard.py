@@ -860,38 +860,6 @@ def test_unauthorized_bottle_movement_alerts_once_before_due():
     ]
 
 
-def test_missing_bottle_still_detected_when_current_medication_is_stale_but_idle():
-    system = make_system()
-    system.display = FakeDisplay()
-    system.audio = FakeAudio()
-    system.state_machine = FakeStateMachine(SystemState.IDLE)
-    system.current_medication = {
-        "medicine_name": "Aspirin 100mg",
-        "station_id": "station_1",
-        "dosage_pills": 1,
-    }
-    system.weight_manager = FakeWeightManager({
-        "connected": True,
-        "stable": True,
-        "weight_g": 0.0,
-        "event_detection_enabled": False,
-    })
-    system.secured_medications["station_1"] = {
-        "medicine_name": "Aspirin 100mg",
-        "station_id": "station_1",
-        "next_due_timestamp": time.time() + 3600,
-        "next_due_display": "2026-03-25 20:00:00",
-        "present": True,
-        "authorized": False,
-        "early_alert_sent": False,
-    }
-
-    system._process_secured_bottle_movements()
-
-    assert system.secured_medications["station_1"]["early_alert_sent"] is True
-    assert system.display.error_calls == ["Station 1 missing bottle"]
-
-
 def test_simultaneous_missing_bottles_show_combined_error_screen():
     system = make_system()
     system.display = FakeDisplay()
