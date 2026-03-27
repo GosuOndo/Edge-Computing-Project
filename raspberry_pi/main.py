@@ -554,14 +554,16 @@ class MedicationSystem:
             ):
                 continue
 
-            # Skip stations that are in the middle of verifying a returned bottle
-            # or waiting for a stable weight reading for a tamper check.
-            # _process_secured_bottle_movements owns this state transition; calling
-            # _secure_bottle_until_due here would wipe the pre-removal weight
-            # snapshot and early-alert flags before the tamper check can run.
+            # Skip stations that are in the middle of verifying a returned bottle,
+            # waiting for a stable weight reading for a tamper check, or already
+            # showing a tamper alert. _process_secured_bottle_movements owns these
+            # state transitions; calling _secure_bottle_until_due here would wipe
+            # the pre-removal snapshot / tamper flags and drop the alert screen.
             _existing = self.secured_medications.get(station_id, {})
-            if _existing.get("early_alert_sent", False) or _existing.get(
-                "tamper_check_pending", False
+            if (
+                _existing.get("early_alert_sent", False)
+                or _existing.get("tamper_check_pending", False)
+                or self._tamper_alert_active(_existing)
             ):
                 continue
 
