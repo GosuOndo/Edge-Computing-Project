@@ -136,6 +136,10 @@ telegram:
 reminder:
     advance_minutes: 5
     timeout_minutes: 30
+    # How many minutes after a reminder is paused by a security alert before
+    # the caregiver is notified that the dose has not been taken.
+    # The reminder itself is still resumed as soon as the alert clears.
+    post_security_alert_timeout_minutes: 15
 
 # Decision Engine Rules
 decision_engine:

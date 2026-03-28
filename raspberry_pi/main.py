@@ -102,7 +102,30 @@ class MedicationSystem:
         # True while the station firmware is handling dosing (pill counting
         # on-device).  Prevents the old lift/replace FSM from interfering.
         self._firmware_dosing_active = False
-        
+
+        # ------------------------------------------------------------------
+        # Security-aware reminder deferral state
+        #
+        # When a security alert (missing bottle, wrong bottle, weight
+        # tampering) is active on a station at the moment a scheduled
+        # reminder fires, the reminder is held here instead of being
+        # processed.  Each main-loop tick _process_deferred_reminders()
+        # checks whether the alert has cleared (resume reminder) or the
+        # caregiver timeout has been exceeded (alert caregiver).
+        #
+        # Structure:
+        #   { medicine_name: {
+        #       "reminder_data":  dict,   # original reminder payload
+        #       "deferred_at":    float,  # epoch when deferral started
+        #       "alert_notified": bool,   # True once caregiver was alerted
+        #   } }
+        # ------------------------------------------------------------------
+        self._deferred_reminders: dict = {}
+        reminder_cfg = self.config.get("reminder", {})
+        self._security_alert_caregiver_timeout_minutes = float(
+            reminder_cfg.get("post_security_alert_timeout_minutes", 15)
+        )
+
         self._initialize_modules()
 
         signal.signal(signal.SIGINT,  self._signal_handler)
@@ -652,6 +675,23 @@ class MedicationSystem:
     def _tamper_alert_active(self, secure_state: dict) -> bool:
         return bool(secure_state.get("tamper_alert_sent", False))
 
+    def _has_security_alert_for_station(self, station_id: str) -> bool:
+        """Return True if *station_id* has any active security alert.
+
+        Covers all three alert types that should pause a medication reminder:
+        - Bottle missing (early_alert_sent)
+        - Wrong medicine bottle detected (wrong_bottle_on_station)
+        - Weight tampering detected after bottle return (tamper_alert_sent)
+        """
+        secure_state = self.secured_medications.get(station_id)
+        if not secure_state:
+            return False
+        return (
+            secure_state.get("early_alert_sent", False)
+            or secure_state.get("wrong_bottle_on_station", False)
+            or self._tamper_alert_active(secure_state)
+        )
+
     def _clear_tamper_alert_state(self, secure_state: dict):
         secure_state.pop("tamper_alert_sent", None)
         secure_state.pop("tamper_alert_until", None)
@@ -661,6 +701,24 @@ class MedicationSystem:
     def _station_has_normal_security_window(
         self, station_id: str, secure_state: dict, now_ts: float
     ) -> bool:
+        # Keep the security monitoring loop running for this station even
+        # when the scheduled dose time has passed, provided a non-tamper
+        # alert (missing or wrong bottle) is still active.  This allows
+        # _process_secured_bottle_movements to continue tracking the bottle
+        # and clear the alert when the correct bottle is returned, which in
+        # turn lets _process_deferred_reminders resume the held reminder.
+        # Skip this override when an active dosing session is already
+        # running for this station (handled by the verification pipeline).
+        if (
+            secure_state.get("early_alert_sent", False)
+            or secure_state.get("wrong_bottle_on_station", False)
+        ):
+            if not (
+                self.current_medication
+                and self.current_medication.get("station_id") == station_id
+            ):
+                return True
+
         if now_ts >= secure_state.get("next_due_timestamp", 0):
             return False
         if secure_state.get("authorized", False):
@@ -1222,13 +1280,153 @@ class MedicationSystem:
     def _process_pending_manual_reminder(self):
         if self.pending_manual_reminder_lock or not self.pending_manual_reminder:
             return
-        reminder_data                = self.pending_manual_reminder
+        reminder_data = self.pending_manual_reminder
+        station_id    = reminder_data.get("station_id")
+        medicine_name = reminder_data.get("medicine_name", "")
+
+        # ----------------------------------------------------------------
+        # Security takes precedence over scheduled medication reminders.
+        #
+        # If the station has an active security alert (missing bottle, wrong
+        # bottle, or weight tampering), hold the reminder in
+        # _deferred_reminders so the security alert screen remains visible
+        # and the patient is not confused by two competing events.
+        # _process_deferred_reminders() will resume it when the alert
+        # clears, or escalate to the caregiver after a timeout.
+        # ----------------------------------------------------------------
+        if station_id and self._has_security_alert_for_station(station_id):
+            if medicine_name not in self._deferred_reminders:
+                self._deferred_reminders[medicine_name] = {
+                    "reminder_data":  reminder_data,
+                    "deferred_at":    time.time(),
+                    "alert_notified": False,
+                }
+                self.logger.warning(
+                    f"[SECURITY PRIORITY] Reminder for {medicine_name} on "
+                    f"{station_id} paused — security alert is active. "
+                    "Dose schedule held until the security issue is resolved."
+                )
+            # Clear the pending slot (the scheduler only queues once per
+            # scheduled time slot, so this won't discard a future reminder).
+            self.pending_manual_reminder = None
+            return
+
+        # If this reminder was previously deferred, log that it is resuming.
+        if medicine_name in self._deferred_reminders:
+            self.logger.info(
+                f"[SECURITY RESOLVED] Security alert cleared — "
+                f"resuming deferred reminder for {medicine_name}."
+            )
+            del self._deferred_reminders[medicine_name]
+
         self.pending_manual_reminder = None
         self.pending_manual_reminder_lock = True
         try:
             self._on_medication_reminder(reminder_data)
         finally:
             self.pending_manual_reminder_lock = False
+
+    # ------------------------------------------------------------------
+    # Security-aware reminder deferral
+    # ------------------------------------------------------------------
+
+    def _process_deferred_reminders(self):
+        """Resume or escalate reminders that were paused by a security alert.
+
+        Called every main-loop tick.  For each deferred reminder:
+
+        1. If the security alert on the station has **cleared**, re-queue
+           the reminder for immediate processing so the patient can still
+           take their medication (possibly a little late).
+
+        2. If the security alert is **still active** and the caregiver
+           timeout has been exceeded, send a missed-dose alert to the
+           caregiver (once only) and log the event to the database.
+        """
+        if not self._deferred_reminders:
+            return
+
+        now       = time.time()
+        timeout_s = self._security_alert_caregiver_timeout_minutes * 60
+
+        for medicine_name, deferred in list(self._deferred_reminders.items()):
+            reminder_data = deferred["reminder_data"]
+            station_id    = reminder_data.get("station_id")
+
+            if not self._has_security_alert_for_station(station_id):
+                # Alert resolved — let the patient take their medication.
+                self.logger.info(
+                    f"[SECURITY RESOLVED] Alert cleared on {station_id}. "
+                    f"Resuming deferred reminder for {medicine_name}."
+                )
+                del self._deferred_reminders[medicine_name]
+                if not self.pending_manual_reminder:
+                    self.pending_manual_reminder = reminder_data
+                return  # Process one at a time; next tick handles the rest.
+
+            # Alert still active — escalate to caregiver after timeout.
+            elapsed = now - deferred["deferred_at"]
+            if elapsed >= timeout_s and not deferred.get("alert_notified", False):
+                self.logger.warning(
+                    f"[SECURITY PRIORITY] {medicine_name} not taken for "
+                    f"{self._security_alert_caregiver_timeout_minutes} min "
+                    f"while security alert is active on {station_id} — "
+                    "notifying caregiver."
+                )
+                self._notify_missed_dose_during_security_alert(
+                    medicine_name, reminder_data
+                )
+                deferred["alert_notified"] = True
+
+    def _notify_missed_dose_during_security_alert(
+        self, medicine_name: str, reminder_data: dict
+    ):
+        """Alert the caregiver that a scheduled dose was not taken because
+        an active security alert prevented the reminder from being processed.
+
+        This is separate from the normal missed-dose path so the reason
+        ("security alert in progress") is clearly recorded.
+        """
+        station_id     = reminder_data.get("station_id", "unknown")
+        scheduled_time = reminder_data.get("scheduled_time", "unknown")
+        dosage_pills   = reminder_data.get("dosage_pills", 0)
+        station_label  = station_id.replace("_", " ").title()
+
+        if self.audio:
+            self.audio.speak_async(
+                f"Warning. {medicine_name} scheduled at {scheduled_time} "
+                f"has not been taken. A security alert is still active on "
+                f"{station_label}. Your caregiver has been notified."
+            )
+
+        self.telegram.send_missed_dose_alert(
+            medicine_name,
+            scheduled_time,
+            self._security_alert_caregiver_timeout_minutes,
+        )
+
+        missed_event = {
+            "timestamp":         time.time(),
+            "expected_medicine": medicine_name,
+            "expected_dosage":   dosage_pills,
+            "result":            DecisionResult.NO_INTAKE,
+            "verified":          False,
+            "alerts": [
+                {
+                    "type":     "missed_dose_during_security_alert",
+                    "severity": "critical",
+                    "message":  (
+                        f"Dose not taken — security alert active on {station_id}"
+                    ),
+                }
+            ],
+            "details": {
+                "reason":     "security_alert_active",
+                "station_id": station_id,
+            },
+            "scores": {},
+        }
+        self.database.log_medication_event(missed_event)
 
     # ------------------------------------------------------------------
     # MQTT / weight callbacks (arrive on MQTT thread)
@@ -1767,6 +1965,18 @@ class MedicationSystem:
             )
 
     def _on_missed_dose(self, missed_data: dict):
+        # If this medicine's reminder was deferred because of a security alert,
+        # _process_deferred_reminders() owns caregiver notification — suppress
+        # this callback to avoid double-alerting the caregiver.
+        medicine_name = missed_data.get("medicine_name", "")
+        if medicine_name in self._deferred_reminders:
+            self.logger.info(
+                f"Missed-dose callback for {medicine_name} suppressed — "
+                "security alert is active; deferred-reminder system handles "
+                "caregiver escalation."
+            )
+            return
+
         self.logger.warning(f"Missed dose: {missed_data}")
 
         # Cancel firmware dosing if still active.
@@ -2735,6 +2945,7 @@ class MedicationSystem:
                 self._process_secured_bottle_placements()
                 self._audit_occupied_stations_with_nfc()
                 self._process_secured_bottle_movements()
+                self._process_deferred_reminders()
                 self._process_pending_manual_reminder()
                 self._authorize_current_medication_if_ready()
                 self._process_pending_weight_event()
