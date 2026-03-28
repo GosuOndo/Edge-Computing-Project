@@ -1502,12 +1502,6 @@ class MedicationSystem:
     def _apply_runtime_profiler_context(self, paso_context: dict):
         if not paso_context:
             return
-        self.scanner.set_profiler_context(
-            self.profiler,
-            paso_context["run_id"],
-            paso_context["scenario"],
-            paso_context["station_id"],
-        )
         self.patient_monitor.set_profiler_context(
             self.profiler,
             paso_context["run_id"],
@@ -1516,7 +1510,6 @@ class MedicationSystem:
         )
 
     def _clear_runtime_profiler_context(self):
-        self.scanner.clear_profiler_context()
         self.patient_monitor.clear_profiler_context()
 
     def _decision_result_value(self, decision: dict):
@@ -1719,7 +1712,7 @@ class MedicationSystem:
         else:
             self.logger.warning(
                 f"No registered medicine for {station_id}. "
-                "Identity will fall back to QR/OCR."
+                "Tag identity check will fail - bottle may need re-registration."
             )
 
         self.state_machine.transition_to(SystemState.REMINDER_ACTIVE, reminder_data)
@@ -1875,8 +1868,6 @@ class MedicationSystem:
             },
         ):
             try:
-                self.scanner.initialize_camera()
-
                 with self._profile_paso_stage(
                     paso_context,
                     "tag_or_identity_check",
@@ -1915,16 +1906,6 @@ class MedicationSystem:
                             expected_station_id, pill_weight_mg
                         )
 
-                    ocr_result = {
-                        "success":       True,
-                        "medicine_name": identity_result.get("medicine_name", medicine_name),
-                        "confidence":    identity_result.get("confidence", 1.0),
-                        "verified":      True,
-                        "method":        identity_result.get("method")
-                    }
-                else:
-                    ocr_result = None
-
             except Exception as e:
                 self.logger.warning(f"Identity verification error: {e}")
                 identity_result = {
@@ -1933,9 +1914,6 @@ class MedicationSystem:
                     "verified": False,
                     "reason":   str(e)
                 }
-                ocr_result = None
-            finally:
-                self.scanner.release_camera()
 
         if not self.running:
             return

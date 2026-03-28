@@ -76,11 +76,11 @@ ocr:
     threshold: true
 
 # Identity Verification Configuration
-# Primary: integrated RFID tag (bottle bottom tag, reader under scale)
-# Fallback: QR code scan, then OCR label scan
+# Primary (and only) method: integrated RFID tag (bottle bottom tag, reader under scale)
+# No QR or OCR fallback - tag only.
+# On failure, up to max_attempts retries are made before reporting tag not found.
 identity:
   primary_method: "tag"
-  fallback_methods: ["qr", "ocr"]
 
   tag:
     enabled: true
@@ -90,16 +90,8 @@ identity:
     command_topics:
       station_1: "medication/tag/command/tag_reader_1"
       station_2: "medication/tag/command/tag_reader_2"
-    max_attempts: 1
-    attempt_timeout_seconds: 3
-
-  qr:
-    enabled: true
-    max_attempts: 1
-
-  ocr:
-    enabled: true
-    max_attempts: 1
+    max_attempts: 3
+    attempt_timeout_seconds: 6
 
 # Registration Configuration
 registration:
