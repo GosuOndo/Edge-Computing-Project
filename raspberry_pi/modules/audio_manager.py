@@ -253,9 +253,6 @@ class AudioManager:
             self.logger.info(f"Cleared {removed} pending audio message(s)")
         return removed
 
-    def set_volume(self, volume):
-        pass
-
     def stop(self):
         """Signal the worker thread to exit after finishing the current item."""
         self._speech_queue.put(None)   # sentinel

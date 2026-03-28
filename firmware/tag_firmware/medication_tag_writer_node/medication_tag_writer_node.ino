@@ -10,15 +10,25 @@
 
 MFRC522 rfid(SS_PIN, RST_PIN);
 
-// ID=medicine_id, P=patient_id, N=medicine_name, D=dosage_amount, T=time_slots, M=meal_rule, S=station_id
-// Compact payload including W=<pill_weight_mg> so the Pi can use per-medicine
-// weights without relying on hard-coded config values.
-// W field: per-pill weight in milligrams (e.g. W=290 for a 290 mg tablet).
-// Total must be <= MAX_PAYLOAD_BYTES (56 bytes).
+// Compact payload format: ID=<medicine_id>;N=<medicine_name>;D=<dosage>;T=<time_slots>;M=<meal_rule>;W=<pill_weight_mg>
+//
+// Fields:
+//   ID  - medicine identifier (required)
+//   N   - medicine name
+//   D   - dosage amount (number of pills)
+//   T   - time slots, e.g. "08,20" (Pi normalises to "08:00,20:00")
+//   M   - meal rule: AF=AFTER_MEAL, BF=BEFORE_MEAL, NM=NO_MEAL_RULE
+//   W   - per-pill weight in milligrams (e.g. W=290 for a 290 mg tablet)
+//
+// P (patient_id) and S (station_id) are intentionally excluded:
+//   - patient_id  is derived from medicine_id via the Pi database.
+//   - station_id  is always assigned from the physical station during onboarding.
+//
+// Total payload must be <= MAX_PAYLOAD_BYTES (56 bytes).
 
-// const char* TEST_PAYLOAD = "ID=M001;P=P001;N=ASPIRIN;D=2;T=08,20;M=AF;S=1;W=290";
-// const char* TEST_PAYLOAD = "ID=M002;P=P001;N=AMLODIPINE;D=1;T=11;M=BF;S=2;W=290";
-const char* TEST_PAYLOAD = "ID=M003;P=P001;N=PARACETAMOL;D=2;T=18;M=AF;S=3;W=290";
+const char* TEST_PAYLOAD = "ID=M001;N=ASPIRIN;D=2;T=08,20;M=AF;W=290";
+// const char* TEST_PAYLOAD = "ID=M002;N=AMLODIPINE;D=1;T=11;M=BF;W=290";
+// const char* TEST_PAYLOAD = "ID=M003;N=PARACETAMOL;D=2;T=18;M=AF;W=290";
 
 // Pages 4-17 = 14 pages = 56 bytes (safe for NTAG213 and larger variants).
 // Standard MIFARE Ultralight only has pages 4-15; use NTAG213 or larger tags.

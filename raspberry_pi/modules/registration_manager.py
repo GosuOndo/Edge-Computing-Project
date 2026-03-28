@@ -15,12 +15,16 @@ Scan control during onboarding
 * run_onboarding_if_needed() calls stop_scanning() once after the final
   slot is confirmed, as the belt-and-suspenders final stop.
 
-Tag payload format (written via medication_tag_write_read_test.ino):
-    ID=M001;P=P001;N=ASPIRIN100;D=2;T=08,20;M=AF;S=1;W=290
+Tag payload format (written via medication_tag_writer_node.ino):
+    ID=M001;N=ASPIRIN;D=2;T=08,20;M=AF;W=290
 
 W field (optional): per-pill weight in milligrams.  When present it overrides
 the hard-coded pill_weight_mg config value for this station, allowing the
 system to use the correct weight for each specific medicine.
+
+Note: P (patient_id) and S (station_id) are not written to the tag.
+The station_id is always determined from the physical station (line 474),
+never from the tag payload.
 """
 
 import time
