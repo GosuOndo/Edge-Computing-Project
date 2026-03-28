@@ -233,92 +233,62 @@ class RegistrationManager:
             self.tag_runtime_service.stop_scanning(station_id)   # stop on timeout
             return False
 
-        # ---- Phase B: find tag scan (3 attempts) ----
+        # ---- Phase B: find tag scan ----
         # The tag is read the moment the bottle touches the reader coil,
         # which typically happens before or during weight stabilisation.
         # We accept any scan received since bottle_detected_at - 2 s.
         lookback_from = bottle_detected_at - 2.0
-        MAX_TAG_SCAN_ATTEMPTS = 3
-        per_attempt_seconds = self.tag_wait_seconds / MAX_TAG_SCAN_ATTEMPTS
+        self._update_screen(station_id, "Reading tag...",
+                            weight_g=stable_weight, stable=True)
+        if self.audio:
+            self.audio.speak("Reading tag.")
 
-        scan_msg = None
-        for tag_attempt in range(1, MAX_TAG_SCAN_ATTEMPTS + 1):
-            self._update_screen(
-                station_id,
-                f"Reading tag... (attempt {tag_attempt}/{MAX_TAG_SCAN_ATTEMPTS})",
-                weight_g=stable_weight, stable=True
-            )
-            if tag_attempt == 1:
-                if self.audio:
-                    self.audio.speak("Reading tag.")
-            else:
+        scan_msg    = None
+        tag_deadline = time.time() + self.tag_wait_seconds
+
+        while time.time() < tag_deadline and time.time() < deadline:
+            if self.display:
+                self.display.update()
+
+            latest = self.tag_runtime_service.get_latest_scan(station_id)
+
+            if not latest or latest.get("received_at", 0) < lookback_from:
+                time.sleep(0.3)
+                continue
+
+            candidate_scan = latest["scan_msg"]
+
+            # Validate the payload before accepting - an empty payload_raw
+            # means the firmware read failed.  Discard it and keep waiting
+            # for the firmware's retry scan.
+            from raspberry_pi.modules.tag_manager import TagManager as _TM
+            probe = _TM(self.logger).build_record_from_scan(candidate_scan)
+            if probe is None:
                 self.logger.warning(
-                    f"Tag not found on attempt {tag_attempt - 1}/{MAX_TAG_SCAN_ATTEMPTS}, retrying"
+                    "Tag scan received but payload could not be parsed "
+                    f"(payload_raw={candidate_scan.get('payload_raw', '')!r}). "
+                    "Waiting for valid retry scan..."
                 )
-                if self.audio:
-                    self.audio.speak(
-                        f"Tag not found. Attempt {tag_attempt} of {MAX_TAG_SCAN_ATTEMPTS}."
-                    )
+                self._update_screen(
+                    station_id,
+                    "Tag detected but unreadable - keep bottle still...",
+                    weight_g=stable_weight, stable=True,
+                )
+                self.tag_runtime_service.clear_latest_scan(station_id)
+                time.sleep(0.5)
+                continue
 
-            attempt_deadline = time.time() + per_attempt_seconds
-            found_in_attempt = False
-
-            while time.time() < attempt_deadline and time.time() < deadline:
-                if self.display:
-                    self.display.update()
-
-                latest = self.tag_runtime_service.get_latest_scan(station_id)
-
-                if not latest or latest.get("received_at", 0) < lookback_from:
-                    time.sleep(0.3)
-                    continue
-
-                candidate_scan = latest["scan_msg"]
-
-                # Validate the payload before accepting - an empty payload_raw
-                # means the firmware read failed.  Discard it and keep waiting
-                # for the firmware's retry scan.
-                from raspberry_pi.modules.tag_manager import TagManager as _TM
-                probe = _TM(self.logger).build_record_from_scan(candidate_scan)
-                if probe is None:
-                    self.logger.warning(
-                        "Tag scan received but payload could not be parsed "
-                        f"(payload_raw={candidate_scan.get('payload_raw', '')!r}). "
-                        "Waiting for valid retry scan..."
-                    )
-                    self._update_screen(
-                        station_id,
-                        "Tag detected but unreadable - keep bottle still...",
-                        weight_g=stable_weight, stable=True,
-                    )
-                    self.tag_runtime_service.clear_latest_scan(station_id)
-                    time.sleep(0.5)
-                    continue
-
-                # Good scan with parseable payload
-                scan_msg = candidate_scan
-                found_in_attempt = True
-                break
-
-            if found_in_attempt:
-                break
-
-            # Clear stale buffer before the next attempt
-            self.tag_runtime_service.clear_latest_scan(station_id)
-
-        if scan_msg is None:
-            self.logger.warning(
-                f"No tag scan received after {MAX_TAG_SCAN_ATTEMPTS} attempts"
-            )
-            self._update_screen(
-                station_id,
-                f"Tag not found after {MAX_TAG_SCAN_ATTEMPTS} attempts - check sticker"
-            )
+            # Good scan with parseable payload
+            scan_msg = candidate_scan
+            break
+        else:
+            self.logger.warning("No tag scan received during onboarding window")
+            self._update_screen(station_id, "No tag - check sticker, re-seat bottle")
             if self.audio:
                 self.audio.speak(
-                    "Tag not found. Please check the sticker and try again."
+                    "No tag detected. Please check the sticker and try again."
                 )
-            self.tag_runtime_service.stop_scanning(station_id)
+            self.tag_runtime_service.stop_scanning(station_id)   # stop on no-tag failure
             time.sleep(2.0)
             return False
 
