@@ -176,13 +176,12 @@ class RegistrationManager:
         self.logger.info(f"Tag scanning STARTED for onboarding slot {slot_number}")
 
         # ---- Guide the user ----
-        msg = f"Medicine {slot_number} of {total} - Place bottle on station"
+        msg = f"Medicine {slot_number} - Place bottle on station"
         if self.display:
             self.display.show_registration_screen(station_id, msg)
         if self.audio:
             self.audio.speak(
-                f"Please place medicine {slot_number} of {total} "
-                f"onto the station now."
+                f"Please place medicine {slot_number} onto the station now."
             )
 
         deadline = time.time() + self.timeout_seconds
