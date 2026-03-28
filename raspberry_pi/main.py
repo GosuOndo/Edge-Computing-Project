@@ -586,19 +586,34 @@ class MedicationSystem:
                 continue
 
             # Skip stations that are in the middle of verifying a returned bottle,
-            # waiting for a stable weight reading for a tamper check, or already
-            # showing a tamper alert. _process_secured_bottle_movements owns these
-            # state transitions; calling _secure_bottle_until_due here would wipe
-            # the pre-removal snapshot / tamper flags and drop the alert screen.
+            # waiting for a stable weight reading for a tamper check, already
+            # showing a tamper alert, or have a wrong bottle on station.
+            # _process_secured_bottle_movements owns these state transitions;
+            # calling _secure_bottle_until_due here would wipe the pre-removal
+            # snapshot / tamper flags and drop the alert screen.
             _existing = self.secured_medications.get(station_id, {})
             if (
                 _existing.get("early_alert_sent", False)
+                or _existing.get("wrong_bottle_on_station", False)
                 or _existing.get("tamper_check_pending", False)
                 or self._tamper_alert_active(_existing)
             ):
                 continue
 
             scan_msg = latest.get("scan_msg") or {}
+
+            # Reject scans that did not come from this station's own reader.
+            # If the station->reader mapping is known, a scan from any other
+            # reader (including the global fallback) is ignored here.
+            expected_reader_id = self.tag_runtime_service._station_to_reader.get(station_id)
+            if expected_reader_id:
+                actual_reader_id = scan_msg.get("reader_id")
+                if actual_reader_id != expected_reader_id:
+                    self.logger.debug(
+                        f"[PLACEMENT] Ignoring scan from reader={actual_reader_id} "
+                        f"for station={station_id} (expected reader={expected_reader_id})"
+                    )
+                    continue
             record   = self._resolve_record_from_scan(scan_msg)
             if not record:
                 continue
@@ -689,6 +704,7 @@ class MedicationSystem:
         return (
             secure_state.get("early_alert_sent", False)
             or secure_state.get("wrong_bottle_on_station", False)
+            or secure_state.get("tamper_check_pending", False)
             or self._tamper_alert_active(secure_state)
         )
 
@@ -1036,7 +1052,19 @@ class MedicationSystem:
             return None
 
         scan_msg = latest.get("scan_msg") or {}
-        record   = self._resolve_record_from_scan(scan_msg)
+
+        # Reject scans that did not come from this station's own reader.
+        expected_reader_id = self.tag_runtime_service._station_to_reader.get(station_id)
+        if expected_reader_id:
+            actual_reader_id = scan_msg.get("reader_id")
+            if actual_reader_id != expected_reader_id:
+                self.logger.warning(
+                    f"[VERIFY RETURN] Ignoring scan from reader={actual_reader_id} "
+                    f"for station={station_id} (expected reader={expected_reader_id})"
+                )
+                return None
+
+        record = self._resolve_record_from_scan(scan_msg)
 
         # Mark this scan as processed so _process_secured_bottle_placements
         # does not treat it as a new onboarding placement.
@@ -1054,10 +1082,15 @@ class MedicationSystem:
         actual_medicine_id   = record.get("medicine_id")
         actual_tag_uid       = record.get("tag_uid") or scan_msg.get("tag_uid")
 
-        correct = (
-            (expected_medicine_id and actual_medicine_id == expected_medicine_id)
-            or (expected_tag_uid and actual_tag_uid == expected_tag_uid)
-        )
+        # tag_uid is hardware-unique and directly identifies the physical bottle.
+        # Use it as the primary check. Only fall back to medicine_id when no
+        # tag_uid was recorded during registration (should be rare).
+        if expected_tag_uid:
+            correct = (actual_tag_uid == expected_tag_uid)
+        elif expected_medicine_id:
+            correct = (actual_medicine_id == expected_medicine_id)
+        else:
+            correct = False
 
         if correct:
             self.logger.info(
@@ -1354,7 +1387,23 @@ class MedicationSystem:
             station_id    = reminder_data.get("station_id")
 
             if not self._has_security_alert_for_station(station_id):
-                # Alert resolved — let the patient take their medication.
+                # Alert resolved — but also confirm the bottle is physically
+                # back on the station before resuming the reminder.  Without
+                # this check a cleared alert (e.g. via _secure_bottle_until_due)
+                # on an empty station would launch a dosing flow with no bottle.
+                station_status = self.weight_manager.get_station_status(station_id) if station_id else {}
+                bottle_present = (
+                    bool(station_status.get("connected"))
+                    and float(station_status.get("weight_g") or 0.0) >= self.min_secured_bottle_weight_g
+                )
+                if not bottle_present:
+                    self.logger.info(
+                        f"[SECURITY RESOLVED] Alert cleared on {station_id} but "
+                        f"bottle not yet present — keeping reminder for "
+                        f"{medicine_name} deferred."
+                    )
+                    continue
+
                 self.logger.info(
                     f"[SECURITY RESOLVED] Alert cleared on {station_id}. "
                     f"Resuming deferred reminder for {medicine_name}."
