@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <HX711_ADC.h>
 #include <Preferences.h>
+#include <time.h>
 
 // =====================================================
 // SMART MEDICATION SYSTEM - STATION 2
@@ -33,6 +34,11 @@ float knownWeight = 100.0;
 const unsigned long MQTT_PUBLISH_STABLE_MS = 500;
 const unsigned long MQTT_PUBLISH_CHANGING_MS = 2000;
 const unsigned long DISPLAY_UPDATE_MS = 200;
+const unsigned long NTP_SYNC_TIMEOUT_MS = 10000;
+const long NTP_GMT_OFFSET_SECONDS = 0;
+const int NTP_DAYLIGHT_OFFSET_SECONDS = 0;
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.nist.gov";
 
 const int FILTER_WINDOW_SIZE = 9;
 const float FAST_SMOOTH_ALPHA = 0.30f;
@@ -81,6 +87,7 @@ unsigned long dosingCorrectSince = 0;
 bool dosingCompletePublished = false;
 const unsigned long DOSING_CONFIRM_MS = 2000;
 const float BOTTLE_MIN_WEIGHT_G = 5.0f;
+bool clockSynced = false;
 
 // =====================================================
 // DISPLAY / HELPER FUNCTIONS
@@ -225,11 +232,57 @@ void clearSavedCalibrationFactor() {
 // =====================================================
 // WIFI / MQTT
 // =====================================================
+unsigned long long getUnixTimeMs() {
+  struct timeval tv;
+  if (gettimeofday(&tv, nullptr) != 0) return 0;
+  if (tv.tv_sec < 946684800) return 0;
+
+  return ((unsigned long long)tv.tv_sec * 1000ULL)
+       + ((unsigned long long)tv.tv_usec / 1000ULL);
+}
+
+void syncClock() {
+  configTime(
+    NTP_GMT_OFFSET_SECONDS,
+    NTP_DAYLIGHT_OFFSET_SECONDS,
+    NTP_SERVER_1,
+    NTP_SERVER_2
+  );
+
+  unsigned long start = millis();
+  while ((millis() - start) < NTP_SYNC_TIMEOUT_MS) {
+    unsigned long long unixMs = getUnixTimeMs();
+    if (unixMs > 0) {
+      clockSynced = true;
+      Serial.print("Clock synced. Unix ms: ");
+      Serial.println((unsigned long)(unixMs / 1000ULL));
+      return;
+    }
+    delay(250);
+  }
+
+  clockSynced = false;
+  Serial.println("Clock sync timed out");
+}
+
+template <typename TDoc>
+void appendPublishTimestamp(TDoc& doc) {
+  unsigned long long unixMs = getUnixTimeMs();
+  if (unixMs > 0) {
+    doc["published_at"] = unixMs;
+    doc["clock_synced"] = true;
+    clockSynced = true;
+  } else {
+    doc["clock_synced"] = false;
+  }
+}
+
 void publishStatus(const char* status) {
   StaticJsonDocument<128> doc;
   doc["station_id"] = STATION_ID;
   doc["status"] = status;
   doc["timestamp"] = millis();
+  appendPublishTimestamp(doc);
 
   char buffer[128];
   serializeJson(doc, buffer);
@@ -257,6 +310,7 @@ void connectWiFi() {
     Serial.println("\nWiFi connected");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
+    syncClock();
     showMsg("WiFi OK", WiFi.localIP().toString().c_str(), "", TFT_GREEN);
   } else {
     Serial.println("\nWiFi failed");
@@ -297,6 +351,7 @@ void publishWeightData() {
   doc["stable"] = isStable;
   doc["timestamp"] = millis();
   doc["rssi"] = WiFi.RSSI();
+  appendPublishTimestamp(doc);
 
   char buffer[256];
   serializeJson(doc, buffer);
@@ -699,6 +754,7 @@ void loop() {
           statusDoc["weight_delta_g"] = round(weightDelta * 100.0f) / 100.0f;
           statusDoc["baseline_g"] = round(bottleBaseline * 100.0f) / 100.0f;
           statusDoc["timestamp"] = millis();
+          appendPublishTimestamp(statusDoc);
           char statusBuf[256];
           serializeJson(statusDoc, statusBuf);
           mqttClient.publish(topic_status, statusBuf);
