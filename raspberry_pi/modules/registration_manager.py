@@ -102,12 +102,15 @@ class RegistrationManager:
             self.logger.info("Registration disabled, skipping onboarding")
             return True
 
-        # Count only medicines registered to THIS station.
+        # Count only medicines registered to THIS station (for progress tracking).
         all_registered   = self.database.list_registered_medicines()
         station_records  = [r for r in all_registered
                             if r.get("station_id") == station_id]
-        registered_ids   = {r["medicine_id"] for r in station_records}
         registered_count = len(station_records)
+
+        # Duplicate detection is global: the same medicine must not appear on
+        # any station, not just the current one.
+        registered_ids = {r["medicine_id"] for r in all_registered}
 
         if registered_count >= expected_medicine_count:
             self.logger.info(
@@ -137,12 +140,10 @@ class RegistrationManager:
                 self.logger.error(f"Onboarding failed at slot {slot} for {station_id}")
                 return False
 
-            # Refresh station-scoped registered_ids after each successful slot.
+            # Refresh global registered_ids after each successful slot so the
+            # next slot cannot re-use a medicine already on any station.
             all_registered = self.database.list_registered_medicines()
-            registered_ids = {
-                r["medicine_id"] for r in all_registered
-                if r.get("station_id") == station_id
-            }
+            registered_ids = {r["medicine_id"] for r in all_registered}
 
         # Belt-and-suspenders: ensure scanner is stopped after all slots.
         self.tag_runtime_service.stop_scanning(station_id)
@@ -345,10 +346,10 @@ class RegistrationManager:
         medicine_id   = record.get("medicine_id")
         medicine_name = record.get("medicine_name", "Unknown")
 
-        # ---- Duplicate check ----
+        # ---- Duplicate check (global across all stations) ----
         if medicine_id in registered_ids:
             self.logger.warning(
-                f"Medicine {medicine_id} already registered - "
+                f"Medicine {medicine_id} already registered on the system - "
                 "asking user to place a different bottle"
             )
             self._update_screen(

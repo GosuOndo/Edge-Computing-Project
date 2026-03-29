@@ -142,7 +142,16 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_registered_medicines_station
                 ON registered_medicines(station_id)
             ''')
-            
+
+            # Unique index: no two *active* rows may share the same medicine_name
+            # for the same patient.  COALESCE normalises NULL patient_id so that
+            # the constraint fires even when patient_id is not set on the tag.
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_active_medicine_name_per_patient
+                ON registered_medicines(COALESCE(patient_id, ''), medicine_name)
+                WHERE active = 1
+            ''')
+
             self.connection.commit()
             self.logger.info("Database tables created/verified")
     
@@ -416,13 +425,70 @@ class Database:
     def upsert_registered_medicine(self, record: Dict[str, Any]) -> bool:
         """
         Insert or update a registered medicine from tag/QR/OCR onboarding.
+
+        Duplicate-safe: the check and the write happen inside the same
+        db_lock acquisition so concurrent onboarding calls cannot both
+        slip through the application-level pre-check.
+
+        Returns False (without raising) when:
+          • the medicine_id is already active on a *different* station, or
+          • the medicine_name already exists for the same patient (active), or
+          • any other database error occurs.
         """
         try:
             with self.db_lock:
                 cursor = self.connection.cursor()
-                
+
+                medicine_id      = record.get("medicine_id")
+                incoming_station = record.get("station_id")
+                medicine_name    = record.get("medicine_name")
+                patient_id       = record.get("patient_id")  # may be None
+
+                # ----------------------------------------------------------
+                # Atomic duplicate guards
+                # ----------------------------------------------------------
+
+                # Guard 1 – same medicine_id already active on a different station
+                cursor.execute(
+                    "SELECT station_id FROM registered_medicines "
+                    "WHERE medicine_id = ? AND active = 1",
+                    (medicine_id,),
+                )
+                existing_by_id = cursor.fetchone()
+                if existing_by_id is not None:
+                    existing_station = existing_by_id["station_id"]
+                    if existing_station != incoming_station:
+                        self.logger.warning(
+                            f"Duplicate blocked: medicine_id '{medicine_id}' is "
+                            f"already active on station '{existing_station}'; "
+                            f"refusing registration to '{incoming_station}'"
+                        )
+                        return False
+                    # Same station → fall through; re-registration is allowed.
+
+                # Guard 2 – same medicine_name already active for the same patient
+                cursor.execute(
+                    "SELECT medicine_id FROM registered_medicines "
+                    "WHERE COALESCE(patient_id, '') = ? "
+                    "  AND medicine_name = ? "
+                    "  AND active = 1 "
+                    "  AND medicine_id != ?",
+                    (patient_id or "", medicine_name, medicine_id),
+                )
+                existing_by_name = cursor.fetchone()
+                if existing_by_name is not None:
+                    self.logger.warning(
+                        f"Duplicate blocked: medicine_name '{medicine_name}' is "
+                        f"already registered (id='{existing_by_name['medicine_id']}') "
+                        f"for patient '{patient_id}'"
+                    )
+                    return False
+
+                # ----------------------------------------------------------
+                # Write
+                # ----------------------------------------------------------
                 now_ts = time.time()
-                
+
                 cursor.execute('''
                     INSERT INTO registered_medicines (
                         medicine_id,
@@ -441,39 +507,39 @@ class Database:
                         updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(medicine_id) DO UPDATE SET
-                        patient_id = excluded.patient_id,
+                        patient_id    = excluded.patient_id,
                         medicine_name = excluded.medicine_name,
                         dosage_amount = excluded.dosage_amount,
-                        dosage_unit = excluded.dosage_unit,
-                        time_slots = excluded.time_slots,
-                        meal_rule = excluded.meal_rule,
-                        station_id = excluded.station_id,
-                        tag_uid = excluded.tag_uid,
-                        tag_payload = excluded.tag_payload,
+                        dosage_unit   = excluded.dosage_unit,
+                        time_slots    = excluded.time_slots,
+                        meal_rule     = excluded.meal_rule,
+                        station_id    = excluded.station_id,
+                        tag_uid       = excluded.tag_uid,
+                        tag_payload   = excluded.tag_payload,
                         source_method = excluded.source_method,
-                        active = excluded.active,
-                        updated_at = excluded.updated_at
+                        active        = excluded.active,
+                        updated_at    = excluded.updated_at
                 ''', (
-                    record.get("medicine_id"),
-                    record.get("patient_id"),
-                    record.get("medicine_name"),
+                    medicine_id,
+                    patient_id,
+                    medicine_name,
                     record.get("dosage_amount"),
                     record.get("dosage_unit", "TABLET"),
                     record.get("time_slots"),
                     record.get("meal_rule"),
-                    record.get("station_id"),
+                    incoming_station,
                     record.get("tag_uid"),
                     record.get("tag_payload"),
                     record.get("source_method", "tag"),
                     1 if record.get("active", True) else 0,
                     record.get("created_at", now_ts),
-                    now_ts
+                    now_ts,
                 ))
-                
+
                 self.connection.commit()
-                self.logger.info(f"Registered medicine upserted: {record.get('medicine_id')}")
+                self.logger.info(f"Registered medicine upserted: {medicine_id}")
                 return True
-                
+
         except Exception as e:
             self.logger.error(f"Failed to upsert registered medicine: {e}")
             return False
