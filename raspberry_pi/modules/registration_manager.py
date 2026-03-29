@@ -169,8 +169,6 @@ class RegistrationManager:
             f"Onboarding slot {slot_number}/{total} on {station_id}"
         )
 
-        slot_label = f"Medicine {slot_number}"
-
         # ----------------------------------------------------------------
         # START scanning for this slot
         # ----------------------------------------------------------------
@@ -178,12 +176,12 @@ class RegistrationManager:
         self.logger.info(f"Tag scanning STARTED for onboarding slot {slot_number}")
 
         # ---- Guide the user ----
-        msg = f"{slot_label} - Place bottle on station"
+        msg = f"Medicine {slot_number} - Place bottle on station"
         if self.display:
             self.display.show_registration_screen(station_id, msg)
         if self.audio:
             self.audio.speak(
-                f"Please place {slot_label} onto the station now."
+                f"Please place medicine {slot_number} onto the station now."
             )
 
         deadline = time.time() + self.timeout_seconds
@@ -213,7 +211,7 @@ class RegistrationManager:
                 bottle_detected_at = time.time()
                 self._update_screen(
                     station_id,
-                    f"{slot_label} detected - stabilising..."
+                    "Bottle detected - stabilising..."
                 )
 
             if not is_stable:
@@ -224,7 +222,7 @@ class RegistrationManager:
             # Show the confirmed stable weight now that the reading has settled
             self._update_screen(
                 station_id,
-                f"{slot_label} weight stable",
+                "Weight stable",
                 weight_g=stable_weight,
                 stable=True,
             )
@@ -239,12 +237,8 @@ class RegistrationManager:
         # which typically happens before or during weight stabilisation.
         # We accept any scan received since bottle_detected_at - 2 s.
         lookback_from = bottle_detected_at - 2.0
-        self._update_screen(
-            station_id,
-            f"Reading tag for {slot_label}...",
-            weight_g=stable_weight,
-            stable=True
-        )
+        self._update_screen(station_id, "Reading tag...",
+                            weight_g=stable_weight, stable=True)
         if self.audio:
             self.audio.speak("Reading tag.")
 
@@ -276,7 +270,7 @@ class RegistrationManager:
                 )
                 self._update_screen(
                     station_id,
-                    f"{slot_label} tag detected but unreadable - keep bottle still...",
+                    "Tag detected but unreadable - keep bottle still...",
                     weight_g=stable_weight, stable=True,
                 )
                 self.tag_runtime_service.clear_latest_scan(station_id)
@@ -288,13 +282,10 @@ class RegistrationManager:
             break
         else:
             self.logger.warning("No tag scan received during onboarding window")
-            self._update_screen(
-                station_id,
-                f"No tag detected for {slot_label} - check sticker and re-seat bottle"
-            )
+            self._update_screen(station_id, "No tag - check sticker, re-seat bottle")
             if self.audio:
                 self.audio.speak(
-                    f"No tag detected for {slot_label}. Please check the sticker and try again."
+                    "No tag detected. Please check the sticker and try again."
                 )
             self.tag_runtime_service.stop_scanning(station_id)   # stop on no-tag failure
             time.sleep(2.0)
@@ -303,14 +294,9 @@ class RegistrationManager:
         # ---- Phase C: build and validate record ----
         record = self._build_registration_record(station_id, stable_weight, scan_msg)
         if record is None:
-            self._update_screen(
-                station_id,
-                f"{slot_label} tag unreadable - check sticker content"
-            )
+            self._update_screen(station_id, "Tag unreadable - check sticker content")
             if self.audio:
-                self.audio.speak(
-                    f"{slot_label} could not be read. Please check the sticker."
-                )
+                self.audio.speak("Tag could not be read. Please check the sticker.")
             self.tag_runtime_service.stop_scanning(station_id)   # stop on bad record
             time.sleep(2.0)
             return False
@@ -326,11 +312,11 @@ class RegistrationManager:
             )
             self._update_screen(
                 station_id,
-                f"{slot_label}: {medicine_name} already registered - place a different bottle"
+                f"{medicine_name} already registered - place a different bottle"
             )
             if self.audio:
                 self.audio.speak(
-                    f"{slot_label}, {medicine_name}, is already registered. "
+                    f"{medicine_name} is already registered. "
                     f"Please place a different medicine bottle."
                 )
             # Stop scanning while the patient swaps bottles, then retry
@@ -385,15 +371,12 @@ class RegistrationManager:
         )
 
         if self.display:
-            self.display.show_registration_success_screen(
-                f"{slot_label}: {medicine_name}",
-                schedule_times
-            )
+            self.display.show_registration_success_screen(medicine_name, schedule_times)
 
         if self.audio:
             times_spoken = " and ".join(schedule_times) if schedule_times else "as scheduled"
             self.audio.speak(
-                f"{slot_label}, {medicine_name}, registered successfully. "
+                f"{medicine_name} registered successfully. "
                 f"You will be reminded at {times_spoken}."
             )
 
@@ -422,18 +405,15 @@ class RegistrationManager:
                 f"- waiting for bottle swap"
             )
 
-            next_slot = slot_number + 1
-            next_label = f"Medicine {next_slot}"
-
             next_msg = (
-                f"{slot_label} done. "
-                f"Remove bottle and place {next_label}."
+                f"Medicine {slot_number} done. "
+                f"Remove bottle and place medicine {slot_number + 1}."
             )
             self._update_screen(station_id, next_msg)
             if self.audio:
                 self.audio.speak(
-                    f"{slot_label} registered successfully. "
-                    f"Please remove the bottle and place {next_label} onto the station now."
+                    f"Medicine {slot_number} registered. "
+                    f"Please remove the bottle and place the next medicine."
                 )
 
             # Wait for bottle to be removed before returning
