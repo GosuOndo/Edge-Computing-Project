@@ -431,7 +431,7 @@ class RegistrationManager:
         )
 
         # ---- Hold success screen briefly ----
-        hold_until = time.time() + 4.0
+        hold_until = time.time() + 1.5
         while time.time() < hold_until:
             if self.display:
                 self.display.update()
@@ -483,7 +483,7 @@ class RegistrationManager:
                 self.audio.speak(spoken)
 
             # Wait for bottle to be removed before returning.
-            remove_deadline = time.time() + 30.0
+            remove_deadline = time.time() + 15.0
             while time.time() < remove_deadline:
                 if self.display:
                     self.display.update()
@@ -491,7 +491,7 @@ class RegistrationManager:
                 weight_g = float(status.get("weight_g") or 0.0)
                 if weight_g < self.min_bottle_weight_g:
                     break
-                time.sleep(0.3)
+                time.sleep(0.1)
             else:
                 self.logger.warning(
                     "Bottle not removed after success - continuing anyway"
@@ -499,7 +499,7 @@ class RegistrationManager:
 
             # Clear stale scan buffer before the next slot's start_scanning().
             self.tag_runtime_service.clear_latest_scan(station_id)
-            time.sleep(1.0)
+            time.sleep(0.3)
 
         # For the final slot on the final station, stop_scanning() is called
         # by run_onboarding_if_needed() after the loop completes.
