@@ -23,7 +23,7 @@ the hard-coded pill_weight_mg config value for this station, allowing the
 system to use the correct weight for each specific medicine.
 
 Note: P (patient_id) and S (station_id) are not written to the tag.
-The station_id is always determined from the physical station (line 474),
+The station_id is always determined from the physical station,
 never from the tag payload.
 """
 
@@ -77,15 +77,24 @@ class RegistrationManager:
         self,
         station_id: str,
         expected_medicine_count: int,
-        scheduler=None
+        scheduler=None,
+        station_number: int = 1,
+        station_total: int = 1,
     ) -> bool:
         """
         Sequential onboarding: register up to expected_medicine_count
         medicines on a single station, one at a time.
 
-        Scanning is controlled per-slot inside _onboard_one_medicine.
-        After the final slot succeeds this method sends one last
-        stop_scan to guarantee the reader is idle.
+        Args:
+            station_id:              The station to onboard.
+            expected_medicine_count: How many medicines this station holds (usually 1).
+            scheduler:               Live scheduler to add medicines to.
+            station_number:          1-based index of this station in the overall
+                                     onboarding sequence (e.g. 1 of 2).  Used in
+                                     display/audio so the patient sees the correct
+                                     "Station X of Y" progress instead of the
+                                     always-misleading "Medicine 1 of 1".
+            station_total:           Total number of stations being onboarded.
 
         Returns True when the target count is reached.
         """
@@ -93,12 +102,10 @@ class RegistrationManager:
             self.logger.info("Registration disabled, skipping onboarding")
             return True
 
-        # Count only medicines registered to THIS station so that a completed
-        # station does not prevent a second station from being onboarded.
+        # Count only medicines registered to THIS station.
         all_registered   = self.database.list_registered_medicines()
         station_records  = [r for r in all_registered
                             if r.get("station_id") == station_id]
-        # Build registered_ids scoped to this station only
         registered_ids   = {r["medicine_id"] for r in station_records}
         registered_count = len(station_records)
 
@@ -107,14 +114,13 @@ class RegistrationManager:
                 f"All {expected_medicine_count} medicine(s) already registered "
                 f"for {station_id}"
             )
-            # Ensure scanner is off if we skip onboarding entirely
             self.tag_runtime_service.stop_scanning(station_id)
             return True
 
         remaining = expected_medicine_count - registered_count
         self.logger.info(
-            f"Onboarding: {registered_count}/{expected_medicine_count} registered, "
-            f"need {remaining} more"
+            f"Onboarding: {registered_count}/{expected_medicine_count} registered "
+            f"for {station_id}, need {remaining} more"
         )
 
         for slot in range(registered_count + 1, expected_medicine_count + 1):
@@ -123,22 +129,22 @@ class RegistrationManager:
                 slot_number=slot,
                 total=expected_medicine_count,
                 registered_ids=registered_ids,
-                scheduler=scheduler
+                scheduler=scheduler,
+                station_number=station_number,
+                station_total=station_total,
             )
             if not success:
-                self.logger.error(f"Onboarding failed at slot {slot}")
-                # _onboard_one_medicine already called stop_scanning on failure
+                self.logger.error(f"Onboarding failed at slot {slot} for {station_id}")
                 return False
 
-            # Refresh registered_ids (station-scoped) after each successful
-            # registration so the duplicate check in the next slot is accurate.
+            # Refresh station-scoped registered_ids after each successful slot.
             all_registered = self.database.list_registered_medicines()
             registered_ids = {
                 r["medicine_id"] for r in all_registered
                 if r.get("station_id") == station_id
             }
 
-        # All slots done - belt-and-suspenders final stop
+        # Belt-and-suspenders: ensure scanner is stopped after all slots.
         self.tag_runtime_service.stop_scanning(station_id)
         self.logger.info(
             f"Onboarding complete for {station_id}. Tag scanning stopped."
@@ -148,49 +154,38 @@ class RegistrationManager:
     # ------------------------------------------------------------------
     # Single-slot onboarding
     # ------------------------------------------------------------------
+
     def _onboard_one_medicine(
         self,
         station_id: str,
         slot_number: int,
         total: int,
         registered_ids: set,
-        scheduler=None
+        scheduler=None,
+        station_number: int = 1,
+        station_total: int = 1,
     ) -> bool:
         """
         Register a single medicine interactively.
 
-        Scan control:
-          START  - at the very top so the reader captures the tag the
-                   moment the bottle touches the reader coil.
-          STOP   - immediately after a successful registration and before
-                   asking the patient to swap bottles, so the outgoing
-                   bottle's tag is not captured as the next slot's scan.
-          STOP   - on every early-exit (timeout, bad tag, etc.) so the
-                   reader is never left running unintentionally.
-
-        IMPORTANT: This method never recurses. Duplicate-medicine retries
-        are handled by returning False with a sentinel so the caller loop
-        can re-invoke with the correct slot_number. Recursion was removed
-        to prevent slot_number drift in display/audio messages.
+        Uses a retry loop instead of recursion so station_number (and
+        slot_number) are always accurate in display/audio output.
         """
-        # Duplicate-retry loop: keep attempting this slot until we get a
-        # non-duplicate medicine, a hard failure, or a timeout.
         while True:
             result = self._attempt_one_slot(
                 station_id=station_id,
                 slot_number=slot_number,
                 total=total,
                 registered_ids=registered_ids,
-                scheduler=scheduler
+                scheduler=scheduler,
+                station_number=station_number,
+                station_total=station_total,
             )
             if result == "success":
                 return True
             elif result == "duplicate_retry":
-                # Scanner was already stopped inside _attempt_one_slot.
-                # Loop back to re-attempt the same slot_number cleanly.
                 continue
             else:
-                # "failure" - scanner already stopped inside _attempt_one_slot
                 return False
 
     def _attempt_one_slot(
@@ -199,47 +194,60 @@ class RegistrationManager:
         slot_number: int,
         total: int,
         registered_ids: set,
-        scheduler=None
+        scheduler=None,
+        station_number: int = 1,
+        station_total: int = 1,
     ) -> str:
         """
         One full attempt to register a single medicine slot.
 
-        Returns:
-            "success"        - medicine registered successfully
-            "duplicate_retry"- duplicate detected; caller should retry
-                               same slot_number after a brief pause
-            "failure"        - unrecoverable error; abort onboarding
-        """
-        self.logger.info(
-            f"Onboarding slot {slot_number}/{total} on {station_id}"
-        )
+        Display/audio uses station_number/station_total (e.g. "Station 2 of 3")
+        when there is only one medicine per station (the common case), so the
+        patient always sees meaningful progress.  When a station genuinely holds
+        multiple medicines the inner slot_number/total is appended as well.
 
-        # ----------------------------------------------------------------
-        # START scanning for this slot
-        # ----------------------------------------------------------------
+        Returns:
+            "success"         - medicine registered successfully
+            "duplicate_retry" - duplicate detected; caller retries same slot
+            "failure"         - unrecoverable error; abort onboarding
+        """
+        # Human-readable progress label shown to the patient.
+        # One medicine per station  -> "Station 2 of 3"
+        # Multiple medicines/station -> "Station 2 of 3 · Medicine 1 of 2"
+        if total <= 1:
+            progress_label = f"Station {station_number} of {station_total}"
+        else:
+            progress_label = (
+                f"Station {station_number} of {station_total}"
+                f" \u00b7 Medicine {slot_number} of {total}"
+            )
+
+        self.logger.info(f"Onboarding {progress_label} ({station_id})")
+
+        # ---- START scanning ----
         self.tag_runtime_service.start_scanning(station_id)
-        self.logger.info(f"Tag scanning STARTED for onboarding slot {slot_number}")
+        self.logger.info(f"Tag scanning STARTED for {progress_label}")
 
         # ---- Guide the user ----
-        msg = f"Medicine {slot_number} of {total} - Place bottle on station"
+        msg = f"{progress_label} - Place bottle on station"
         if self.display:
             self.display.show_registration_screen(station_id, msg)
         if self.audio:
             self.audio.speak(
-                f"Please place medicine {slot_number} onto the station now."
+                f"Please place the medicine for {progress_label} onto the station now."
             )
 
         deadline = time.time() + self.timeout_seconds
 
         # ---- Phase A: wait for stable weight ----
-        stable_weight        = None
-        bottle_detected_at   = None
+        stable_weight      = None
+        bottle_detected_at = None
 
         while time.time() < deadline:
             if self.display:
                 self.display.update()
 
-            status   = self.weight_manager.get_station_status(station_id)
+            status = self.weight_manager.get_station_status(station_id)
             if not status.get("connected"):
                 time.sleep(0.5)
                 continue
@@ -254,10 +262,7 @@ class RegistrationManager:
 
             if bottle_detected_at is None:
                 bottle_detected_at = time.time()
-                self._update_screen(
-                    station_id,
-                    "Bottle detected - stabilising..."
-                )
+                self._update_screen(station_id, "Bottle detected - stabilising...")
 
             if not is_stable:
                 time.sleep(0.3)
@@ -283,7 +288,7 @@ class RegistrationManager:
         if self.audio:
             self.audio.speak("Reading tag.")
 
-        scan_msg    = None
+        scan_msg     = None
         tag_deadline = time.time() + self.tag_wait_seconds
 
         while time.time() < tag_deadline and time.time() < deadline:
@@ -291,7 +296,6 @@ class RegistrationManager:
                 self.display.update()
 
             latest = self.tag_runtime_service.get_latest_scan(station_id)
-
             if not latest or latest.get("received_at", 0) < lookback_from:
                 time.sleep(0.3)
                 continue
@@ -345,7 +349,7 @@ class RegistrationManager:
         if medicine_id in registered_ids:
             self.logger.warning(
                 f"Medicine {medicine_id} already registered - "
-                f"asking user to place a different bottle"
+                "asking user to place a different bottle"
             )
             self._update_screen(
                 station_id,
@@ -354,11 +358,8 @@ class RegistrationManager:
             if self.audio:
                 self.audio.speak(
                     f"{medicine_name} is already registered. "
-                    f"Please place a different medicine bottle."
+                    "Please place a different medicine bottle."
                 )
-            # Stop scanning while the patient swaps bottles.
-            # Return sentinel so _onboard_one_medicine re-attempts this
-            # slot_number correctly (no recursion = no slot drift).
             self.tag_runtime_service.stop_scanning(station_id)
             time.sleep(3.0)
             self.tag_runtime_service.clear_latest_scan(station_id)
@@ -412,7 +413,9 @@ class RegistrationManager:
             self.display.show_registration_success_screen(medicine_name, schedule_times)
 
         if self.audio:
-            times_spoken = " and ".join(schedule_times) if schedule_times else "as scheduled"
+            times_spoken = (
+                " and ".join(schedule_times) if schedule_times else "as scheduled"
+            )
             self.audio.speak(
                 f"{medicine_name} registered successfully. "
                 f"You will be reminded at {times_spoken}."
@@ -433,29 +436,52 @@ class RegistrationManager:
                 self.display.update()
             time.sleep(0.05)
 
-        # ---- Prompt for next bottle (if more slots remain) ----
-        if slot_number < total:
-            # STOP scanning BEFORE asking the patient to remove the current
-            # bottle so we do not capture its tag as the next slot's scan.
+        # ---- Prompt for next bottle/station if more remain ----
+        more_slots    = slot_number < total
+        more_stations = station_number < station_total
+
+        if more_slots or more_stations:
+            # STOP scanning BEFORE asking the patient to swap so we do not
+            # capture the outgoing bottle's tag as the next slot's scan.
             self.tag_runtime_service.stop_scanning(station_id)
             self.logger.info(
-                f"Tag scanning STOPPED after slot {slot_number} "
-                f"- waiting for bottle swap"
+                f"Tag scanning STOPPED after {progress_label} - waiting for swap"
             )
 
-            next_msg = (
-                f"Medicine {slot_number} done. "
-                f"Remove bottle and place medicine {slot_number + 1} of {total}."
-            )
-            self._update_screen(station_id, next_msg)
-            if self.audio:
-                self.audio.speak(
-                    f"Medicine {slot_number} registered. "
-                    f"Please remove the bottle and place medicine "
-                    f"{slot_number + 1}."
+            if more_slots:
+                # Multiple medicines on same station.
+                if total <= 1:
+                    next_label = f"Station {station_number + 1} of {station_total}"
+                else:
+                    next_label = (
+                        f"Station {station_number} of {station_total}"
+                        f" \u00b7 Medicine {slot_number + 1} of {total}"
+                    )
+                next_msg = (
+                    f"{progress_label} done. "
+                    f"Remove bottle and place medicine {slot_number + 1} of {total}."
+                )
+                spoken = (
+                    f"{progress_label} registered. "
+                    f"Please remove the bottle and place medicine {slot_number + 1}."
+                )
+            else:
+                # One medicine per station - move to next station.
+                next_label = f"Station {station_number + 1} of {station_total}"
+                next_msg = (
+                    f"{progress_label} done. "
+                    f"Remove bottle and move to {next_label}."
+                )
+                spoken = (
+                    f"{progress_label} registered. "
+                    f"Please remove the bottle and move to {next_label}."
                 )
 
-            # Wait for bottle to be removed before returning
+            self._update_screen(station_id, next_msg)
+            if self.audio:
+                self.audio.speak(spoken)
+
+            # Wait for bottle to be removed before returning.
             remove_deadline = time.time() + 30.0
             while time.time() < remove_deadline:
                 if self.display:
@@ -470,12 +496,12 @@ class RegistrationManager:
                     "Bottle not removed after success - continuing anyway"
                 )
 
-            # Clear stale scan buffer before the next slot's start_scanning()
+            # Clear stale scan buffer before the next slot's start_scanning().
             self.tag_runtime_service.clear_latest_scan(station_id)
             time.sleep(1.0)
 
-        # For the FINAL slot, stop_scanning() is called by
-        # run_onboarding_if_needed() after the loop completes.
+        # For the final slot on the final station, stop_scanning() is called
+        # by run_onboarding_if_needed() after the loop completes.
 
         return "success"
 
@@ -512,7 +538,7 @@ class RegistrationManager:
         record = tag_manager.build_record_from_scan(scan_msg)
         if not record:
             return None
-        # Physical station always wins over tag payload S field
+        # Physical station always wins over tag payload S field.
         record["station_id"] = station_id
         return record
 

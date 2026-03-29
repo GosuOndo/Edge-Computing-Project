@@ -2965,22 +2965,34 @@ class MedicationSystem:
 
         EXPECTED_MEDICINE_COUNT = 1  # one medicine per station
         STATION_IDS = list(self.weight_manager.station_configs.keys())
-
+ 
         onboarding_was_needed = any(
             not self._station_has_existing_schedule(sid) for sid in STATION_IDS
         )
-
+ 
+        # Determine which stations actually need onboarding so we can give the
+        # patient an accurate "Station X of Y" progress count.
+        stations_to_onboard = [
+            sid for sid in STATION_IDS
+            if not self._station_has_existing_schedule(sid)
+        ]
+        station_total = len(stations_to_onboard)
+ 
         all_registered = True
+        station_number = 0
         for station_id in STATION_IDS:
             if self._station_has_existing_schedule(station_id):
                 self.logger.info(
                     f"Schedule already in place for {station_id}, skipping onboarding"
                 )
                 continue
+            station_number += 1
             ok = self.registration_manager.run_onboarding_if_needed(
                 station_id=station_id,
                 expected_medicine_count=EXPECTED_MEDICINE_COUNT,
-                scheduler=self.scheduler
+                scheduler=self.scheduler,
+                station_number=station_number,
+                station_total=station_total,
             )
             if not ok:
                 self.logger.error(
