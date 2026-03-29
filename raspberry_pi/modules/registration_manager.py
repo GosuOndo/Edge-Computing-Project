@@ -286,8 +286,7 @@ class RegistrationManager:
         self._update_screen(station_id, "Reading tag...",
                             weight_g=stable_weight, stable=True)
         if self.audio:
-            # Non-blocking: tag scan loop starts immediately in parallel with audio.
-            self.audio.speak_async("Reading tag.")
+            self.audio.speak("Reading tag.")
 
         scan_msg     = None
         tag_deadline = time.time() + self.tag_wait_seconds
@@ -480,9 +479,7 @@ class RegistrationManager:
 
             self._update_screen(station_id, next_msg)
             if self.audio:
-                # Non-blocking: audio plays while we immediately start watching
-                # for the bottle to be removed — no dead time waiting for TTS.
-                self.audio.speak_async(spoken)
+                self.audio.speak(spoken)
 
             # Wait for bottle to be removed before returning.
             remove_deadline = time.time() + 30.0
@@ -500,10 +497,8 @@ class RegistrationManager:
                 )
 
             # Clear stale scan buffer before the next slot's start_scanning().
-            # No extra sleep needed — clear_latest_scan is synchronous and the
-            # weight sensor will need a moment to settle on its own before the
-            # next bottle is placed anyway.
             self.tag_runtime_service.clear_latest_scan(station_id)
+            time.sleep(1.0)
 
         # For the final slot on the final station, stop_scanning() is called
         # by run_onboarding_if_needed() after the loop completes.
