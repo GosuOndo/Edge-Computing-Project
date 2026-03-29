@@ -23,8 +23,8 @@ An edge-computing IoT system that automates real-time medication intake verifica
 
 The system supports up to two medication stations. Each station consists of:
 
-- A **weight scale** (M5StickC+ with HX711 load cell) that detects pill removal
-- An **NFC/RFID reader** (MFRC522) mounted under the scale to identify the medicine bottle
+- A **weight scale unit** (M5StickC Plus with HX711 load cell) that detects pill removal
+- A **tag reader unit** (M5StickC Plus with MFRC522 module) mounted under the scale to identify the medicine bottle via NFC/RFID
 - A central **Raspberry Pi** that orchestrates all sensors, runs the scheduler, evaluates compliance, and sends Telegram alerts
 
 Key features:
@@ -39,45 +39,57 @@ Key features:
 
 ## Hardware Requirements
 
-| Component | Details |
-|-----------|---------|
-| Raspberry Pi 4 (or 5) | Main compute unit |
-| M5StickC+ × 2 | HX711 load cell controller per station; communicates over MQTT via Wi-Fi |
-| MFRC522 RFID module × 2 | NFC/RFID readers wired to the Pi via SPI |
-| NTAG213 NFC sticker tags | Affixed to the bottom of each medicine bottle |
-| Display (HDMI) | 1024 × 600 touchscreen or monitor for the pygame UI |
-| USB camera | For patient monitoring (MediaPipe) and optional OCR |
-| Speaker / audio output | For espeak TTS announcements |
-| MQTT broker (Mosquitto) | Runs locally on the Pi (`localhost:1883`) |
+| Component | Quantity | Details |
+|-----------|----------|---------|
+| Raspberry Pi 4 (or 5) | 1 | Main compute unit |
+| M5StickC Plus (scale unit) | 2 | One per station; drives HX711 load cell for weight sensing; communicates over MQTT via Wi-Fi |
+| M5StickC Plus (tag reader unit) | 2 | One per station; drives MFRC522 RFID module for NFC identity verification; communicates over MQTT via Wi-Fi |
+| MFRC522 RFID module | 2 | Wired to the tag reader M5StickC Plus units via SPI; mounted under each station's scale |
+| NTAG213 NFC sticker tags | 1 per bottle | Affixed to the bottom of each medicine bottle |
+| Display (HDMI) | 1 | 1024 × 600 touchscreen or monitor for the pygame UI |
+| USB camera | 1 | For patient monitoring (MediaPipe) and optional OCR |
+| Speaker / audio output | 1 | For espeak TTS announcements |
+| MQTT broker (Mosquitto) | — | Runs locally on the Pi (`localhost:1883`) |
+
+> **Per-station summary:** each station uses **2 × M5StickC Plus** units — one dedicated to weight sensing (HX711) and one dedicated to tag reading (MFRC522). Both communicate with the Pi over MQTT via Wi-Fi, so no wired sensor connections are required at the Pi.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Raspberry Pi                         │
-│                                                             │
-│  main.py  ──► StateMachine ──► DecisionEngine               │
-│      │                                                      │
-│      ├── WeightManager  ◄── MQTT ◄── M5StickC+ (station 1) │
-│      │                  ◄── MQTT ◄── M5StickC+ (station 2) │
-│      │                                                      │
-│      ├── TagRuntimeService ◄── MQTT ◄── MFRC522 reader ×2  │
-│      │       └── TagManager (payload parser)                │
-│      │                                                      │
-│      ├── IdentityManager (tag → QR → OCR fallback chain)    │
-│      ├── RegistrationManager (onboarding flow)              │
-│      ├── MedicationScheduler (reminder scheduling)          │
-│      ├── PatientMonitor (MediaPipe swallow detection)        │
-│      ├── Database (SQLite)                                  │
-│      ├── DisplayManager (pygame UI)                         │
-│      ├── AudioManager (espeak TTS)                          │
-│      └── TelegramBot (caregiver/patient alerts)             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                           Raspberry Pi                              │
+│                                                                     │
+│  main.py  ──► StateMachine ──► DecisionEngine                       │
+│      │                                                              │
+│      ├── WeightManager  ◄── MQTT ◄── M5StickC+ scale  (station 1)  │
+│      │                  ◄── MQTT ◄── M5StickC+ scale  (station 2)  │
+│      │                                                              │
+│      ├── TagRuntimeService ◄── MQTT ◄── M5StickC+ reader (station 1)│
+│      │                    ◄── MQTT ◄── M5StickC+ reader (station 2) │
+│      │       └── TagManager (payload parser)                        │
+│      │                                                              │
+│      ├── IdentityManager (tag → QR → OCR fallback chain)            │
+│      ├── RegistrationManager (onboarding flow)                      │
+│      ├── MedicationScheduler (reminder scheduling)                  │
+│      ├── PatientMonitor (MediaPipe swallow detection)               │
+│      ├── Database (SQLite)                                          │
+│      ├── DisplayManager (pygame UI)                                 │
+│      ├── AudioManager (espeak TTS)                                  │
+│      └── TelegramBot (caregiver/patient alerts)                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+Per station (× 2):
+  ┌─────────────────────────┐   ┌──────────────────────────────┐
+  │  M5StickC Plus          │   │  M5StickC Plus               │
+  │  (scale unit)           │   │  (tag reader unit)           │
+  │  HX711 load cell        │   │  MFRC522 RFID module (SPI)   │
+  │  MQTT → weight topic    │   │  MQTT → tag read/cmd topics  │
+  └─────────────────────────┘   └──────────────────────────────┘
 ```
 
-Communication between the Pi and M5StickC+ units is done via **MQTT** over the local Wi-Fi network. The MFRC522 readers are connected directly to the Pi over SPI and run their own Arduino firmware that publishes tag scan results to MQTT.
+All four M5StickC Plus units communicate with the Pi exclusively over **MQTT** via the local Wi-Fi network. There are no wired sensor connections at the Pi.
 
 ---
 
@@ -97,9 +109,9 @@ Edge-Computing-Project/
 │   │       └── medication_scale_station.ino   # M5StickC+ scale firmware (station 2)
 │   └── tag_firmware/
 │       ├── medication_tag_reader_node_station1/
-│       │   └── medication_tag_reader_node_station1.ino  # MFRC522 reader (station 1)
+│       │   └── medication_tag_reader_node_station1.ino  # M5StickC+ tag reader (station 1)
 │       ├── medication_tag_reader_node_station2/
-│       │   └── medication_tag_reader_node_station2.ino  # MFRC522 reader (station 2)
+│       │   └── medication_tag_reader_node_station2.ino  # M5StickC+ tag reader (station 2)
 │       ├── medication_tag_writer_node/
 │       │   └── medication_tag_writer_node.ino           # Tag write/verify utility
 │       └── rc522_test_read_uid/
@@ -205,12 +217,16 @@ Edit `config/config.yaml` and fill in:
 
 ### 5. Flash firmware
 
-- Flash `firmware/station_1/medication_scale_station.ino` to the M5StickC+ for station 1
-- Flash `firmware/station_2/medication_scale_station.ino` to the M5StickC+ for station 2
-- Flash `firmware/tag_firmware/medication_tag_reader_node_station1/` to the MFRC522 reader for station 1
-- Flash `firmware/tag_firmware/medication_tag_reader_node_station2/` to the MFRC522 reader for station 2
+There are **4 M5StickC Plus units** to flash in total — 2 scale units and 2 tag reader units:
 
-> Update the Wi-Fi SSID, password, and MQTT broker IP in each firmware file before flashing.
+| Unit | Firmware | Notes |
+|------|----------|-------|
+| Scale unit — station 1 | `firmware/station_1/medication_scale_station.ino` | Drives HX711 load cell |
+| Scale unit — station 2 | `firmware/station_2/medication_scale_station.ino` | Drives HX711 load cell |
+| Tag reader unit — station 1 | `firmware/tag_firmware/medication_tag_reader_node_station1/medication_tag_reader_node_station1.ino` | Drives MFRC522 via SPI |
+| Tag reader unit — station 2 | `firmware/tag_firmware/medication_tag_reader_node_station2/medication_tag_reader_node_station2.ino` | Drives MFRC522 via SPI |
+
+> Update the Wi-Fi SSID, password, and MQTT broker IP in **each** firmware file before flashing.
 
 ### 6. Write NFC tags
 
@@ -233,17 +249,18 @@ On first run, the system enters **onboarding mode** and prompts you to place eac
 
 ### Scale Station (`medication_scale_station.ino`)
 
-- Runs on **M5StickC+** with an HX711 load cell
+- Runs on **M5StickC Plus** (scale unit) with an HX711 load cell
 - Publishes weight data to MQTT topic: `medication/weight/<station_id>`
 - Receives dosing commands via MQTT and confirms pill-count verification
 - Supports persistent EEPROM calibration
 
 ### Tag Reader Nodes (`medication_tag_reader_node_station*.ino`)
 
-- Runs on an **ESP32** wired to an **MFRC522** RFID module
+- Runs on **M5StickC Plus** (tag reader unit) wired to an **MFRC522** RFID module via SPI
 - Subscribes to `medication/tag/command/tag_reader_<n>` for `start_scan` / `stop_scan` commands
 - Publishes scan results (UID + raw payload) to `medication/tag/read/tag_reader_<n>`
 - Implements retry logic (4 attempts, 120 ms delay) for reliable reads
+- Communicates with the Pi exclusively over MQTT via Wi-Fi — no wired connection to the Pi required
 
 ### Tag Writer Utility (`medication_tag_writer_node.ino`)
 
@@ -292,9 +309,9 @@ Normal Operation
     │       Display + audio alert
     │       │
     │       ▼
-    │   Bottle lifted (weight delta detected)
+    │   Bottle lifted (weight delta detected by scale M5StickC+)
     │       │
-    │       ├── NFC tag verified (coincident scan)
+    │       ├── NFC tag verified (coincident scan by tag reader M5StickC+)
     │       ├── Weight delta → pill count estimated
     │       └── Patient behaviour monitored (MediaPipe)
     │               │
